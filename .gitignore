@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / frontend
+node_modules/
+portal/dist/
+*.local
+
+# Azure / IaC
+*.azureauth
+.azure/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+
+# Secrets — never commit
+*.pem
+*.pfx
+secrets.json
+local.settings.json
+
+# Internal status/working notes (contain live infra endpoints — keep local)
+STATUS.md

@@ -1,0 +1,47 @@
+{
+  "__comment": "Token Foundry — cross-tenant usage/cost/TPM dashboard. Import into Managed Grafana with Log Analytics + App Insights data sources. This is a minimal seed; expand panels in Phase 3.",
+  "title": "Token Foundry — Usage & Cost",
+  "uid": "token-foundry-usage",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["token-foundry", "llm", "finops"],
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Total tokens by tenant (24h)",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "queryType": "Azure Log Analytics",
+          "query": "customMetrics | where name == 'llm-total-tokens' | extend tenant = tostring(customDimensions['tenant']) | summarize tokens = sum(value) by tenant"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Tokens by model route (24h)",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "queryType": "Azure Log Analytics",
+          "query": "customMetrics | where name == 'llm-total-tokens' | extend route = tostring(customDimensions['route']) | summarize tokens = sum(value) by route"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "TPM over time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "queryType": "Azure Log Analytics",
+          "query": "customMetrics | where name == 'llm-total-tokens' | summarize tokens = sum(value) by bin(timestamp, 1m)"
+        }
+      ]
+    }
+  ]
+}

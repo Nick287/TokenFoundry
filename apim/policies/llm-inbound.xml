@@ -1,0 +1,66 @@
+<!--
+  Token Foundry — LLM inbound policy (Phase 1).
+
+  Applies to the Unified Model API. The gateway does the real work here; the
+  control plane never reimplements any of this:
+    * llm-token-limit      — per-subscription TPM enforcement (returns 429)
+    * llm-emit-token-metric — token usage to App Insights, dimensioned by
+                              tenant / route / subscription for dashboards
+                              (Grafana) and KQL pulls.
+
+  Phase 2 adds llm-semantic-cache-lookup/store (tenant-partitioned) and the
+  content-safety policy — see comments below.
+
+  counter-key is the subscription id so limits are per virtual key.
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- Per-key TPM limit. tokens-per-minute is illustrative; the real tier is
+         applied per Product via named values set by the provisioner. -->
+    <llm-token-limit
+      counter-key="@(context.Subscription.Id)"
+      tokens-per-minute="1000"
+      estimate-prompt-tokens="false"
+      remaining-tokens-header-name="x-remaining-tokens"
+      tokens-consumed-header-name="x-consumed-tokens" />
+
+    <!-- Emit token metrics with dimensions for FinOps + isolation-aware views.
+         tenant/route are surfaced as request headers by the control plane when
+         issuing keys, or derived from the subscription. -->
+    <llm-emit-token-metric namespace="tokenfoundry">
+      <dimension name="subscription" value="@(context.Subscription.Id)" />
+      <dimension name="tenant" value="@(context.Request.Headers.GetValueOrDefault(" x-tf-tenant","unknown"))" />
+      <dimension name="route" value="@(context.Request.Headers.GetValueOrDefault(" x-tf-route","unknown"))" />
+      <dimension name="api" value="@(context.Api.Id)" />
+    </llm-emit-token-metric>
+
+    <!--
+      Phase 2 — semantic caching. MUST be tenant-partitioned to avoid the
+      cross-tenant cache-leak (the #1 security pitfall in the plan):
+      <llm-semantic-cache-lookup
+        score-threshold="0.95"
+        embeddings-backend-id="embeddings"
+        embeddings-backend-auth="system-assigned">
+        <vary-by>@(context.Subscription.Id)</vary-by>
+      </llm-semantic-cache-lookup>
+
+      Phase 3 — content safety:
+      <llm-content-safety backend-id="content-safety" ... />
+    -->
+  </inbound>
+
+  <backend>
+    <base />
+  </backend>
+
+  <outbound>
+    <base />
+    <!-- Phase 2: <llm-semantic-cache-store duration="3600" /> -->
+  </outbound>
+
+  <on-error>
+    <base />
+  </on-error>
+</policies>
