@@ -1,0 +1,46 @@
+# Build context hygiene for `az acr build` / `docker build`.
+# The image rebuilds the portal inside the Dockerfile (npm install + npm run
+# build), so local node_modules / dist must NOT be uploaded — doing so bloats
+# the build context and can choke on stray/broken files inside node_modules.
+
+# Node / frontend (re-installed inside the image)
+**/node_modules
+portal/dist
+static
+
+# Python caches / virtualenvs
+**/__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+.venv
+venv
+build
+dist
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# VCS / editor / OS
+.git
+.gitignore
+.github
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local env / secrets (never bake into an image)
+.env
+.env.*
+*.pem
+*.pfx
+secrets.json
+local.settings.json
+
+# Docs / IaC not needed at runtime
+infra
+scripts
+tests
+*.md
