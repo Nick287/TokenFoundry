@@ -1,10 +1,10 @@
 # Token Foundry
 
 Azure-native LLM token hub / AI gateway. A hybrid control plane on top of Azure
-API Management's GenAI gateway — multi-provider (Claude / Gemini / Kimi /
-DeepSeek), per-tenant virtual keys, token/cost metering, and a React portal.
-
-> Full design rationale: `~/.claude/plans/token-hub-hashed-avalanche.md`.
+API Management's GenAI gateway — multi-provider (Anthropic Claude / Google
+Gemini / OpenAI), per-tenant virtual keys, token/cost metering, and a React
+portal. Each provider gets its own APIM API with the provider's native
+subscription-key header, so the provider's own SDK works against the gateway.
 
 ## Architecture
 
@@ -21,8 +21,8 @@ DeepSeek), per-tenant virtual keys, token/cost metering, and a React portal.
    LB+breaker    └───────────────┬─────────────────────┘
    emit-metric        │          ├─ PostgreSQL  (metadata)
         │             ▼          ├─ Cosmos NoSQL (usage)
-   Claude / Gemini / Kimi /      ├─ Key Vault   (secrets)
-   DeepSeek backends             └─ Azure Monitor + Grafana
+   Claude / Gemini / OpenAI      ├─ Key Vault   (secrets)
+   backends (per-provider API)   └─ Azure Monitor + Grafana
 ```
 
 - **APIM = data plane** — limiting, routing, caching, metrics via GenAI policies.
@@ -110,9 +110,12 @@ az acr build -r <acr> -t tokenfoundry:latest .   # root Dockerfile builds portal
    Grafana up; backend pool + circuit breaker created (preview API version).
 3. Admin console → create tenant + issue key + add model alias → APIM gets the
    Product/Subscription/backend, key lands in Key Vault.
-4. Call `/llm/v1/chat/completions` with the key → completion; over-TPM → 429.
-5. Multi-provider: same key/code, switch `model` alias (`gpt-4o` →
-   `claude-sonnet` → `gemini`/`kimi`) → all route correctly; `/models` lists them.
+4. Call a provider API with the key (e.g. `POST {gateway}/llm-openai/v1/chat/completions`
+   with the virtual key in the `api-key` header) → completion; over-TPM → 429.
+5. Multi-provider: switch the `model` in the body and call the matching provider
+   path — `claude-*` → `/llm-anthropic/v1/messages` (`x-api-key` header),
+   `gpt-5.x` → `/llm-openai/v1/responses`, other OpenAI/Gemini →
+   `/v1/chat/completions` → all route correctly.
 6. App Insights shows token metrics by tenant/route; `GET /usage` agrees.
 7. Grafana renders cross-tenant usage/cost/TPM.
 8. Small budget → `budget_enforcer` suspends the subscription → 401 thereafter.
@@ -120,6 +123,13 @@ az acr build -r <acr> -t tokenfoundry:latest .   # root Dockerfile builds portal
 10. (Phase 2) Customer portal: customer sees only their tenant; cross-tenant
     access rejected by the tenant-scope middleware.
 11. (Phase 2) BYO backend credential isolation; semantic cache stays per-tenant.
+
+To smoke-test every registered model end-to-end through the gateway, run
+`python scripts/smoke_test_models.py` — it auto-discovers the models from the
+control plane, calls each through its provider path (routing `gpt-5.x` to the
+Responses API), and prints a pass/fail table. Configure the gateway URL and a
+virtual key via a local `.env` (gitignored); see the script's header for the
+required variables.
 
 ## Implementation status
 
