@@ -257,27 +257,72 @@ tbody tr:hover {
   background: var(--accent-soft);
 }
 
-/* Calls-per-hour mini bar chart (App Insights time trend). CSS-only; bars are
-   scaled to the busiest hour, hover shows exact time + count via title attr. */
-.trend-bars {
+/* Calls-per-hour mini time series (App Insights). CSS-only. The backend zero-
+   fills every hour, so columns are evenly spaced across a continuous timeline:
+   non-zero bars carry a count label, zero hours get a faint baseline stub, and
+   the axis labels every 4th hour. */
+.trend {
+  padding: 1rem 1.1rem 0.6rem;
+}
+
+.trend-plot {
   display: flex;
   align-items: flex-end;
-  gap: 2px;
-  height: 120px;
-  padding: 0.85rem;
+  gap: 3px;
+  height: 130px;
+}
+
+.trend-col {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+  min-width: 0;
+}
+
+.trend-val {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 3px;
+  line-height: 1;
 }
 
 .trend-bar {
-  flex: 1 1 0;
-  min-width: 2px;
-  background: var(--accent);
-  border-radius: 2px 2px 0 0;
-  opacity: 0.8;
+  width: 100%;
+  background: linear-gradient(180deg, var(--accent) 0%, var(--accent-dark) 100%);
+  border-radius: 3px 3px 0 0;
   transition: opacity 0.15s ease;
 }
 
-.trend-bar:hover {
-  opacity: 1;
+.trend-col:hover .trend-bar {
+  opacity: 0.82;
+}
+
+/* Zero hours: a flat, muted stub on the baseline rather than nothing, so the
+   timeline reads as continuous. */
+.trend-bar[data-zero] {
+  background: var(--border);
+  border-radius: 2px;
+}
+
+.trend-axis {
+  display: flex;
+  gap: 3px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+}
+
+.trend-tick {
+  flex: 1 1 0;
+  min-width: 0;
+  text-align: center;
+  font-size: 0.65rem;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 code {

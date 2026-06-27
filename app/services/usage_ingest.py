@@ -186,11 +186,16 @@ class AppInsightsUsage:
             row["gateway_p50"] = split.get("gateway_p50") if split else None
             row["backend_p50"] = split.get("backend_p50") if split else None
 
-        # 3) Trend: calls per hour, oldest→newest, for a simple time series.
+        # 3) Trend: calls per hour, oldest→newest. make-series zero-fills the
+        #    gaps so the chart shows a continuous 24h timeline (a plain summarize
+        #    by bin() only emits hours that had calls — producing a few isolated
+        #    spikes with empty space between, not a real time series).
         trend_kql = """
         requests
         | where name startswith 'POST /llm-'
-        | summarize calls = count() by bin(timestamp, 1h)
+        | make-series calls = count() default = 0
+            on timestamp from ago(24h) to now() step 1h
+        | mv-expand timestamp to typeof(datetime), calls to typeof(long)
         | order by timestamp asc
         """
         by_hour = [

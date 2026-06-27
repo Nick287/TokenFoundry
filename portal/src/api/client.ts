@@ -70,6 +70,8 @@ export interface UsageSummary {
 export interface UsageRecordView {
   ts: string | null;
   subscription: string | null;
+  project_id: string | null;
+  project_name: string | null;
   route: string;
   api: string | null;
   prompt_tok: number;

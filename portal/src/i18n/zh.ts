@@ -108,7 +108,7 @@ export const zh: TranslationShape = {
     callLog: "调用记录",
     colTime: "时间",
     colModel: "模型",
-    colKey: "密钥",
+    colKey: "项目 / 密钥",
     colPromptTok: "输入 token",
     colCompletionTok: "输出 token",
     colCachedTok: "缓存命中",

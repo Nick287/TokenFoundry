@@ -90,18 +90,44 @@ def _summarize(tenant_id: str, rows: list[dict]) -> UsageSummary:
     return summary
 
 
-def _to_record_view(r: dict) -> dict[str, Any]:
+def _to_record_view(r: dict, key_projects: dict[str, dict] | None = None) -> dict[str, Any]:
     """Flatten a raw usage document into a compact row for the portal's call
-    log (time / model / tokens / key)."""
+    log (time / model / key+project / tokens).
+
+    `key_projects` maps a virtual-key id -> {"project_id", "project_name"} so the
+    log can show the owning project alongside the key (resolved from PostgreSQL;
+    the Cosmos document only carries the key id under `subscription`).
+    """
     prompt, completion, cached = _extract_tokens(r)
+    sub = r.get("subscription") or r.get("subscription_id")
+    proj = (key_projects or {}).get(sub or "")
     return {
         "ts": r.get("ts"),
-        "subscription": r.get("subscription") or r.get("subscription_id"),
+        "subscription": sub,
+        "project_id": proj.get("project_id") if proj else None,
+        "project_name": proj.get("project_name") if proj else None,
         "route": r.get("route", "unknown"),
         "api": r.get("api"),
         "prompt_tok": prompt,
         "completion_tok": completion,
         "cached_tok": cached,
+    }
+
+
+def _key_project_map(db: Session, tenant_id: str) -> dict[str, dict]:
+    """Map each of a tenant's virtual-key ids -> its owning project (id + name).
+
+    Used to label the call log: Cosmos records the key id, the human-readable
+    project comes from PostgreSQL.
+    """
+    rows = (
+        db.query(VirtualKey.id, Project.id, Project.name)
+        .join(Project, VirtualKey.project_id == Project.id)
+        .filter(Project.tenant_id == tenant_id)
+        .all()
+    )
+    return {
+        r[0]: {"project_id": r[1], "project_name": r[2]} for r in rows
     }
 
 
@@ -141,7 +167,8 @@ def tenant_usage_records(
     """
     key_ids = _tenant_key_ids(db, tenant_id)
     rows = UsageStore().query_by_subscriptions(key_ids, limit=limit)
-    return [_to_record_view(r) for r in rows]
+    key_projects = _key_project_map(db, tenant_id)
+    return [_to_record_view(r, key_projects) for r in rows]
 
 
 @router.get("/admin/usage-telemetry")

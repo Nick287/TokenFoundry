@@ -6,20 +6,42 @@ import { api, type UsageTelemetry } from "../api/client";
 import { usePrincipal } from "../auth/AuthProvider";
 import { UsageCard } from "./UsageCard";
 
-// Calls-per-hour bars. CSS-only (no chart lib): each bar's height is scaled to
-// the busiest hour; the title attribute carries the exact time + count on hover.
+// Calls-per-hour mini time series. CSS-only (no chart lib). The backend zero-
+// fills every hour in the window, so bars are evenly spaced across a continuous
+// 24h timeline; non-zero bars carry their count above, zero hours show a faint
+// baseline stub, and the x-axis labels every 4th hour for a time reference.
 function TrendBars({ data }: { data: UsageTelemetry["by_hour"] }) {
   const max = Math.max(1, ...data.map((d) => d.calls));
+  const fmtHour = (ts: string) =>
+    new Date(ts).toLocaleTimeString([], { hour: "2-digit", hour12: false });
   return (
-    <div className="trend-bars card">
-      {data.map((d) => (
-        <div
-          key={d.ts}
-          className="trend-bar"
-          style={{ height: `${Math.max(4, (d.calls / max) * 100)}%` }}
-          title={`${new Date(d.ts).toLocaleString()} — ${d.calls}`}
-        />
-      ))}
+    <div className="trend card">
+      <div className="trend-plot">
+        {data.map((d) => {
+          const pct = d.calls === 0 ? 2 : Math.max(8, (d.calls / max) * 85);
+          return (
+            <div
+              className="trend-col"
+              key={d.ts}
+              title={`${new Date(d.ts).toLocaleString()} — ${d.calls}`}
+            >
+              {d.calls > 0 && <span className="trend-val">{d.calls}</span>}
+              <div
+                className="trend-bar"
+                style={{ height: `${pct}%` }}
+                data-zero={d.calls === 0 ? "" : undefined}
+              />
+            </div>
+          );
+        })}
+      </div>
+      <div className="trend-axis">
+        {data.map((d, i) => (
+          <span className="trend-tick" key={d.ts}>
+            {i % 4 === 0 ? fmtHour(d.ts) : ""}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
@@ -100,7 +122,16 @@ export function UsageDashboardPage() {
                     <td>{r.ts ? new Date(r.ts).toLocaleString() : "—"}</td>
                     <td>{r.api ?? r.route}</td>
                     <td>
-                      <code className="id-cell">{r.subscription ?? "—"}</code>
+                      {r.project_name ? (
+                        <>
+                          {r.project_name}{" "}
+                          <code className="id-cell">
+                            ({r.subscription ?? "—"})
+                          </code>
+                        </>
+                      ) : (
+                        <code className="id-cell">{r.subscription ?? "—"}</code>
+                      )}
                     </td>
                     <td>{r.prompt_tok.toLocaleString()}</td>
                     <td>{r.completion_tok.toLocaleString()}</td>

@@ -107,7 +107,7 @@ export const en = {
     callLog: "Call log",
     colTime: "Time",
     colModel: "Model",
-    colKey: "Key",
+    colKey: "Project / Key",
     colPromptTok: "Prompt tok",
     colCompletionTok: "Completion tok",
     colCachedTok: "Cached tok",
