@@ -36,6 +36,7 @@ body {
   position: sticky;
   top: 0;
   z-index: 10;
+  flex-wrap: wrap;
 }
 
 .brand {
@@ -48,6 +49,8 @@ body {
   display: flex;
   gap: 0.35rem;
   flex: 1;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .topbar nav a {
@@ -63,6 +66,12 @@ body {
 .topbar nav a:hover {
   color: var(--accent);
   background: var(--accent-soft);
+}
+
+.topbar nav a.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
 }
 
 .who {
@@ -248,12 +257,44 @@ tbody tr:hover {
   background: var(--accent-soft);
 }
 
+/* Calls-per-hour mini bar chart (App Insights time trend). CSS-only; bars are
+   scaled to the busiest hour, hover shows exact time + count via title attr. */
+.trend-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 120px;
+  padding: 0.85rem;
+}
+
+.trend-bar {
+  flex: 1 1 0;
+  min-width: 2px;
+  background: var(--accent);
+  border-radius: 2px 2px 0 0;
+  opacity: 0.8;
+  transition: opacity 0.15s ease;
+}
+
+.trend-bar:hover {
+  opacity: 1;
+}
+
 code {
   font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
   font-size: 0.85em;
   background: #f0eee8;
   padding: 0.1rem 0.4rem;
   border-radius: 4px;
+}
+
+/* Secondary identifiers (ids shown alongside a human name). Muted + lighter
+   so the name reads first and the id is available but not shouting. */
+code.id-cell {
+  background: transparent;
+  padding: 0;
+  color: var(--muted);
+  font-size: 0.8em;
 }
 
 /* --- Status badges --- */
@@ -396,6 +437,14 @@ code {
 }
 
 @media (max-width: 640px) {
+  .topbar {
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+  }
+  .topbar nav {
+    order: 3;
+    flex-basis: 100%;
+  }
   .form-grid {
     grid-template-columns: 1fr;
   }

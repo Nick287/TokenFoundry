@@ -66,6 +66,32 @@ export interface UsageSummary {
   total_billed_usd: number;
 }
 
+// One row in the Cosmos-sourced call log (per-call usage record).
+export interface UsageRecordView {
+  ts: string | null;
+  subscription: string | null;
+  route: string;
+  api: string | null;
+  prompt_tok: number;
+  completion_tok: number;
+  cached_tok: number;
+}
+
+// App Insights-sourced call counts + latency (separate data source).
+export interface UsageTelemetry {
+  total_calls: number;
+  by_api: Array<{
+    name: string;
+    calls: number;
+    p50: number | null;
+    p95: number | null;
+    failures: number;
+    gateway_p50: number | null;
+    backend_p50: number | null;
+  }>;
+  by_hour: Array<{ ts: string; calls: number }>;
+}
+
 async function request<T>(
   path: string,
   token: string,
@@ -152,9 +178,18 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  listKeys: (token: string, projectId?: string) =>
+    request<VirtualKey[]>(
+      projectId ? `/keys?project_id=${encodeURIComponent(projectId)}` : "/keys",
+      token,
+    ),
   myUsage: (token: string) => request<UsageSummary>("/usage", token),
   tenantUsage: (token: string, tenantId: string) =>
     request<UsageSummary>(`/admin/usage/${tenantId}`, token),
+  tenantUsageRecords: (token: string, tenantId: string) =>
+    request<UsageRecordView[]>(`/admin/usage/${tenantId}/records`, token),
+  usageTelemetry: (token: string) =>
+    request<UsageTelemetry>("/admin/usage-telemetry", token),
   listUsers: (token: string) => request<User[]>("/users", token),
   createUser: (
     token: string,

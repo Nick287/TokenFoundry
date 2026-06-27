@@ -22,6 +22,20 @@ from app.services.keyvault import KeyVaultService
 router = APIRouter()
 
 
+@router.get("/keys", response_model=list[VirtualKeyOut])
+def list_keys(
+    project_id: str | None = None,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> list[VirtualKey]:
+    """List issued virtual keys (metadata only — the secret VALUE never returns
+    here; it lives in Key Vault and is shown exactly once at creation)."""
+    q = db.query(VirtualKey)
+    if project_id:
+        q = q.filter(VirtualKey.project_id == project_id)
+    return list(q.order_by(VirtualKey.created_at.desc()).all())
+
+
 @router.post(
     "/keys", response_model=VirtualKeySecret, status_code=status.HTTP_201_CREATED
 )

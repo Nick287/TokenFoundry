@@ -6,7 +6,7 @@
 // boundary: the backend re-enforces tenant isolation on every request.
 
 import { useTranslation } from "react-i18next";
-import { Link, Navigate, Route, Routes } from "react-router-dom";
+import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 
 import { LANG_KEY } from "./i18n";
 import { useAuth, usePrincipal } from "./auth/AuthProvider";
@@ -61,17 +61,17 @@ export function App() {
         <nav>
           {isAdmin ? (
             <>
-              <Link to="/tenants">{t("nav.tenants")}</Link>
-              <Link to="/projects">{t("nav.projects")}</Link>
-              <Link to="/keys">{t("nav.keys")}</Link>
-              <Link to="/routes">{t("nav.models")}</Link>
-              <Link to="/usage">{t("nav.usage")}</Link>
-              <Link to="/users">{t("nav.users")}</Link>
+              <NavLink to="/tenants">{t("nav.tenants")}</NavLink>
+              <NavLink to="/projects">{t("nav.projects")}</NavLink>
+              <NavLink to="/keys">{t("nav.keys")}</NavLink>
+              <NavLink to="/routes">{t("nav.models")}</NavLink>
+              <NavLink to="/usage">{t("nav.usage")}</NavLink>
+              <NavLink to="/users">{t("nav.users")}</NavLink>
             </>
           ) : (
             <>
-              <Link to="/me">{t("nav.myUsage")}</Link>
-              <Link to="/account">{t("nav.myAccount")}</Link>
+              <NavLink to="/me">{t("nav.myUsage")}</NavLink>
+              <NavLink to="/account">{t("nav.myAccount")}</NavLink>
             </>
           )}
         </nav>

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { type FormEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { api } from "../api/client";
@@ -44,6 +44,7 @@ export function UsersPage() {
     onSuccess: () => {
       setUsername("");
       setPassword("");
+      setRole("customer");
       setTenantId("");
       qc.invalidateQueries({ queryKey: ["users"] });
     },
@@ -60,6 +61,13 @@ export function UsersPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["users"] }),
   });
 
+  const reset = useMutation({
+    mutationFn: (vars: { id: string; pw: string }) =>
+      api.resetPassword(principal.token, vars.id, vars.pw),
+    onSuccess: () => setPwMsg(t("users.resetDone")),
+    onError: () => setPwMsg(t("users.resetFailed")),
+  });
+
   const changePw = useMutation({
     mutationFn: () => api.changeMyPassword(principal.token, oldPw, newPw),
     onSuccess: () => {
@@ -72,7 +80,25 @@ export function UsersPage() {
 
   function onReset(id: string) {
     const pw = window.prompt(t("users.resetPrompt"));
-    if (pw) api.resetPassword(principal.token, id, pw).catch(() => undefined);
+    if (pw) reset.mutate({ id, pw });
+  }
+
+  function onChangePw(e: FormEvent) {
+    e.preventDefault();
+    if (!oldPw || !newPw || changePw.isPending) return;
+    changePw.mutate();
+  }
+
+  function onCreate(e: FormEvent) {
+    e.preventDefault();
+    if (
+      !username ||
+      !password ||
+      (role === "customer" && !tenantId) ||
+      create.isPending
+    )
+      return;
+    create.mutate();
   }
 
   return (
@@ -83,7 +109,7 @@ export function UsersPage() {
       {/* Change my own password — available to everyone */}
       <div className="card">
         <h3>{t("users.myPassword")}</h3>
-        <div className="form-row">
+        <form className="form-row" onSubmit={onChangePw}>
           <input
             type="password"
             placeholder={t("users.oldPassword")}
@@ -98,20 +124,17 @@ export function UsersPage() {
             onChange={(e) => setNewPw(e.target.value)}
             autoComplete="new-password"
           />
-          <button
-            disabled={!oldPw || !newPw || changePw.isPending}
-            onClick={() => changePw.mutate()}
-          >
+          <button type="submit" disabled={!oldPw || !newPw || changePw.isPending}>
             {t("users.change")}
           </button>
-        </div>
+        </form>
         {pwMsg && <p className="hint">{pwMsg}</p>}
       </div>
 
       {/* Admin-only: create + manage users */}
       {isAdmin && (
         <>
-          <div className="card form-row">
+          <form className="card form-row" onSubmit={onCreate}>
             <input
               placeholder={t("users.username")}
               value={username}
@@ -138,17 +161,17 @@ export function UsersPage() {
               </select>
             )}
             <button
+              type="submit"
               disabled={
                 !username ||
                 !password ||
                 (role === "customer" && !tenantId) ||
                 create.isPending
               }
-              onClick={() => create.mutate()}
             >
               {create.isPending ? t("users.creating") : t("users.create")}
             </button>
-          </div>
+          </form>
           {create.isError && <p className="error">{String(create.error)}</p>}
           {(update.isError || del.isError) && (
             <p className="error">{String(update.error || del.error)}</p>
@@ -168,8 +191,17 @@ export function UsersPage() {
                 </tr>
               </thead>
               <tbody>
+                {users.data && users.data.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="hint">
+                      {t("users.empty")}
+                    </td>
+                  </tr>
+                )}
                 {users.data?.map((u) => {
                   const isSelf = u.username === principal.username;
+                  const busy = update.isPending || del.isPending || reset.isPending;
+                  const userTenant = tenants.data?.find((x) => x.id === u.tenant_id);
                   return (
                     <tr key={u.id}>
                       <td>
@@ -177,20 +209,36 @@ export function UsersPage() {
                         {isSelf ? " ·" : ""}
                       </td>
                       <td>{u.role}</td>
-                      <td>{u.tenant_id ? <code>{u.tenant_id}</code> : "—"}</td>
+                      <td>
+                        {u.tenant_id ? (
+                          <>
+                            {userTenant ? `${userTenant.name} ` : ""}
+                            <code className="id-cell">{u.tenant_id}</code>
+                          </>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
                       <td>
                         <span className={`badge badge-${u.disabled ? "suspended" : "active"}`}>
                           {u.disabled ? t("users.disabled") : t("users.active")}
                         </span>
                       </td>
                       <td className="row-actions">
-                        <button className="btn-sm" onClick={() => onReset(u.id)}>
+                        <button
+                          type="button"
+                          className="btn-sm"
+                          disabled={busy}
+                          onClick={() => onReset(u.id)}
+                        >
                           {t("users.reset")}
                         </button>
                         {!isSelf && (
                           <>
                             <button
+                              type="button"
                               className="btn-sm"
+                              disabled={busy}
                               onClick={() =>
                                 update.mutate({ id: u.id, body: { disabled: !u.disabled } })
                               }
@@ -198,7 +246,9 @@ export function UsersPage() {
                               {u.disabled ? t("users.enable") : t("users.disable")}
                             </button>
                             <button
+                              type="button"
                               className="btn-sm"
+                              disabled={busy}
                               onClick={() =>
                                 update.mutate({
                                   id: u.id,
@@ -213,7 +263,9 @@ export function UsersPage() {
                               {u.role === "admin" ? t("users.makeCustomer") : t("users.makeAdmin")}
                             </button>
                             <button
+                              type="button"
                               className="btn-sm btn-danger"
+                              disabled={busy}
                               onClick={() => {
                                 if (window.confirm(t("users.deleteConfirm"))) del.mutate(u.id);
                               }}

@@ -2,37 +2,117 @@
 
 The customer endpoint derives tenant_id from the token (tenant_scope), NEVER
 from a request param. An admin endpoint can read any tenant explicitly.
+
+Usage records are written by the APIM outbound policy (one document per LLM
+call, carrying the full backend response under `raw_response`). Token counts
+live inside that raw response in provider-specific shapes, so we normalize them
+here at read time rather than at write time.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.api.auth import Principal, require_admin, tenant_scope
 from app.db import get_db
+from app.models.orm import Project, VirtualKey
 from app.models.schemas import UsageSummary
-from app.services.usage_ingest import UsageStore
+from app.services.usage_ingest import AppInsightsUsage, UsageStore
 
 router = APIRouter()
+
+
+def _tenant_key_ids(db: Session, tenant_id: str) -> list[str]:
+    """Virtual-key ids belonging to a tenant (via its projects).
+
+    Usage documents are tagged tenant='unknown' on the data plane, so a tenant's
+    usage is resolved by matching its virtual keys against the document's
+    `subscription` field. Returns [] if the tenant has no keys yet.
+    """
+    rows = (
+        db.query(VirtualKey.id)
+        .join(Project, VirtualKey.project_id == Project.id)
+        .filter(Project.tenant_id == tenant_id)
+        .all()
+    )
+    return [r[0] for r in rows]
+
+
+def _extract_tokens(record: dict) -> tuple[int, int, int]:
+    """Return (prompt, completion, cached) tokens from a usage record.
+
+    Handles both the new APIM-written shape (tokens nested in raw_response) and
+    any legacy flat shape. Providers name the fields differently:
+      * OpenAI / Google chat: prompt_tokens / completion_tokens
+      * Anthropic + OpenAI Responses: input_tokens / output_tokens
+    """
+    # Legacy flat record (worker/KQL era) — already normalized.
+    if "prompt_tok" in record or "completion_tok" in record:
+        return (
+            int(record.get("prompt_tok", 0) or 0),
+            int(record.get("completion_tok", 0) or 0),
+            int(record.get("cached_tok", 0) or 0),
+        )
+
+    raw = record.get("raw_response")
+    if not isinstance(raw, dict):
+        return (0, 0, 0)
+    usage = raw.get("usage")
+    if not isinstance(usage, dict):
+        return (0, 0, 0)
+
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+    completion = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+    cached = (
+        usage.get("cache_read_input_tokens")
+        or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        or (usage.get("input_tokens_details") or {}).get("cached_tokens")
+        or 0
+    )
+    return (int(prompt), int(completion), int(cached))
 
 
 def _summarize(tenant_id: str, rows: list[dict]) -> UsageSummary:
     summary = UsageSummary(tenant_id=tenant_id)
     for r in rows:
-        summary.total_prompt_tok += int(r.get("prompt_tok", 0))
-        summary.total_completion_tok += int(r.get("completion_tok", 0))
-        summary.total_cost_usd += float(r.get("cost_usd", 0.0))
-        summary.total_billed_usd += float(r.get("billed_usd", 0.0))
+        prompt, completion, _cached = _extract_tokens(r)
+        summary.total_prompt_tok += prompt
+        summary.total_completion_tok += completion
+        # cost/billed are not computed at write time yet; fall back to any value
+        # already on the record (legacy) so the field is populated when present.
+        summary.total_cost_usd += float(r.get("cost_usd", 0.0) or 0.0)
+        summary.total_billed_usd += float(r.get("billed_usd", 0.0) or 0.0)
     summary.total_cost_usd = round(summary.total_cost_usd, 4)
     summary.total_billed_usd = round(summary.total_billed_usd, 4)
     return summary
 
 
+def _to_record_view(r: dict) -> dict[str, Any]:
+    """Flatten a raw usage document into a compact row for the portal's call
+    log (time / model / tokens / key)."""
+    prompt, completion, cached = _extract_tokens(r)
+    return {
+        "ts": r.get("ts"),
+        "subscription": r.get("subscription") or r.get("subscription_id"),
+        "route": r.get("route", "unknown"),
+        "api": r.get("api"),
+        "prompt_tok": prompt,
+        "completion_tok": completion,
+        "cached_tok": cached,
+    }
+
+
 @router.get("/usage", response_model=UsageSummary)
-def my_usage(tenant_id: str = Depends(tenant_scope)) -> UsageSummary:
+def my_usage(
+    tenant_id: str = Depends(tenant_scope),
+    db: Session = Depends(get_db),
+) -> UsageSummary:
     """Customer self-service: usage for the CALLER's tenant only."""
-    rows = UsageStore().query_tenant(tenant_id)
+    key_ids = _tenant_key_ids(db, tenant_id)
+    rows = UsageStore().query_by_subscriptions(key_ids)
     return _summarize(tenant_id, rows)
 
 
@@ -40,8 +120,36 @@ def my_usage(tenant_id: str = Depends(tenant_scope)) -> UsageSummary:
 def tenant_usage(
     tenant_id: str,
     _: Principal = Depends(require_admin),
-    __: Session = Depends(get_db),
+    db: Session = Depends(get_db),
 ) -> UsageSummary:
     """Platform admin: usage for an explicitly named tenant."""
-    rows = UsageStore().query_tenant(tenant_id)
+    key_ids = _tenant_key_ids(db, tenant_id)
+    rows = UsageStore().query_by_subscriptions(key_ids)
     return _summarize(tenant_id, rows)
+
+
+@router.get("/admin/usage/{tenant_id}/records")
+def tenant_usage_records(
+    tenant_id: str,
+    limit: int = 100,
+    _: Principal = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Platform admin: per-call usage log (Cosmos source) for one tenant.
+
+    Resolves the tenant's virtual keys, then returns the matching call records.
+    """
+    key_ids = _tenant_key_ids(db, tenant_id)
+    rows = UsageStore().query_by_subscriptions(key_ids, limit=limit)
+    return [_to_record_view(r) for r in rows]
+
+
+@router.get("/admin/usage-telemetry")
+def usage_telemetry(
+    hours: int = 24,
+    _: Principal = Depends(require_admin),
+) -> dict[str, Any]:
+    """Platform admin: call counts + latency from App Insights (separate data
+    source from Cosmos usage). Best-effort — returns an empty summary if App
+    Insights isn't configured."""
+    return AppInsightsUsage().request_telemetry(hours=hours)

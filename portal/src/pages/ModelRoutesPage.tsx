@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { type FormEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { api } from "../api/client";
@@ -41,7 +41,15 @@ export function ModelRoutesPage() {
         markup_pct: Number(form.markup_pct) || 0,
       }),
     onSuccess: () => {
-      setForm({ ...form, name: "", backend_url: "", backend_secret: "" });
+      setForm({
+        ...form,
+        name: "",
+        backend_url: "",
+        backend_secret: "",
+        price_in_per_1k: "",
+        price_out_per_1k: "",
+        markup_pct: "",
+      });
       qc.invalidateQueries({ queryKey: ["routes"] });
     },
   });
@@ -49,11 +57,17 @@ export function ModelRoutesPage() {
   const upd = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
     setForm({ ...form, [k]: e.target.value });
 
+  function onSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!form.name || create.isPending) return;
+    create.mutate();
+  }
+
   return (
     <section>
       <h2>{t("models.title")}</h2>
       <p className="help-card">{t("help.models")}</p>
-      <div className="card form-grid">
+      <form className="card form-grid" onSubmit={onSubmit}>
         <input placeholder={t("models.alias")} value={form.name} onChange={upd("name")} />
         <select value={form.provider} onChange={upd("provider")}>
           <option value="anthropic">Anthropic (Claude)</option>
@@ -70,13 +84,15 @@ export function ModelRoutesPage() {
         <input placeholder={t("models.priceIn")} value={form.price_in_per_1k} onChange={upd("price_in_per_1k")} />
         <input placeholder={t("models.priceOut")} value={form.price_out_per_1k} onChange={upd("price_out_per_1k")} />
         <input placeholder={t("models.markup")} value={form.markup_pct} onChange={upd("markup_pct")} />
-        <button disabled={!form.name || create.isPending} onClick={() => create.mutate()}>
+        <button type="submit" disabled={!form.name || create.isPending}>
           {create.isPending ? t("models.adding") : t("models.add")}
         </button>
-      </div>
+      </form>
       {create.isError && <p className="error">{String(create.error)}</p>}
 
-      {routes.data && (
+      {routes.isLoading ? (
+        <p>{t("common.loading")}</p>
+      ) : (
         <table className="card">
           <thead>
             <tr>
@@ -87,7 +103,14 @@ export function ModelRoutesPage() {
             </tr>
           </thead>
           <tbody>
-            {routes.data.map((r) => (
+            {routes.data && routes.data.length === 0 && (
+              <tr>
+                <td colSpan={4} className="hint">
+                  {t("models.empty")}
+                </td>
+              </tr>
+            )}
+            {routes.data?.map((r) => (
               <tr key={r.id}>
                 <td>
                   <code>{r.name}</code>

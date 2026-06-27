@@ -16,6 +16,12 @@ param keyVaultUri string
 param cosmosEndpoint string
 param apimServiceName string
 
+@description('Application Insights resource id — for the usage-telemetry KQL endpoint')
+param appInsightsId string
+
+@description('Cosmos DB account name — used to grant the app data-plane RBAC')
+param cosmosAccountName string
+
 @description('ACR resource id the app pulls its image from')
 param acrId string
 
@@ -168,6 +174,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'TF_KEYVAULT_URI', value: keyVaultUri }
             { name: 'TF_COSMOS_ENDPOINT', value: cosmosEndpoint }
             { name: 'TF_APIM_SERVICE_NAME', value: apimServiceName }
+            { name: 'TF_APP_INSIGHTS_RESOURCE_ID', value: appInsightsId }
             { name: 'TF_RESOURCE_GROUP', value: resourceGroup().name }
             { name: 'TF_AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
             { name: 'TF_ENVIRONMENT', value: 'prod' }
@@ -240,3 +247,50 @@ resource kvSecretsOfficer 'Microsoft.Authorization/roleAssignments@2022-04-01' =
     )
   }
 }
+
+// Grant the app's SYSTEM identity Cosmos DB data-plane access. The Cosmos
+// account sets disableLocalAuth=true (no keys), so the usage read/write path
+// (usage_ingest.py via DefaultAzureCredential = system identity) needs a
+// Cosmos *data-plane* RBAC assignment — distinct from Azure control-plane RBAC.
+// Built-in "Cosmos DB Data Contributor" (…0002) covers readMetadata + read +
+// upsert. Without this, every /usage and /admin/usage call returns Forbidden.
+resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2024-11-15' existing = {
+  name: cosmosAccountName
+}
+
+resource cosmosDataContributor 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = {
+  parent: cosmosAccount
+  name: guid(cosmosAccount.id, app.id, '00000000-0000-0000-0000-000000000002')
+  properties: {
+    principalId: app.identity.principalId
+    // Built-in Cosmos DB Data Contributor (account-scoped role definition).
+    roleDefinitionId: resourceId(
+      'Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions',
+      cosmosAccountName,
+      '00000000-0000-0000-0000-000000000002'
+    )
+    scope: cosmosAccount.id
+  }
+}
+
+// Grant the app's SYSTEM identity Monitoring Reader on App Insights so the
+// usage-telemetry endpoint (AppInsightsUsage KQL via azure-monitor-query) can
+// read the requests table. Without it the telemetry block degrades to empty.
+resource appInsights 'Microsoft.Insights/components@2020-02-02' existing = {
+  name: last(split(appInsightsId, '/'))
+}
+
+resource appMonitoringReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: appInsights
+  name: guid(appInsights.id, app.id, '43d0d8ad-25c7-4714-9337-8ba259a9fe05')
+  properties: {
+    principalId: app.identity.principalId
+    principalType: 'ServicePrincipal'
+    // Monitoring Reader
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '43d0d8ad-25c7-4714-9337-8ba259a9fe05'
+    )
+  }
+}
+

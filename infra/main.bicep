@@ -107,6 +107,7 @@ module apim 'modules/apim.bicep' = {
     tags: tags
     appInsightsId: monitor.outputs.appInsightsId
     appInsightsConnectionString: monitor.outputs.appInsightsConnectionString
+    cosmosAccountName: cosmos.outputs.accountName
   }
 }
 
@@ -153,6 +154,8 @@ module containerapps 'modules/containerapps.bicep' = {
     appImage: appImage
     keyVaultUri: keyvault.outputs.vaultUri
     cosmosEndpoint: cosmos.outputs.endpoint
+    cosmosAccountName: cosmos.outputs.accountName
+    appInsightsId: monitor.outputs.appInsightsId
     apimServiceName: apim.outputs.apimName
     acrId: acr.outputs.registryId
     acrLoginServer: acr.outputs.loginServer

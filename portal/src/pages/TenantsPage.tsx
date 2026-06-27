@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { type FormEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { api } from "../api/client";
@@ -21,6 +21,7 @@ export function TenantsPage() {
     mutationFn: () => api.createTenant(principal.token, { name, mode }),
     onSuccess: () => {
       setName("");
+      setMode("RESELL");
       qc.invalidateQueries({ queryKey: ["tenants"] });
     },
   });
@@ -30,12 +31,18 @@ export function TenantsPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tenants"] }),
   });
 
+  function onSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!name || create.isPending) return;
+    create.mutate();
+  }
+
   return (
     <section>
       <h2>{t("tenants.title")}</h2>
       <p className="help-card">{t("help.tenants")}</p>
 
-      <div className="card form-row">
+      <form className="card form-row" onSubmit={onSubmit}>
         <input
           placeholder={t("tenants.namePlaceholder")}
           value={name}
@@ -46,10 +53,10 @@ export function TenantsPage() {
           <option value="BYO">{t("tenants.modeByo")}</option>
           <option value="INTERNAL">{t("tenants.modeInternal")}</option>
         </select>
-        <button disabled={!name || create.isPending} onClick={() => create.mutate()}>
+        <button type="submit" disabled={!name || create.isPending}>
           {create.isPending ? t("tenants.creating") : t("tenants.create")}
         </button>
-      </div>
+      </form>
       {create.isError && <p className="error">{String(create.error)}</p>}
 
       {tenants.isLoading ? (
@@ -60,24 +67,31 @@ export function TenantsPage() {
         <table className="card">
           <thead>
             <tr>
-              <th>{t("common.id")}</th>
               <th>{t("common.name")}</th>
+              <th>{t("common.id")}</th>
               <th>{t("tenants.mode")}</th>
               <th>{t("tenants.product")}</th>
               <th>{t("common.status")}</th>
             </tr>
           </thead>
           <tbody>
+            {tenants.data && tenants.data.length === 0 && (
+              <tr>
+                <td colSpan={5} className="hint">
+                  {t("tenants.empty")}
+                </td>
+              </tr>
+            )}
             {tenants.data?.map((tn) => (
               <tr key={tn.id}>
-                <td>
-                  <code>{tn.id}</code>
-                </td>
                 <td>{tn.name}</td>
+                <td>
+                  <code className="id-cell">{tn.id}</code>
+                </td>
                 <td>{tn.mode}</td>
                 <td>
                   {tn.apim_product_ids.length > 0 ? (
-                    <code>{tn.apim_product_ids[0]}</code>
+                    <code className="id-cell">{tn.apim_product_ids[0]}</code>
                   ) : (
                     <button
                       className="btn-sm"

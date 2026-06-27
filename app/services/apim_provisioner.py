@@ -19,6 +19,7 @@ into the unified API is isolated in `_attach_alias`.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
@@ -206,10 +207,10 @@ class ApimProvisioner:
                     name="trip-on-5xx",
                     failure_condition=CircuitBreakerFailureCondition(
                         count=3,
-                        interval="PT1H",
+                        interval=timedelta(hours=1),
                         status_code_ranges=[FailureStatusCodeRange(min=500, max=599)],
                     ),
-                    trip_duration="PT1H",
+                    trip_duration=timedelta(hours=1),
                     accept_retry_after=True,
                 )
             ]
@@ -325,10 +326,10 @@ class ApimProvisioner:
                     name="trip-on-5xx",
                     failure_condition=CircuitBreakerFailureCondition(
                         count=3,
-                        interval="PT1H",
+                        interval=timedelta(hours=1),
                         status_code_ranges=[FailureStatusCodeRange(min=500, max=599)],
                     ),
-                    trip_duration="PT1H",
+                    trip_duration=timedelta(hours=1),
                     accept_retry_after=True,
                 )
             ]

@@ -24,7 +24,7 @@ export function CustomerUsagePage() {
         {t("usage.tenant")}: {principal.tenantId ?? "—"}
       </p>
       {usage.isLoading && <p>{t("common.loading")}</p>}
-      {usage.isError && <p className="error">{String(usage.error)}</p>}
+      {usage.isError && <p className="error">{t("usage.loadFailed")}</p>}
       {usage.data && <UsageCard usage={usage.data} />}
     </section>
   );
