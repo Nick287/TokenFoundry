@@ -1,5 +1,7 @@
 # Token Foundry
 
+**English** | [中文](README.zh.md)
+
 Azure-native LLM token hub / AI gateway. A hybrid control plane on top of Azure
 API Management's GenAI gateway — multi-provider (Anthropic Claude / Google
 Gemini / OpenAI), per-tenant virtual keys, token/cost metering, and a React
@@ -8,38 +10,168 @@ subscription-key header, so the provider's own SDK works against the gateway.
 
 ## Architecture
 
-```
-                  aca-app (single Container App)
-                  ┌─────────────────────────────────────┐
-                  │  React portal (admin + customer SPA) │
-                  │  served by FastAPI StaticFiles       │
-                  │            │ /api                     │
-  Clients ─key─▶ APIM         ▼                           │
-   (data plane)  │   FastAPI control plane               │
-   Unified API   │   tenants / keys / routes / budgets / │
-   token-limit   │   usage  +  tenant-scope auth         │
-   LB+breaker    └───────────────┬─────────────────────┘
-   emit-metric        │          ├─ PostgreSQL  (metadata)
-        │             ▼          ├─ Cosmos NoSQL (usage)
-   Claude / Gemini / OpenAI      ├─ Key Vault   (secrets)
-   backends (per-provider API)   └─ Azure Monitor + Grafana
+![Token Foundry architecture](docs/architecture.png)
+
+> The diagram is a visual aid; the ASCII below is the authoritative reference.
+
+```text
+                       aca-app (single Azure Container App)
+                       ┌──────────────────────────────────────┐
+                       │  React portal (admin + customer SPA)  │
+                       │  served by FastAPI StaticFiles        │
+                       │             │ /api                     │
+  Clients ──key──▶ APIM            ▼                            │
+   (data plane)     │     FastAPI control plane                │
+   per-provider API │     tenants / projects / keys / routes / │
+   token-limit      │     budgets / usage + tenant-scope auth  │
+   LB + breaker     └────────┬───────────────┬─────────────────┘
+   emit-metric  │            │ manage (ARM)   │
+                │            ▼                ├─ PostgreSQL  (metadata)
+                │      provisions APIM        ├─ Cosmos NoSQL (usage, read)
+                │      products / subs /      ├─ Key Vault   (secrets r/w)
+                │      backends at runtime    └─ App Insights (KQL telemetry)
+                │
+                ├─route─▶ Claude / Gemini / OpenAI backends (per-provider API)
+                │
+                └─outbound policy (managed identity, fire-and-forget)──▶
+                         Cosmos NoSQL `usage` container (one doc per call)
 ```
 
-- **APIM = data plane** — limiting, routing, caching, metrics via GenAI policies.
-- **FastAPI = control plane** — provisioning + accounting + enforcement only;
-  also serves the built SPA (one image, one Container App, no nginx).
-- **React = human layer** — operator console (admin) + customer portal (customer).
+- **APIM = data plane** — auth, token-limiting, routing, load-balance + circuit
+  breaker, and the **outbound policy that writes one usage record per call
+  directly to Cosmos** (managed-identity auth, `send-one-way-request` so the LLM
+  response is never blocked).
+- **FastAPI = control plane** — provisioning + accounting + enforcement; reads
+  usage back from Cosmos and latency from App Insights; also serves the built
+  SPA (one image, one Container App, no nginx).
+- **React = human layer** — operator console (admin) + customer portal.
+
+### How usage is captured (the billing path)
+
+The portal's usage numbers were `0` until this path existed — there was no
+writer. It now works as a single direct write:
+
+1. A client calls a provider API through APIM with its virtual key.
+2. On a successful response, APIM's **outbound policy**
+   (`apim/policies/outbound-cosmos-write.xml`) POSTs one document to the Cosmos
+   `usage` container — the **raw provider response JSON** plus metadata (request
+   id, subscription/virtual-key id, timestamp, API name, partition key). Tokens
+   are *not* parsed at write time; they live inside `raw_response`.
+3. The control plane parses tokens at **read** time (`app/api/usage.py`),
+   handling each provider's shape (`prompt_tokens`/`completion_tokens`,
+   Anthropic + OpenAI-Responses `input_tokens`/`output_tokens`, cached-token
+   variants), and resolves a record's tenant by matching its virtual-key id
+   against PostgreSQL (`virtual key → project → tenant`).
+
+This is a deliberate MVP trade-off: `send-one-way-request` is fire-and-forget,
+so a failed write is **not retried** (occasional loss is acceptable for trend
+usage). Billing-grade, replayable accounting is the Event Hub path below — the
+namespace is provisioned but **not yet wired** (`worker/eventhub_consumer.py`
+is a stub).
+
+### The usage page has two data sources, shown separately
+
+- **Usage & cost — from Cosmos** (the billing source): per-call log with model,
+  project/key, prompt/completion/cached tokens.
+- **Calls & latency — from App Insights** (telemetry, may be sampled): call
+  counts, p50/p95, **gateway vs backend latency split** (APIM time vs LLM time),
+  failures, and a calls-per-hour trend. Sampled data is fine for
+  health/performance but **must not** be used for billing — that's why the two
+  sources are kept apart.
 
 ## Layout
 
-```
+```text
 app/            FastAPI control plane (models / services / api)
-worker/         Event Hub consumer (Phase 2)
+worker/         Event Hub consumer (Phase 2 — stub, not wired)
 portal/         React + Vite frontend
-infra/          Bicep IaC (main + modules + Grafana dashboards)
+infra/          Bicep IaC (main + lite + modules + Grafana dashboards)
 apim/policies/  APIM policy XML (data-plane core)
+docs/           architecture diagram
 tests/          pytest (billing logic — pure, no Azure)
 ```
+
+## Infrastructure (Bicep)
+
+Two entry points:
+
+| File | What it deploys | When to use |
+|---|---|---|
+| `infra/main.lite.bicep` | Monitor, Key Vault, PostgreSQL, Cosmos, Event Hub, ACR | Fast first pass — stands up the cheap data + observability tier so you can `az acr build` while APIM provisions. |
+| `infra/main.bicep` | Everything in lite **plus** APIM (~30–45 min), the APIM backend pool, Grafana, app secrets, and the Container App | Full deployment. |
+
+### Deploy parameters (passed to `main.bicep`)
+
+These are the values **you provide** at deploy time, defined in
+`infra/main.bicepparam` (non-secrets) or on the command line (secrets):
+
+| Parameter | Secret | Default | Meaning |
+|---|---|---|---|
+| `namePrefix` | no | `tokenfoundry` | Prefix for every resource name (e.g. `tokenfoundry-apim`). Globally-unique resources (Cosmos / Key Vault / ACR) also append a hash of the resource-group id. |
+| `location` | no | `centralus` | Azure region for all resources. **Keep it `centralus`** — this subscription blocks PostgreSQL in some regions (e.g. eastus); one region avoids cross-region issues. |
+| `environmentName` | no | `dev` | Tag only (`dev` \| `prod`); applied to every resource for cost grouping. |
+| `pgAdminLogin` | no | `tfadmin` | PostgreSQL administrator username. |
+| `pgAdminPassword` | **yes** | — | PostgreSQL admin password. Pass via `-p pgAdminPassword=$PG_PWD`; **never** hardcode it in the `.bicepparam`. Assembled into the DB connection string and stored as a Key Vault secret (`tf-database-url`). |
+| `jwtSecret` | **yes** | — | HS256 signing secret for the self-hosted login JWTs. Stored as `tf-jwt-secret`. |
+| `adminPassword` | **yes** | — | Password for the seed `admin` account created on first boot. Stored as `tf-admin-password`. |
+| `appImage` | no | placeholder | Full image ref the Container App runs, e.g. `<acr>.azurecr.io/tokenfoundry:v6`. Chicken-and-egg: deploy lite → `az acr build` → set this → deploy full. |
+
+Example:
+
+```bash
+az deployment group create -g <rg> -f infra/main.bicep \
+  -p infra/main.bicepparam \
+  -p pgAdminPassword=$PG_PWD -p jwtSecret=$JWT -p adminPassword=$ADMIN_PWD \
+  -p appImage=<acr>.azurecr.io/tokenfoundry:v6
+```
+
+### What each module provisions (and the non-obvious settings)
+
+| Module | Resource | Notes worth knowing |
+|---|---|---|
+| `monitor` | Log Analytics + App Insights | Workspace retention 30 days. App Insights is the latency/telemetry source the usage page queries via KQL. |
+| `keyvault` | Key Vault | **RBAC authorization** (not access policies); soft-delete 7 days. Identities are granted roles in the consuming modules. |
+| `postgres` | PostgreSQL Flexible Server 16 | `Standard_B1ms` burstable, 32 GB. Firewall rule `AllowAzureServices` (0.0.0.0) lets Container Apps reach it — tighten to VNet in prod. |
+| `cosmos` | Cosmos DB for NoSQL | **Serverless**, `disableLocalAuth: true` (AAD-only — no keys). DB `tokenfoundry`, container `usage`, partition key `/pk` (`subscriptionId_yyyymm`), **90-day TTL** on raw docs. |
+| `eventhub` | Event Hub namespace + `usage` hub | Provisioned for the Phase-2 billing stream; **not wired yet**. Standard tier, 2 partitions, 1-day retention, `billing` consumer group. |
+| `acr` | Container Registry (Basic) | `adminUserEnabled: false` — pull is via the Container App's managed identity (AcrPull). |
+| `apim` | API Management (Developer SKU) | System-assigned identity. Sets up the App Insights **logger + diagnostic** (sampling **100%** — the cost/detail knob, see the module comment) and grants its own identity **Cosmos Data Contributor** so the outbound policy can write usage. |
+| `apim-backends` | Backend pool + circuit breakers | Uses the **preview** API version (native in Bicep — the reason we chose Bicep over Terraform). Placeholder pool; real per-provider backends are created at runtime by the FastAPI provisioner. |
+| `grafana` | Azure Managed Grafana | System identity granted **Monitoring Reader** on the RG so dashboards render (previously a manual step). |
+| `appsecrets` | Key Vault secrets | Assembles the Postgres connection string (so the password never lands in app settings) and writes `tf-database-url` / `tf-jwt-secret` / `tf-admin-password`. |
+| `containerapps` | Container App (API + portal) | See identity/RBAC below. |
+
+### Identities & RBAC (who can touch what)
+
+The Container App uses **two** identities by design:
+
+- **User-assigned (`*-acrpull-id`)** — granted AcrPull + Key Vault Secrets User
+  *before* the app exists, so the first revision can pull its image and resolve
+  secret references without a chicken-and-egg race.
+- **System-assigned** — the runtime identity (`DefaultAzureCredential`). Granted
+  at runtime: **APIM Service Contributor** (provision products/subs/backends),
+  **Key Vault Secrets Officer** (write subscription keys + BYO secrets),
+  **Cosmos DB Data Contributor** (read usage — data-plane RBAC, distinct from
+  control-plane), and **Monitoring Reader** on App Insights (KQL telemetry).
+
+APIM's system identity is separately granted **Cosmos DB Data Contributor** for
+the outbound-policy write path.
+
+### Runtime configuration (`TF_*` env vars)
+
+`app/config.py` reads these (prefix `TF_`); Container Apps injects them, secrets
+as Key Vault references:
+
+| Env var | Source | Purpose |
+|---|---|---|
+| `TF_DATABASE_URL` | KV `tf-database-url` | PostgreSQL SQLAlchemy URL. |
+| `TF_JWT_SECRET` | KV `tf-jwt-secret` | Signs self-hosted login JWTs. |
+| `TF_ADMIN_USERNAME` / `TF_ADMIN_PASSWORD` | env / KV | Seed admin credentials. |
+| `TF_COSMOS_ENDPOINT` | cosmos module | Usage store endpoint. |
+| `TF_APIM_SERVICE_NAME` | apim module | Target for runtime provisioning. |
+| `TF_APP_INSIGHTS_RESOURCE_ID` | monitor module | Resource the usage-telemetry KQL runs against. Without it the App Insights block degrades to empty. |
+| `TF_RESOURCE_GROUP` / `TF_AZURE_SUBSCRIPTION_ID` | deployment | ARM scope for the provisioner. |
+| `TF_ENVIRONMENT` | static `prod` | Gates the local dev-token auth bypass. |
 
 ## Run it (inside the Dev Container)
 
@@ -92,37 +224,51 @@ when `TF_ENVIRONMENT=local` — no Entra needed to exercise the flow end-to-end.
 ### 4. Deploy
 
 ```bash
-az group create -n <rg> -l <region>
+az group create -n <rg> -l centralus
+
+# (optional) fast first pass — data + observability tier only
+az deployment group create -g <rg> -f infra/main.lite.bicep \
+  -p namePrefix=tokenfoundry -p pgAdminPassword=<pwd>
+
+# build & push the single image (root Dockerfile builds portal + API)
+az acr build -r <acr> -t tokenfoundry:v6 .
+
+# full deployment
 az deployment group create -g <rg> -f infra/main.bicep \
-  -p infra/main.bicepparam -p pgAdminPassword=<pwd>
+  -p infra/main.bicepparam \
+  -p pgAdminPassword=<pwd> -p jwtSecret=<jwt> -p adminPassword=<admin-pwd> \
+  -p appImage=<acr>.azurecr.io/tokenfoundry:v6
 ```
 
-Then build/push the single image to ACR and update `appImage`:
+Subsequent app-only updates skip the deployment — rebuild and roll the revision:
 
 ```bash
-az acr build -r <acr> -t tokenfoundry:latest .   # root Dockerfile builds portal + API
+az acr build -r <acr> -t tokenfoundry:v7 .
+az containerapp update -g <rg> -n <prefix>-aca-app \
+  --image <acr>.azurecr.io/tokenfoundry:v7
 ```
 
-## Verification (maps to the plan's end-to-end checklist)
+## Verification (end-to-end checklist)
 
 1. `az login` in the container.
 2. `az deployment group create …` — APIM / PostgreSQL / Cosmos / Monitor /
    Grafana up; backend pool + circuit breaker created (preview API version).
-3. Admin console → create tenant + issue key + add model alias → APIM gets the
-   Product/Subscription/backend, key lands in Key Vault.
+3. Admin console → create tenant + project + issue key + add model alias → APIM
+   gets the Product/Subscription/backend, key lands in Key Vault.
 4. Call a provider API with the key (e.g. `POST {gateway}/llm-openai/v1/chat/completions`
    with the virtual key in the `api-key` header) → completion; over-TPM → 429.
 5. Multi-provider: switch the `model` in the body and call the matching provider
    path — `claude-*` → `/llm-anthropic/v1/messages` (`x-api-key` header),
    `gpt-5.x` → `/llm-openai/v1/responses`, other OpenAI/Gemini →
    `/v1/chat/completions` → all route correctly.
-6. App Insights shows token metrics by tenant/route; `GET /usage` agrees.
+6. **Usage page → pick the tenant**: the *Cosmos* block shows real prompt/
+   completion tokens + a per-call log; the *App Insights* block shows call
+   counts, p50/p95, gateway-vs-backend split, and the hourly trend.
 7. Grafana renders cross-tenant usage/cost/TPM.
 8. Small budget → `budget_enforcer` suspends the subscription → 401 thereafter.
 9. Azure Monitor alert → Action Group on budget threshold.
-10. (Phase 2) Customer portal: customer sees only their tenant; cross-tenant
-    access rejected by the tenant-scope middleware.
-11. (Phase 2) BYO backend credential isolation; semantic cache stays per-tenant.
+10. Customer portal: customer sees only their tenant; cross-tenant access
+    rejected by the tenant-scope middleware.
 
 To smoke-test every registered model end-to-end through the gateway, run
 `python scripts/smoke_test_models.py` — it auto-discovers the models from the
@@ -133,10 +279,11 @@ required variables.
 
 ## Implementation status
 
-- **Phase 1 (this scaffold):** data model, control-plane API + tenant-scope
-  auth, APIM provisioning service, multi-provider model routes, admin console,
-  Bicep for all PaaS, token-limit + emit-token-metric policy, Grafana dashboard.
-- **Phase 0 to do first:** validate the Unified Model API *management* contract
-  for adding a model/alias against a live instance (see `apim_provisioner.attach_alias`).
-- **Phase 2:** Event Hub billing worker, semantic cache, BYO isolation, customer
-  portal, budget $-enforcement via the stream, chargeback.
+- **Working today:** data model, control-plane API + tenant-scope auth, APIM
+  provisioning service, multi-provider model routes, admin + customer portal,
+  Bicep for all PaaS, token-limit + emit-token-metric policy, **APIM→Cosmos
+  direct usage capture**, **dual-source usage page** (Cosmos billing + App
+  Insights latency), Grafana dashboards.
+- **Phase 2 (provisioned, not wired):** Event Hub billing worker for
+  replayable/retry-safe accounting, semantic cache, BYO credential isolation,
+  budget $-enforcement via the stream, chargeback.
