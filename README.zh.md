@@ -9,32 +9,44 @@ Azure 原生的 LLM token 中枢 / AI 网关。在 Azure API Management 的 GenA
 
 ## 架构
 
-![Token Foundry 架构](docs/architecture.png)
+```mermaid
+flowchart LR
+    Clients["客户端 (SDK)"]
 
-> 图片仅作示意;下面的 ASCII 图才是权威参考。
+    subgraph ACA["aca-app — 单个 Azure Container App"]
+        Portal["React 门户<br/>(管理端 + 客户端 SPA)"]
+        API["FastAPI 控制平面<br/>租户 · 项目 · 密钥 ·<br/>路由 · 预算 · 用量"]
+        Portal -. "/api" .-> API
+    end
 
-```text
-                       aca-app(单个 Azure Container App)
-                       ┌──────────────────────────────────────┐
-                       │  React 门户(管理端 + 客户端 SPA)      │
-                       │  由 FastAPI StaticFiles 托管            │
-                       │             │ /api                     │
-  客户端 ──密钥──▶ APIM            ▼                            │
-   (数据平面)       │     FastAPI 控制平面                      │
-   每供应商一个 API │     租户 / 项目 / 密钥 / 路由 /           │
-   token 限流       │     预算 / 用量 + 租户作用域鉴权          │
-   负载均衡 + 熔断  └────────┬───────────────┬─────────────────┘
-   发射指标     │            │ 管理 (ARM)     │
-                │            ▼                ├─ PostgreSQL  (元数据)
-                │      运行时向 APIM           ├─ Cosmos NoSQL (用量,读)
-                │      provision 产品/订阅/    ├─ Key Vault   (密钥读写)
-                │      后端                    └─ App Insights (KQL 遥测)
-                │
-                ├─路由─▶ Claude / Gemini / OpenAI 后端(每供应商一个 API)
-                │
-                └─出站策略(托管身份,即发即忘)──▶
-                         Cosmos NoSQL `usage` 容器(每次调用一条文档)
+    APIM["Azure API Management — AI 网关<br/>token 限流 · 负载均衡 · 熔断"]
+
+    Claude["Anthropic Claude"]
+    Gemini["Google Gemini"]
+    OpenAI["OpenAI"]
+
+    PG[("PostgreSQL<br/>元数据")]
+    Cosmos[("Cosmos DB<br/>用量")]
+    KV["Key Vault<br/>密钥"]
+    Insights["App Insights<br/>遥测"]
+
+    Clients -->|虚拟密钥| APIM
+    APIM -->|路由| Claude
+    APIM -->|路由| Gemini
+    APIM -->|路由| OpenAI
+    APIM -->|"出站策略:写用量"| Cosmos
+
+    API -->|管理 · ARM| APIM
+    API <-->|读 / 写| PG
+    API <-->|读 / 写| KV
+    API -->|读| Cosmos
+    API -->|读| Insights
 ```
+
+> 全系统只有**一个** Cosmos DB。APIM 在每次调用时把一条用量记录*写*进去
+> (出站策略);FastAPI 从**同一个**库里*读*出来给用量页 —— 这就是为什么
+> 同一个节点既有一条写入箭头、又有一条读出箭头。精修版渲染图在
+> [`docs/architecture.png`](docs/architecture.png);这张 Mermaid 图才是权威来源。
 
 - **APIM = 数据平面** —— 鉴权、token 限流、路由、负载均衡 + 熔断,以及那条
   **每次调用直接把一条用量记录写进 Cosmos 的出站策略**(托管身份鉴权、

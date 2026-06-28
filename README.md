@@ -10,32 +10,45 @@ subscription-key header, so the provider's own SDK works against the gateway.
 
 ## Architecture
 
-![Token Foundry architecture](docs/architecture.png)
+```mermaid
+flowchart LR
+    Clients["Clients (SDKs)"]
 
-> The diagram is a visual aid; the ASCII below is the authoritative reference.
+    subgraph ACA["aca-app — single Azure Container App"]
+        Portal["React portal<br/>(admin + customer SPA)"]
+        API["FastAPI control plane<br/>tenants · projects · keys ·<br/>routes · budgets · usage"]
+        Portal -. "/api" .-> API
+    end
 
-```text
-                       aca-app (single Azure Container App)
-                       ┌──────────────────────────────────────┐
-                       │  React portal (admin + customer SPA)  │
-                       │  served by FastAPI StaticFiles        │
-                       │             │ /api                     │
-  Clients ──key──▶ APIM            ▼                            │
-   (data plane)     │     FastAPI control plane                │
-   per-provider API │     tenants / projects / keys / routes / │
-   token-limit      │     budgets / usage + tenant-scope auth  │
-   LB + breaker     └────────┬───────────────┬─────────────────┘
-   emit-metric  │            │ manage (ARM)   │
-                │            ▼                ├─ PostgreSQL  (metadata)
-                │      provisions APIM        ├─ Cosmos NoSQL (usage, read)
-                │      products / subs /      ├─ Key Vault   (secrets r/w)
-                │      backends at runtime    └─ App Insights (KQL telemetry)
-                │
-                ├─route─▶ Claude / Gemini / OpenAI backends (per-provider API)
-                │
-                └─outbound policy (managed identity, fire-and-forget)──▶
-                         Cosmos NoSQL `usage` container (one doc per call)
+    APIM["Azure API Management — AI gateway<br/>token-limit · load-balance · circuit-breaker"]
+
+    Claude["Anthropic Claude"]
+    Gemini["Google Gemini"]
+    OpenAI["OpenAI"]
+
+    PG[("PostgreSQL<br/>metadata")]
+    Cosmos[("Cosmos DB<br/>usage")]
+    KV["Key Vault<br/>secrets"]
+    Insights["App Insights<br/>telemetry"]
+
+    Clients -->|virtual key| APIM
+    APIM -->|route| Claude
+    APIM -->|route| Gemini
+    APIM -->|route| OpenAI
+    APIM -->|"outbound policy: write usage"| Cosmos
+
+    API -->|manage · ARM| APIM
+    API <-->|read / write| PG
+    API <-->|read / write| KV
+    API -->|read| Cosmos
+    API -->|read| Insights
 ```
+
+> There is **one** Cosmos DB. APIM *writes* a usage record to it on every call
+> (outbound policy); FastAPI *reads* from that same store for the usage page —
+> that's why one node has both a write arrow in and a read arrow out. A polished
+> rendering is at [`docs/architecture.png`](docs/architecture.png); this Mermaid
+> diagram is the authoritative source.
 
 - **APIM = data plane** — auth, token-limiting, routing, load-balance + circuit
   breaker, and the **outbound policy that writes one usage record per call
