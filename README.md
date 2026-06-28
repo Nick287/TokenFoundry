@@ -290,6 +290,13 @@ Responses API), and prints a pass/fail table. Configure the gateway URL and a
 virtual key via a local `.env` (gitignored); see the script's header for the
 required variables.
 
+## Security & data model
+
+How secrets and data are stored — what lives in Key Vault vs. PostgreSQL vs.
+Cosmos, how callers and users are authenticated, the RBAC model, and the honest
+list of trade-offs — is documented in
+**[docs/SECURITY.md](docs/SECURITY.md)** ([中文](docs/SECURITY.zh.md)).
+
 ## Implementation status
 
 - **Working today:** data model, control-plane API + tenant-scope auth, APIM

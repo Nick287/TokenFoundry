@@ -276,6 +276,12 @@ az containerapp update -g <rg> -n <prefix>-aca-app \
 Responses API),并打印一张通过/失败表。通过本地 `.env`(已 gitignore)配置网关
 URL 和一个虚拟密钥;所需变量见脚本头部。
 
+## 安全与数据模型
+
+密钥和数据怎么存 —— 什么存在 Key Vault、什么存在 PostgreSQL、什么存在 Cosmos,
+调用方和用户怎么鉴权,RBAC 模型,以及诚实的取舍清单 —— 都记在
+**[docs/SECURITY.zh.md](docs/SECURITY.zh.md)**([English](docs/SECURITY.md))。
+
 ## 实现状态
 
 - **当前可用:** 数据模型、控制平面 API + 租户作用域鉴权、APIM 开通服务、
