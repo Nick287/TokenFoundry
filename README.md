@@ -46,9 +46,10 @@ flowchart LR
 
 > There is **one** Cosmos DB. APIM *writes* a usage record to it on every call
 > (outbound policy); FastAPI *reads* from that same store for the usage page —
-> that's why one node has both a write arrow in and a read arrow out. A polished
-> rendering is at [`docs/architecture.png`](docs/architecture.png); this Mermaid
-> diagram is the authoritative source.
+> that's why one node has both a write arrow in and a read arrow out. The Mermaid
+> diagram above is the authoritative source; a polished rendering is below.
+
+![Token Foundry architecture](docs/architecture.png)
 
 - **APIM = data plane** — auth, token-limiting, routing, load-balance + circuit
   breaker, and the **outbound policy that writes one usage record per call

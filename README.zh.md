@@ -45,8 +45,10 @@ flowchart LR
 
 > 全系统只有**一个** Cosmos DB。APIM 在每次调用时把一条用量记录*写*进去
 > (出站策略);FastAPI 从**同一个**库里*读*出来给用量页 —— 这就是为什么
-> 同一个节点既有一条写入箭头、又有一条读出箭头。精修版渲染图在
-> [`docs/architecture.png`](docs/architecture.png);这张 Mermaid 图才是权威来源。
+> 同一个节点既有一条写入箭头、又有一条读出箭头。上方的 Mermaid 图是权威来源;
+> 下方是精修版渲染图。
+
+![Token Foundry 架构](docs/architecture.png)
 
 - **APIM = 数据平面** —— 鉴权、token 限流、路由、负载均衡 + 熔断,以及那条
   **每次调用直接把一条用量记录写进 Cosmos 的出站策略**(托管身份鉴权、
