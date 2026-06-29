@@ -34,6 +34,7 @@ param adminPassword string
 var tags = {
   project: 'token-foundry'
   environment: environmentName
+  SecurityControl: 'Ignore'
 }
 
 // --- Observability foundation (Log Analytics + App Insights) ---

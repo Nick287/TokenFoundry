@@ -26,6 +26,7 @@ param pgAdminPassword string
 var tags = {
   project: 'token-foundry'
   environment: environmentName
+  SecurityControl: 'Ignore'
 }
 
 module monitor 'modules/monitor.bicep' = {

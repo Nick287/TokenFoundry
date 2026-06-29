@@ -93,6 +93,9 @@ class ApimProvisioner:
         self._sub_id = s.azure_subscription_id
         self._rg = s.resource_group
         self._service = s.apim_service_name
+        self._cosmos_endpoint = s.cosmos_endpoint.rstrip("/")
+        self._cosmos_db = s.cosmos_database
+        self._cosmos_container = s.cosmos_usage_container
         self._client: ApiManagementClient | None = None
 
     @property
@@ -225,13 +228,16 @@ class ApimProvisioner:
         )
         return backend.name or backend_id
 
-    @staticmethod
-    def _build_provider_policy(backend_id: str) -> str:
-        """Inbound policy for a provider API: fixed backend + token govern.
+    def _build_provider_policy(self, backend_id: str) -> str:
+        """Inbound governance + outbound Cosmos usage write for a provider API.
 
-        No per-model <choose> needed — each provider API binds one backend; the
-        upstream (multi-model) backend dispatches by the body's `model`.
+        Each provider API binds one backend; the upstream (multi-model) backend
+        dispatches by the body's `model`. Outbound writes one usage record per
+        successful call to the `usage` container (send-one-way-request,
+        fire-and-forget, MI auth) — the Cosmos endpoint comes from settings so it
+        always matches the deployed account (never a hardcoded host).
         """
+        docs = f"{self._cosmos_endpoint}/dbs/{self._cosmos_db}/colls/{self._cosmos_container}/docs"
         return f"""<policies>
   <inbound>
     <base />
@@ -244,9 +250,29 @@ class ApimProvisioner:
       <dimension name="subscription" value="@(context.Subscription.Id)" />
       <dimension name="api" value="@(context.Api.Id)" />
     </llm-emit-token-metric>
+    <authentication-managed-identity resource="https://cosmos.azure.com"
+      output-token-variable-name="cosmosToken" ignore-error="true" />
   </inbound>
   <backend><base /></backend>
-  <outbound><base /></outbound>
+  <outbound>
+    <base />
+    <choose>
+      <when condition="@(context.Response.StatusCode == 200 &amp;&amp; context.Variables.ContainsKey(&quot;cosmosToken&quot;))">
+        <send-one-way-request mode="new">
+          <set-url>{docs}</set-url>
+          <set-method>POST</set-method>
+          <set-header name="Authorization" exists-action="override">
+            <value>@(System.Net.WebUtility.UrlEncode("type=aad&amp;ver=1.0&amp;sig=" + (string)context.Variables["cosmosToken"]))</value>
+          </set-header>
+          <set-header name="x-ms-version" exists-action="override"><value>2018-12-31</value></set-header>
+          <set-header name="x-ms-documentdb-partitionkey" exists-action="override">
+            <value>@("[\\"" + context.Subscription.Id + "_" + DateTime.UtcNow.ToString("yyyyMM") + "\\"]")</value>
+          </set-header>
+          <set-body>@{{var doc=new JObject();doc["id"]=context.RequestId;doc["pk"]=context.Subscription.Id+"_"+DateTime.UtcNow.ToString("yyyyMM");doc["ts"]=DateTime.UtcNow.ToString("o");doc["subscription"]=context.Subscription.Id;doc["api"]=context.Api.Id;try{{doc["raw_response"]=context.Response.Body.As&lt;JObject&gt;(preserveContent:true);}}catch{{doc["raw_response"]=null;}}return doc.ToString();}}</set-body>
+        </send-one-way-request>
+      </when>
+    </choose>
+  </outbound>
   <on-error><base /></on-error>
 </policies>"""
 
