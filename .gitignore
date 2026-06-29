@@ -45,3 +45,6 @@ local.settings.json
 
 # Internal status/working notes (contain live infra endpoints — keep local)
 STATUS.md
+
+# TS incremental build cache (machine-generated)
+*.tsbuildinfo

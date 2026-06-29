@@ -106,3 +106,28 @@ def suspend_key(
     db.commit()
     db.refresh(vk)
     return vk
+
+
+@router.delete("/keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_key(
+    key_id: str,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> None:
+    """Permanently revoke a virtual key: cancel its APIM subscription, drop the
+    Key Vault secret, and delete the row. Best-effort on the cloud cleanup so a
+    stale Azure object never blocks removing the record."""
+    vk = db.get(VirtualKey, key_id)
+    if not vk:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="key not found")
+    if vk.apim_subscription_id:
+        try:
+            ApimProvisioner().delete_subscription(vk.apim_subscription_id)
+        except Exception:  # noqa: BLE001 — never block deletion on APIM
+            pass
+    try:
+        KeyVaultService().delete_secret(KeyVaultService.subscription_key_name(key_id))
+    except Exception:  # noqa: BLE001 — secret may already be gone
+        pass
+    db.delete(vk)
+    db.commit()

@@ -98,6 +98,11 @@ class TenantOut(BaseModel):
     created_at: datetime
 
 
+class TenantUpdate(BaseModel):
+    name: str | None = None
+    mode: TenantMode | None = None
+
+
 # ----- Project -----
 
 
@@ -114,6 +119,11 @@ class ProjectOut(BaseModel):
     name: str
     cost_center: str | None
     created_at: datetime
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = None
+    cost_center: str | None = None
 
 
 # ----- VirtualKey -----
@@ -179,6 +189,13 @@ class ModelRouteOut(BaseModel):
     price_out_per_1k: float
     markup_pct: float
     created_at: datetime
+
+
+class ModelRouteUpdate(BaseModel):
+    name: str | None = None
+    price_in_per_1k: float | None = None
+    price_out_per_1k: float | None = None
+    markup_pct: float | None = None
 
 
 # ----- Budget -----

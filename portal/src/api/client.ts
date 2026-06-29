@@ -54,6 +54,8 @@ export interface ModelRoute {
   name: string;
   provider: "openai" | "anthropic" | "google";
   owner_scope: "PLATFORM" | "TENANT";
+  price_in_per_1k: number;
+  price_out_per_1k: number;
   markup_pct: number;
   created_at: string;
 }
@@ -156,6 +158,13 @@ export const api = {
     request<Tenant>(`/tenants/${tenantId}/ensure-product`, token, {
       method: "POST",
     }),
+  updateTenant: (token: string, id: string, body: { name?: string; mode?: string }) =>
+    request<Tenant>(`/tenants/${id}`, token, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteTenant: (token: string, id: string) =>
+    requestNoContent(`/tenants/${id}`, token, { method: "DELETE" }),
   listProjects: (token: string, tenantId?: string) =>
     request<Project[]>(
       tenantId ? `/projects?tenant_id=${encodeURIComponent(tenantId)}` : "/projects",
@@ -169,12 +178,30 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  updateProject: (
+    token: string,
+    id: string,
+    body: { name?: string; cost_center?: string | null },
+  ) =>
+    request<Project>(`/projects/${id}`, token, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteProject: (token: string, id: string) =>
+    requestNoContent(`/projects/${id}`, token, { method: "DELETE" }),
   listRoutes: (token: string) => request<ModelRoute[]>("/routes", token),
   createRoute: (token: string, body: Record<string, unknown>) =>
     request<ModelRoute>("/routes", token, {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  updateRoute: (token: string, id: string, body: Record<string, unknown>) =>
+    request<ModelRoute>(`/routes/${id}`, token, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteRoute: (token: string, id: string) =>
+    requestNoContent(`/routes/${id}`, token, { method: "DELETE" }),
   createKey: (token: string, body: Record<string, unknown>) =>
     request<VirtualKeySecret>("/keys", token, {
       method: "POST",
@@ -185,6 +212,8 @@ export const api = {
       projectId ? `/keys?project_id=${encodeURIComponent(projectId)}` : "/keys",
       token,
     ),
+  deleteKey: (token: string, id: string) =>
+    requestNoContent(`/keys/${id}`, token, { method: "DELETE" }),
   myUsage: (token: string) => request<UsageSummary>("/usage", token),
   tenantUsage: (token: string, tenantId: string) =>
     request<UsageSummary>(`/admin/usage/${tenantId}`, token),

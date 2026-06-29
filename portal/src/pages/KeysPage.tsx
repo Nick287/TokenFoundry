@@ -2,17 +2,23 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { api, type VirtualKeySecret } from "../api/client";
+import { api, type VirtualKey, type VirtualKeySecret } from "../api/client";
 import { usePrincipal } from "../auth/AuthProvider";
+import { ConfirmDialog } from "../components/Modal";
+import { CopyId } from "../components/CopyId";
+import { useToast } from "../components/Toast";
 
 export function KeysPage() {
   const principal = usePrincipal()!;
   const qc = useQueryClient();
   const { t } = useTranslation();
+  const toast = useToast();
   const [projectId, setProjectId] = useState("");
   const [budget, setBudget] = useState("");
   const [issued, setIssued] = useState<VirtualKeySecret | null>(null);
   const [copied, setCopied] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [removing, setRemoving] = useState<VirtualKey | null>(null);
 
   const projects = useQuery({
     queryKey: ["projects"],
@@ -36,6 +42,8 @@ export function KeysPage() {
       setCopied(false);
       setProjectId("");
       setBudget("");
+      setAdding(false);
+      toast(t("common.created"));
       qc.invalidateQueries({ queryKey: ["keys"] });
     },
   });
@@ -45,6 +53,15 @@ export function KeysPage() {
     if (!projectId || create.isPending) return;
     create.mutate();
   }
+
+  const del = useMutation({
+    mutationFn: (id: string) => api.deleteKey(principal.token, id),
+    onSuccess: () => {
+      setRemoving(null);
+      toast(t("common.deleted"));
+      qc.invalidateQueries({ queryKey: ["keys"] });
+    },
+  });
 
   async function onCopy() {
     if (!issued) return;
@@ -63,6 +80,13 @@ export function KeysPage() {
       <h2>{t("keys.title")}</h2>
       <p className="help-card">{t("help.keys")}</p>
 
+      <div className="list-toolbar">
+        <button type="button" className="add-toggle" onClick={() => setAdding((v) => !v)}>
+          {adding ? t("common.close") : `+ ${t("keys.addNew")}`}
+        </button>
+      </div>
+
+      {adding && (
       <form className="card form-row" onSubmit={onSubmit}>
         <select value={projectId} onChange={(e) => setProjectId(e.target.value)}>
           <option value="">{t("keys.selectProject")}</option>
@@ -81,6 +105,7 @@ export function KeysPage() {
           {create.isPending ? t("keys.provisioning") : t("keys.issue")}
         </button>
       </form>
+      )}
       {create.isError && <p className="error">{String(create.error)}</p>}
 
       {issued && (
@@ -109,6 +134,7 @@ export function KeysPage() {
       ) : keys.isError ? (
         <p className="error">{t("common.loadFailed")}</p>
       ) : keys.data && keys.data.length > 0 ? (
+        <div className="table-scroll">
         <table className="card">
           <thead>
             <tr>
@@ -117,6 +143,7 @@ export function KeysPage() {
               <th>{t("common.status")}</th>
               <th>{t("keys.budgetCol")}</th>
               <th>{t("keys.created")}</th>
+              <th>{t("common.actions")}</th>
             </tr>
           </thead>
           <tbody>
@@ -125,7 +152,7 @@ export function KeysPage() {
               return (
                 <tr key={k.id}>
                   <td>
-                    <code className="id-cell">{k.id}</code>
+                    <CopyId value={k.id} />
                   </td>
                   <td>
                     {proj ? (
@@ -146,13 +173,40 @@ export function KeysPage() {
                       : t("keys.unlimited")}
                   </td>
                   <td>{new Date(k.created_at).toLocaleString()}</td>
+                  <td className="row-actions">
+                    <button
+                      type="button"
+                      className="btn-sm btn-danger"
+                      onClick={() => setRemoving(k)}
+                    >
+                      {t("common.delete")}
+                    </button>
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
+        </div>
       ) : (
-        <p className="hint">{t("keys.empty")}</p>
+        <div className="card empty-cta">
+          <strong>{t("keys.emptyTitle")}</strong>
+          {t("keys.emptyHint")}
+        </div>
+      )}
+
+      {removing && (
+        <ConfirmDialog
+          title={t("keys.deleteTitle")}
+          impact={
+            <>
+              {t("keys.deleteImpact", { id: removing.id })} {t("common.cannotUndo")}
+            </>
+          }
+          busy={del.isPending}
+          onConfirm={() => del.mutate(removing.id)}
+          onClose={() => setRemoving(null)}
+        />
       )}
     </section>
   );

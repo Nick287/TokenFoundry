@@ -10,12 +10,14 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import Principal, require_admin
 from app.db import get_db
-from app.models.orm import Project, Tenant
+from app.models.orm import Project, Tenant, VirtualKey
 from app.models.schemas import (
     ProjectCreate,
     ProjectOut,
+    ProjectUpdate,
     TenantCreate,
     TenantOut,
+    TenantUpdate,
 )
 from app.services.apim_provisioner import ApimProvisioner
 
@@ -63,6 +65,53 @@ def list_tenants(
     db: Session = Depends(get_db), _: Principal = Depends(require_admin)
 ) -> list[Tenant]:
     return list(db.query(Tenant).all())
+
+
+@router.patch("/tenants/{tenant_id}", response_model=TenantOut)
+def update_tenant(
+    tenant_id: str,
+    body: TenantUpdate,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> Tenant:
+    tenant = db.get(Tenant, tenant_id)
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="tenant not found"
+        )
+    if body.name is not None:
+        tenant.name = body.name
+    if body.mode is not None:
+        tenant.mode = body.mode
+    db.commit()
+    db.refresh(tenant)
+    return tenant
+
+
+@router.delete("/tenants/{tenant_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_tenant(
+    tenant_id: str,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> None:
+    """Delete a tenant and cascade its projects + keys. Refuses while live
+    (active/suspended) keys exist so a delete never silently revokes traffic."""
+    tenant = db.get(Tenant, tenant_id)
+    if not tenant:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="tenant not found")
+    live = (
+        db.query(VirtualKey)
+        .join(Project, VirtualKey.project_id == Project.id)
+        .filter(Project.tenant_id == tenant_id)
+        .count()
+    )
+    if live:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"tenant has {live} key(s); delete those first",
+        )
+    db.delete(tenant)
+    db.commit()
 
 
 @router.post("/tenants/{tenant_id}/ensure-product", response_model=TenantOut)
@@ -120,3 +169,42 @@ def list_projects(
     if tenant_id:
         q = q.filter(Project.tenant_id == tenant_id)
     return list(q.all())
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectOut)
+def update_project(
+    project_id: str,
+    body: ProjectUpdate,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> Project:
+    project = db.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+    if body.name is not None:
+        project.name = body.name
+    if body.cost_center is not None:
+        project.cost_center = body.cost_center
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+@router.delete("/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> None:
+    """Delete a project. Refuses while it still has keys (delete those first)."""
+    project = db.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+    live = db.query(VirtualKey).filter(VirtualKey.project_id == project_id).count()
+    if live:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"project has {live} key(s); delete those first",
+        )
+    db.delete(project)
+    db.commit()

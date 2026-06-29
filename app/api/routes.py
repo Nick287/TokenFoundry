@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import Principal, require_admin
 from app.db import get_db
 from app.models.orm import ModelRoute
-from app.models.schemas import ModelRouteCreate, ModelRouteOut
+from app.models.schemas import ModelRouteCreate, ModelRouteOut, ModelRouteUpdate
 from app.services.apim_provisioner import ApimProvisioner
 from app.services.keyvault import KeyVaultService
 
@@ -72,6 +72,31 @@ def list_routes(
     db: Session = Depends(get_db), _: Principal = Depends(require_admin)
 ) -> list[ModelRoute]:
     return list(db.query(ModelRoute).all())
+
+
+@router.patch("/routes/{route_id}", response_model=ModelRouteOut)
+def update_route(
+    route_id: str,
+    body: ModelRouteUpdate,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> ModelRoute:
+    """Edit a route's display fields: alias and pricing/markup. Provider, backend
+    and KV secret are immutable here — delete and re-add to change those."""
+    route = db.get(ModelRoute, route_id)
+    if not route:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="route not found")
+    if body.name is not None:
+        route.name = body.name
+    if body.price_in_per_1k is not None:
+        route.price_in_per_1k = body.price_in_per_1k
+    if body.price_out_per_1k is not None:
+        route.price_out_per_1k = body.price_out_per_1k
+    if body.markup_pct is not None:
+        route.markup_pct = body.markup_pct
+    db.commit()
+    db.refresh(route)
+    return route
 
 
 @router.delete("/routes/{route_id}", status_code=status.HTTP_204_NO_CONTENT)

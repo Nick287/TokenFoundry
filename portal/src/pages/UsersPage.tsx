@@ -4,11 +4,14 @@ import { useTranslation } from "react-i18next";
 
 import { api } from "../api/client";
 import { usePrincipal } from "../auth/AuthProvider";
+import { ConfirmDialog } from "../components/Modal";
+import { useToast } from "../components/Toast";
 
 export function UsersPage() {
   const principal = usePrincipal()!;
   const qc = useQueryClient();
   const { t } = useTranslation();
+  const toast = useToast();
   const isAdmin = principal.role === "admin";
 
   // --- create-user form (admin) ---
@@ -16,6 +19,7 @@ export function UsersPage() {
   const [password, setPassword] = useState("");
   const [role, setRole] = useState("customer");
   const [tenantId, setTenantId] = useState("");
+  const [removing, setRemoving] = useState<{ id: string; username: string } | null>(null);
 
   // --- change-my-password (everyone) ---
   const [oldPw, setOldPw] = useState("");
@@ -46,6 +50,7 @@ export function UsersPage() {
       setPassword("");
       setRole("customer");
       setTenantId("");
+      toast(t("common.created"));
       qc.invalidateQueries({ queryKey: ["users"] });
     },
   });
@@ -58,7 +63,11 @@ export function UsersPage() {
 
   const del = useMutation({
     mutationFn: (id: string) => api.deleteUser(principal.token, id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["users"] }),
+    onSuccess: () => {
+      setRemoving(null);
+      toast(t("common.deleted"));
+      qc.invalidateQueries({ queryKey: ["users"] });
+    },
   });
 
   const reset = useMutation({
@@ -134,6 +143,7 @@ export function UsersPage() {
       {/* Admin-only: create + manage users */}
       {isAdmin && (
         <>
+          <h3>{t("users.manageTitle")}</h3>
           <form className="card form-row" onSubmit={onCreate}>
             <input
               placeholder={t("users.username")}
@@ -180,6 +190,7 @@ export function UsersPage() {
           {users.isLoading ? (
             <p>{t("common.loading")}</p>
           ) : (
+            <div className="table-scroll">
             <table className="card">
               <thead>
                 <tr>
@@ -266,9 +277,7 @@ export function UsersPage() {
                               type="button"
                               className="btn-sm btn-danger"
                               disabled={busy}
-                              onClick={() => {
-                                if (window.confirm(t("users.deleteConfirm"))) del.mutate(u.id);
-                              }}
+                              onClick={() => setRemoving({ id: u.id, username: u.username })}
                             >
                               {t("users.delete")}
                             </button>
@@ -280,8 +289,23 @@ export function UsersPage() {
                 })}
               </tbody>
             </table>
+            </div>
           )}
         </>
+      )}
+
+      {removing && (
+        <ConfirmDialog
+          title={t("users.deleteConfirm")}
+          impact={
+            <>
+              <code>{removing.username}</code> · {t("common.cannotUndo")}
+            </>
+          }
+          busy={del.isPending}
+          onConfirm={() => del.mutate(removing.id)}
+          onClose={() => setRemoving(null)}
+        />
       )}
     </section>
   );

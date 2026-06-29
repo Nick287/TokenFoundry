@@ -11,13 +11,18 @@ import { UsageCard } from "./UsageCard";
 // 24h timeline; non-zero bars carry their count above, zero hours show a faint
 // baseline stub, and the x-axis labels every 4th hour for a time reference.
 function TrendBars({ data }: { data: UsageTelemetry["by_hour"] }) {
-  const max = Math.max(1, ...data.map((d) => d.calls));
+  // Trim leading empty hours so a single late spike isn't crushed against 20
+  // blank bars; keep from the first hour with traffic onward (min 6 cols).
+  const first = data.findIndex((d) => d.calls > 0);
+  const start = first < 0 ? Math.max(0, data.length - 6) : Math.max(0, Math.min(first - 1, data.length - 6));
+  const shown = data.slice(start);
+  const max = Math.max(1, ...shown.map((d) => d.calls));
   const fmtHour = (ts: string) =>
     new Date(ts).toLocaleTimeString([], { hour: "2-digit", hour12: false });
   return (
     <div className="trend card">
       <div className="trend-plot">
-        {data.map((d) => {
+        {shown.map((d) => {
           const pct = d.calls === 0 ? 2 : Math.max(8, (d.calls / max) * 85);
           return (
             <div
@@ -36,7 +41,7 @@ function TrendBars({ data }: { data: UsageTelemetry["by_hour"] }) {
         })}
       </div>
       <div className="trend-axis">
-        {data.map((d, i) => (
+        {shown.map((d, i) => (
           <span className="trend-tick" key={d.ts}>
             {i % 4 === 0 ? fmtHour(d.ts) : ""}
           </span>
@@ -54,6 +59,7 @@ export function UsageDashboardPage() {
   const principal = usePrincipal()!;
   const { t } = useTranslation();
   const [tenantId, setTenantId] = useState("");
+  const [showAll, setShowAll] = useState(false);
 
   const tenants = useQuery({
     queryKey: ["tenants"],
@@ -105,6 +111,8 @@ export function UsageDashboardPage() {
           {records.isLoading ? (
             <p>{t("common.loading")}</p>
           ) : records.data && records.data.length > 0 ? (
+            <>
+            <div className="table-scroll">
             <table className="card">
               <thead>
                 <tr>
@@ -117,7 +125,7 @@ export function UsageDashboardPage() {
                 </tr>
               </thead>
               <tbody>
-                {records.data.map((r, i) => (
+                {(showAll ? records.data : records.data.slice(0, 25)).map((r, i) => (
                   <tr key={`${r.ts}-${i}`}>
                     <td>{r.ts ? new Date(r.ts).toLocaleString() : "—"}</td>
                     <td>{r.api ?? r.route}</td>
@@ -140,6 +148,13 @@ export function UsageDashboardPage() {
                 ))}
               </tbody>
             </table>
+            </div>
+            {records.data.length > 25 && (
+              <button type="button" className="btn-sm" onClick={() => setShowAll((v) => !v)}>
+                {showAll ? t("common.close") : t("usage.showAll", { n: records.data.length })}
+              </button>
+            )}
+            </>
           ) : (
             <p className="hint">{t("usage.noRecords")}</p>
           )}
@@ -155,6 +170,7 @@ export function UsageDashboardPage() {
           <p className="hint">
             {t("usage.totalCalls")}: {telemetry.data.total_calls.toLocaleString()}
           </p>
+          <div className="table-scroll">
           <table className="card">
             <thead>
               <tr>
@@ -173,7 +189,9 @@ export function UsageDashboardPage() {
                   <td>{row.name}</td>
                   <td>{row.calls.toLocaleString()}</td>
                   <td>{row.p50 != null ? `${Math.round(row.p50)} ms` : "—"}</td>
-                  <td>{row.p95 != null ? `${Math.round(row.p95)} ms` : "—"}</td>
+                  <td className={row.p95 != null && row.p95 > 3000 ? "cell-alert" : undefined}>
+                    {row.p95 != null ? `${Math.round(row.p95)} ms` : "—"}
+                  </td>
                   <td>
                     {row.gateway_p50 != null
                       ? `${Math.round(row.gateway_p50)} ms`
@@ -184,11 +202,14 @@ export function UsageDashboardPage() {
                       ? `${Math.round(row.backend_p50)} ms`
                       : "—"}
                   </td>
-                  <td>{row.failures.toLocaleString()}</td>
+                  <td className={row.failures > 0 ? "cell-alert" : "cell-zero"}>
+                    {row.failures.toLocaleString()}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
+          </div>
 
           {telemetry.data.by_hour.length > 0 && (
             <>

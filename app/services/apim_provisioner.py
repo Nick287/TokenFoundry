@@ -326,6 +326,16 @@ class ApimProvisioner:
             self._rg, self._service, subscription_id, params
         )
 
+    def delete_subscription(self, subscription_id: str) -> None:
+        """Permanently delete an APIM subscription (key revoke). Idempotent:
+        a missing subscription is treated as already-deleted, not an error."""
+        try:
+            self.client.subscription.delete(
+                self._rg, self._service, subscription_id, if_match="*"
+            )
+        except ResourceNotFoundError:
+            logger.info("subscription %s already gone", subscription_id)
+
     # --- Model backends + aliases ---
 
     def add_model_route(

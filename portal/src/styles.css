@@ -383,10 +383,206 @@ code.id-cell {
   background: var(--accent-soft);
 }
 
+.btn-danger {
+  color: var(--error);
+}
+
 .btn-danger:hover:not(:disabled) {
   border-color: var(--error);
   color: var(--error);
   background: #fbe4e6;
+}
+
+/* Visible keyboard focus on every interactive control (quality floor). Mouse
+   clicks don't show it; tab/arrow navigation does. */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+.topbar nav a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn-danger:focus-visible,
+.btn-danger-solid:focus-visible {
+  outline-color: var(--error);
+}
+
+/* --- Modal (edit forms + delete confirm) --- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(28, 27, 26, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  animation: modal-fade 0.15s ease;
+}
+
+.modal {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 8px 40px rgba(28, 27, 26, 0.22);
+  padding: 1.4rem 1.5rem;
+  width: 100%;
+  max-width: 420px;
+  max-height: 85vh;
+  overflow-y: auto;
+  outline: none;
+  animation: modal-rise 0.18s ease;
+}
+
+.modal-title {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+}
+
+.modal-impact {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0 0 1.1rem;
+}
+
+.modal-impact code {
+  color: var(--ink);
+}
+
+.modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  margin: 0.25rem 0 1.1rem;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+}
+
+/* Solid danger CTA — only inside a confirm, where delete is the primary action. */
+.btn-danger-solid {
+  background: var(--error);
+  color: #fff;
+  border: none;
+}
+
+.btn-danger-solid:hover:not(:disabled) {
+  background: #8a0019;
+}
+
+@keyframes modal-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes modal-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modal-overlay, .modal { animation: none; }
+}
+
+/* --- Toast stack (bottom-right, auto-dismiss) --- */
+.toast-stack {
+  position: fixed;
+  bottom: 1.25rem;
+  right: 1.25rem;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.toast {
+  background: var(--ink);
+  color: #fff;
+  padding: 0.6rem 0.95rem;
+  border-radius: 9px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  box-shadow: var(--shadow);
+  animation: modal-rise 0.18s ease;
+}
+
+.toast-ok { border-left: 3px solid var(--ok); }
+.toast-error { border-left: 3px solid var(--error); }
+
+@media (prefers-reduced-motion: reduce) {
+  .toast { animation: none; }
+}
+
+/* --- Click-to-copy id --- */
+.copy-id {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-weight: 400;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.copy-id:hover .id-cell { color: var(--accent); }
+
+/* --- Horizontal scroll wrapper for wide tables on narrow screens --- */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin: 1rem 0;
+}
+.table-scroll table { min-width: 640px; margin: 0; }
+
+/* --- Search / filter row above a list --- */
+.list-toolbar {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0.5rem 0;
+}
+.list-toolbar .count { color: var(--muted); font-size: 0.82rem; margin-left: auto; white-space: nowrap; }
+
+/* Keep the alias readable as one token; let the column carry width, the cell
+   scrolls inside .table-scroll rather than wrapping mid-name. */
+td code { white-space: nowrap; }
+
+/* Collapse create form behind a +Add toggle */
+.add-toggle {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  font-weight: 600;
+}
+
+/* Row actions reveal on hover/focus to quiet dense tables; stay visible on touch. */
+.row-actions { opacity: 0.35; transition: opacity 0.12s; }
+tr:hover .row-actions,
+tr:focus-within .row-actions { opacity: 1; }
+@media (hover: none) { .row-actions { opacity: 1; } }
+
+/* Data cells that signal trouble (failures, slow p95). */
+.cell-alert { color: var(--error); font-weight: 600; }
+.cell-zero { color: #b0aca4; }
+
+/* Empty-table call to action. */
+.empty-cta { text-align: center; color: var(--muted); padding: 1.25rem; }
+.empty-cta strong { display: block; color: var(--ink); margin-bottom: 0.25rem; }
+
+/* Toolbar: search grows, filter + button stay compact, count trails. */
+.list-toolbar input { flex: 1 1 200px; }
+.list-toolbar select { flex: 0 0 auto; }
+.list-toolbar .add-toggle { flex: 0 0 auto; }
+
+@media (max-width: 640px) {
+  .toast-stack { left: 1rem; right: 1rem; bottom: 1rem; }
+  .toast { text-align: center; }
 }
 
 /* --- Metrics --- */
