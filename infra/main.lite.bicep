@@ -67,15 +67,6 @@ module cosmos 'modules/cosmos.bicep' = {
   }
 }
 
-module eventhub 'modules/eventhub.bicep' = {
-  name: 'eventhub'
-  params: {
-    namePrefix: namePrefix
-    location: location
-    tags: tags
-  }
-}
-
 // --- Container Registry (holds the single API+portal image for the full tier) ---
 module acr 'modules/acr.bicep' = {
   name: 'acr'
@@ -90,6 +81,5 @@ output keyVaultUri string = keyvault.outputs.vaultUri
 output postgresFqdn string = postgres.outputs.serverFqdn
 output cosmosEndpoint string = cosmos.outputs.endpoint
 output appInsightsId string = monitor.outputs.appInsightsId
-output eventHubNamespace string = eventhub.outputs.namespaceName
 output acrLoginServer string = acr.outputs.loginServer
 output acrName string = acr.outputs.registryName

@@ -18,7 +18,7 @@ param publisherEmail string = 'admin@tokenfoundry.local'
 param publisherName string = 'Token Foundry'
 
 resource apim 'Microsoft.ApiManagement/service@2024-05-01' = {
-  name: '${namePrefix}-apim'
+  name: take('${namePrefix}-apim-${uniqueString(resourceGroup().id)}', 50)
   location: location
   tags: tags
   sku: {

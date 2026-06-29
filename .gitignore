@@ -28,6 +28,9 @@ infra/*.json
 !infra/main.bicepparam
 !infra/dashboards/*.json
 
+# Playwright MCP (browser automation artifacts — console logs, page snapshots)
+.playwright-mcp/
+
 # Editor / OS
 .DS_Store
 Thumbs.db

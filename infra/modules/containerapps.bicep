@@ -110,7 +110,7 @@ resource kvSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 
 // --- Single app: API + portal in one image ---
 resource app 'Microsoft.App/containerApps@2024-03-01' = {
-  name: '${namePrefix}-aca-app'
+  name: take('${namePrefix}-aca-${uniqueString(resourceGroup().id)}', 32)
   location: location
   tags: tags
   // SystemAssigned: runtime access to Key Vault / Cosmos / APIM (DefaultAzureCredential).

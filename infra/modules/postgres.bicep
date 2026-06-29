@@ -9,7 +9,7 @@ param adminLogin string
 param adminPassword string
 
 resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
-  name: '${namePrefix}-pg'
+  name: take('${namePrefix}-pg-${uniqueString(resourceGroup().id)}', 60)
   location: location
   tags: tags
   sku: {

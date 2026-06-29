@@ -89,16 +89,6 @@ module acr 'modules/acr.bicep' = {
   }
 }
 
-// --- Billing stream (Event Hub) — Phase 2, provisioned now ---
-module eventhub 'modules/eventhub.bicep' = {
-  name: 'eventhub'
-  params: {
-    namePrefix: namePrefix
-    location: location
-    tags: tags
-  }
-}
-
 // --- AI gateway (APIM) ---
 module apim 'modules/apim.bicep' = {
   name: 'apim'
@@ -117,16 +107,6 @@ module apimBackends 'modules/apim-backends.bicep' = {
   name: 'apim-backends'
   params: {
     apimName: apim.outputs.apimName
-  }
-}
-
-// --- Managed Grafana (read-only dashboards) ---
-module grafana 'modules/grafana.bicep' = {
-  name: 'grafana'
-  params: {
-    namePrefix: namePrefix
-    location: location
-    tags: tags
   }
 }
 
@@ -171,5 +151,4 @@ module containerapps 'modules/containerapps.bicep' = {
 output apimGatewayUrl string = apim.outputs.gatewayUrl
 output appFqdn string = containerapps.outputs.appFqdn
 output keyVaultUri string = keyvault.outputs.vaultUri
-output grafanaEndpoint string = grafana.outputs.endpoint
 output acrLoginServer string = acr.outputs.loginServer
