@@ -157,18 +157,31 @@ def tenant_usage(
 @router.get("/admin/usage/{tenant_id}/records")
 def tenant_usage_records(
     tenant_id: str,
-    limit: int = 100,
+    page: int = 1,
+    page_size: int = 25,
     _: Principal = Depends(require_admin),
     db: Session = Depends(get_db),
-) -> list[dict[str, Any]]:
-    """Platform admin: per-call usage log (Cosmos source) for one tenant.
+) -> dict[str, Any]:
+    """Platform admin: per-call usage log (Cosmos source) for one tenant,
+    server-side paginated.
 
-    Resolves the tenant's virtual keys, then returns the matching call records.
+    Resolves the tenant's virtual keys, then returns the matching page of call
+    records plus the total count so the portal can render page controls.
     """
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
     key_ids = _tenant_key_ids(db, tenant_id)
-    rows = UsageStore().query_by_subscriptions(key_ids, limit=limit)
+    store = UsageStore()
+    rows = store.query_by_subscriptions(
+        key_ids, limit=page_size, skip=(page - 1) * page_size
+    )
     key_projects = _key_project_map(db, tenant_id)
-    return [_to_record_view(r, key_projects) for r in rows]
+    return {
+        "items": [_to_record_view(r, key_projects) for r in rows],
+        "total": store.count_by_subscriptions(key_ids),
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @router.get("/admin/usage-telemetry")

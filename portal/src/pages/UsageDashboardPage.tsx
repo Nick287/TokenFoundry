@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -59,7 +59,8 @@ export function UsageDashboardPage() {
   const principal = usePrincipal()!;
   const { t } = useTranslation();
   const [tenantId, setTenantId] = useState("");
-  const [showAll, setShowAll] = useState(false);
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 25;
 
   const tenants = useQuery({
     queryKey: ["tenants"],
@@ -73,9 +74,10 @@ export function UsageDashboardPage() {
   });
 
   const records = useQuery({
-    queryKey: ["admin-usage-records", tenantId],
-    queryFn: () => api.tenantUsageRecords(principal.token, tenantId),
+    queryKey: ["admin-usage-records", tenantId, page],
+    queryFn: () => api.tenantUsageRecords(principal.token, tenantId, page, PAGE_SIZE),
     enabled: tenantId.length > 0,
+    placeholderData: keepPreviousData,
   });
 
   const telemetry = useQuery({
@@ -88,7 +90,7 @@ export function UsageDashboardPage() {
       <h2>{t("usage.title")}</h2>
       <p className="help-card">{t("help.usage")}</p>
       <div className="card form-row">
-        <select value={tenantId} onChange={(e) => setTenantId(e.target.value)}>
+        <select value={tenantId} onChange={(e) => { setTenantId(e.target.value); setPage(1); }}>
           <option value="">{t("usage.selectTenant")}</option>
           {tenants.data?.map((tn) => (
             <option key={tn.id} value={tn.id}>
@@ -110,7 +112,7 @@ export function UsageDashboardPage() {
           <h4>{t("usage.callLog")}</h4>
           {records.isLoading ? (
             <p>{t("common.loading")}</p>
-          ) : records.data && records.data.length > 0 ? (
+          ) : records.data && records.data.items.length > 0 ? (
             <>
             <div className="table-scroll">
             <table className="card">
@@ -125,7 +127,7 @@ export function UsageDashboardPage() {
                 </tr>
               </thead>
               <tbody>
-                {(showAll ? records.data : records.data.slice(0, 25)).map((r, i) => (
+                {records.data.items.map((r, i) => (
                   <tr key={`${r.ts}-${i}`}>
                     <td>{r.ts ? new Date(r.ts).toLocaleString() : "—"}</td>
                     <td>{r.api ?? r.route}</td>
@@ -149,11 +151,33 @@ export function UsageDashboardPage() {
               </tbody>
             </table>
             </div>
-            {records.data.length > 25 && (
-              <button type="button" className="btn-sm" onClick={() => setShowAll((v) => !v)}>
-                {showAll ? t("common.close") : t("usage.showAll", { n: records.data.length })}
-              </button>
-            )}
+            {(() => {
+              const total = records.data.total;
+              const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+              return (
+                <div className="pager">
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={page <= 1 || records.isFetching}
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  >
+                    {t("usage.pagePrev")}
+                  </button>
+                  <span className="pager-info">
+                    {t("usage.pageIndicator", { page, pages })}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={page >= pages || records.isFetching}
+                    onClick={() => setPage((p) => p + 1)}
+                  >
+                    {t("usage.pageNext")}
+                  </button>
+                </div>
+              );
+            })()}
             </>
           ) : (
             <p className="hint">{t("usage.noRecords")}</p>

@@ -121,6 +121,8 @@ class ModelRoute(Base, TimestampMixin):
     provider: Mapped[Provider] = mapped_column(Enum(Provider), nullable=False)
     apim_backend_or_pool_id: Mapped[str | None] = mapped_column(String(256))
     deployment_name: Mapped[str | None] = mapped_column(String(128))
+    # Azure OpenAI API version (e.g. "2024-10-21"); NULL for non-Azure providers.
+    api_version: Mapped[str | None] = mapped_column(String(64))
     owner_scope: Mapped[OwnerScope] = mapped_column(
         Enum(OwnerScope), default=OwnerScope.PLATFORM
     )

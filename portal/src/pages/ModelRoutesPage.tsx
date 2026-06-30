@@ -23,6 +23,8 @@ export function ModelRoutesPage() {
     provider: "anthropic",
     backend_url: "",
     backend_secret: "",
+    deployment_name: "",
+    api_version: "",
     auth_mode: "KV_SECRET",
     price_in_per_1k: "",
     price_out_per_1k: "",
@@ -43,13 +45,15 @@ export function ModelRoutesPage() {
         provider: form.provider,
         backend_url: form.backend_url || null,
         backend_secret: form.backend_secret || null,
+        deployment_name: form.deployment_name || null,
+        api_version: form.api_version || null,
         auth_mode: form.auth_mode,
         price_in_per_1k: Number(form.price_in_per_1k) || 0,
         price_out_per_1k: Number(form.price_out_per_1k) || 0,
         markup_pct: Number(form.markup_pct) || 0,
       }),
     onSuccess: () => {
-      setForm({ ...form, name: "", backend_url: "", backend_secret: "", price_in_per_1k: "", price_out_per_1k: "", markup_pct: "" });
+      setForm({ ...form, name: "", backend_url: "", backend_secret: "", deployment_name: "", api_version: "", price_in_per_1k: "", price_out_per_1k: "", markup_pct: "" });
       setAdding(false);
       toast(t("common.created"));
       qc.invalidateQueries({ queryKey: ["routes"] });
@@ -109,6 +113,7 @@ export function ModelRoutesPage() {
           <option value="anthropic">Anthropic</option>
           <option value="openai">OpenAI</option>
           <option value="google">Google</option>
+          <option value="azure">Azure OpenAI</option>
         </select>
         <button type="button" className="add-toggle" onClick={() => setAdding((v) => !v)}>
           {adding ? t("common.close") : `+ ${t("models.addNew")}`}
@@ -125,11 +130,14 @@ export function ModelRoutesPage() {
           <input placeholder={t("models.alias")} value={form.name} onChange={upd("name")} />
           <select value={form.provider} onChange={upd("provider")}>
             <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI-compatible (Kimi / DeepSeek / AOAI)</option>
+            <option value="openai">OpenAI-compatible (Kimi / DeepSeek)</option>
             <option value="google">Google (Gemini, OpenAI-compat)</option>
+            <option value="azure">Azure OpenAI</option>
           </select>
           <input placeholder={t("models.backendUrl")} value={form.backend_url} onChange={upd("backend_url")} />
           <input placeholder={t("models.backendKey")} value={form.backend_secret} onChange={upd("backend_secret")} type="password" />
+          <input placeholder={t("models.deployment")} value={form.deployment_name} onChange={upd("deployment_name")} />
+          <input placeholder={t("models.apiVersion")} value={form.api_version} onChange={upd("api_version")} />
           <input placeholder={t("models.priceIn")} value={form.price_in_per_1k} onChange={upd("price_in_per_1k")} />
           <input placeholder={t("models.priceOut")} value={form.price_out_per_1k} onChange={upd("price_out_per_1k")} />
           <input placeholder={t("models.markup")} value={form.markup_pct} onChange={upd("markup_pct")} />
@@ -205,16 +213,37 @@ function EditRouteModal({ route, busy, onClose, onSave }: {
 }) {
   const { t } = useTranslation();
   const [name, setName] = useState(route.name);
+  const [priceIn, setPriceIn] = useState(String(route.price_in_per_1k));
+  const [priceOut, setPriceOut] = useState(String(route.price_out_per_1k));
+  const [deployment, setDeployment] = useState(route.deployment_name ?? "");
+  const [apiVersion, setApiVersion] = useState(route.api_version ?? "");
   const [markup, setMarkup] = useState(String(route.markup_pct));
   return (
     <Modal title={t("models.editTitle")} onClose={onClose}>
       <div className="modal-form">
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder={t("models.alias")} />
+        <input value={deployment} onChange={(e) => setDeployment(e.target.value)} placeholder={t("models.deployment")} />
+        <input value={apiVersion} onChange={(e) => setApiVersion(e.target.value)} placeholder={t("models.apiVersion")} />
+        <input value={priceIn} onChange={(e) => setPriceIn(e.target.value)} placeholder={t("models.priceIn")} />
+        <input value={priceOut} onChange={(e) => setPriceOut(e.target.value)} placeholder={t("models.priceOut")} />
         <input value={markup} onChange={(e) => setMarkup(e.target.value)} placeholder={t("models.markup")} />
       </div>
       <div className="modal-actions">
         <button type="button" className="btn-sm" onClick={onClose} disabled={busy}>{t("common.cancel")}</button>
-        <button type="button" disabled={!name || busy} onClick={() => onSave({ name, markup_pct: Number(markup) || 0 })}>
+        <button
+          type="button"
+          disabled={!name || busy}
+          onClick={() =>
+            onSave({
+              name,
+              deployment_name: deployment || null,
+              api_version: apiVersion || null,
+              price_in_per_1k: Number(priceIn) || 0,
+              price_out_per_1k: Number(priceOut) || 0,
+              markup_pct: Number(markup) || 0,
+            })
+          }
+        >
           {busy ? t("common.saving") : t("common.save")}
         </button>
       </div>

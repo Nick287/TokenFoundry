@@ -55,6 +55,7 @@ def add_route(
         provider=body.provider,
         apim_backend_or_pool_id=backend_id,
         deployment_name=body.deployment_name,
+        api_version=body.api_version,
         owner_scope=body.owner_scope,
         auth_mode=body.auth_mode,
         price_in_per_1k=body.price_in_per_1k,
@@ -81,13 +82,18 @@ def update_route(
     db: Session = Depends(get_db),
     _: Principal = Depends(require_admin),
 ) -> ModelRoute:
-    """Edit a route's display fields: alias and pricing/markup. Provider, backend
-    and KV secret are immutable here — delete and re-add to change those."""
+    """Edit a route's display fields: alias, deployment/version and
+    pricing/markup. Provider, backend and KV secret are immutable here — delete
+    and re-add to change those."""
     route = db.get(ModelRoute, route_id)
     if not route:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="route not found")
     if body.name is not None:
         route.name = body.name
+    if body.deployment_name is not None:
+        route.deployment_name = body.deployment_name
+    if body.api_version is not None:
+        route.api_version = body.api_version
     if body.price_in_per_1k is not None:
         route.price_in_per_1k = body.price_in_per_1k
     if body.price_out_per_1k is not None:

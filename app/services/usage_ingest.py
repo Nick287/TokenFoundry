@@ -93,13 +93,16 @@ class UsageStore:
         )
 
     def query_by_subscriptions(
-        self, subscription_ids: list[str], limit: int = 1000
+        self, subscription_ids: list[str], limit: int = 1000, skip: int = 0
     ) -> list[dict]:
         """Usage records whose `subscription` (virtual key id) is in the given
         set. This is how a tenant's usage is resolved: the caller maps tenant ->
         its virtual keys via PostgreSQL, then we match those keys in Cosmos.
         Records are written with tenant='unknown' (no tenant header on the data
-        plane yet), so the virtual key is the reliable tenant linkage."""
+        plane yet), so the virtual key is the reliable tenant linkage.
+
+        `skip`/`limit` give server-side pagination (OFFSET/LIMIT) for the portal
+        call log; pair with count_by_subscriptions for total pages."""
         if not self._endpoint or not subscription_ids:
             return []
         # Cosmos supports ARRAY_CONTAINS(@ids, c.subscription) for an IN-style
@@ -108,15 +111,34 @@ class UsageStore:
             self._container.query_items(
                 query=(
                     "SELECT * FROM c WHERE ARRAY_CONTAINS(@ids, c.subscription) "
-                    "ORDER BY c.ts DESC OFFSET 0 LIMIT @n"
+                    "ORDER BY c.ts DESC OFFSET @skip LIMIT @n"
                 ),
                 parameters=[
                     {"name": "@ids", "value": subscription_ids},
+                    {"name": "@skip", "value": skip},
                     {"name": "@n", "value": limit},
                 ],
                 enable_cross_partition_query=True,
             )
         )
+
+    def count_by_subscriptions(self, subscription_ids: list[str]) -> int:
+        """Total number of usage records for the given virtual keys — used to
+        compute page count for the paginated call log. Returns 0 when Cosmos is
+        not configured or the key set is empty."""
+        if not self._endpoint or not subscription_ids:
+            return 0
+        rows = list(
+            self._container.query_items(
+                query=(
+                    "SELECT VALUE COUNT(1) FROM c "
+                    "WHERE ARRAY_CONTAINS(@ids, c.subscription)"
+                ),
+                parameters=[{"name": "@ids", "value": subscription_ids}],
+                enable_cross_partition_query=True,
+            )
+        )
+        return int(rows[0]) if rows else 0
 
 
 class AppInsightsUsage:

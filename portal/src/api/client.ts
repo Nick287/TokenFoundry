@@ -52,8 +52,10 @@ export interface VirtualKeySecret extends VirtualKey {
 export interface ModelRoute {
   id: string;
   name: string;
-  provider: "openai" | "anthropic" | "google";
+  provider: "openai" | "anthropic" | "google" | "azure";
   owner_scope: "PLATFORM" | "TENANT";
+  deployment_name: string | null;
+  api_version: string | null;
   price_in_per_1k: number;
   price_out_per_1k: number;
   markup_pct: number;
@@ -79,6 +81,14 @@ export interface UsageRecordView {
   prompt_tok: number;
   completion_tok: number;
   cached_tok: number;
+}
+
+// One server-side page of the Cosmos-sourced call log.
+export interface UsageRecordPage {
+  items: UsageRecordView[];
+  total: number;
+  page: number;
+  page_size: number;
 }
 
 // App Insights-sourced call counts + latency (separate data source).
@@ -217,8 +227,16 @@ export const api = {
   myUsage: (token: string) => request<UsageSummary>("/usage", token),
   tenantUsage: (token: string, tenantId: string) =>
     request<UsageSummary>(`/admin/usage/${tenantId}`, token),
-  tenantUsageRecords: (token: string, tenantId: string) =>
-    request<UsageRecordView[]>(`/admin/usage/${tenantId}/records`, token),
+  tenantUsageRecords: (
+    token: string,
+    tenantId: string,
+    page = 1,
+    pageSize = 25,
+  ) =>
+    request<UsageRecordPage>(
+      `/admin/usage/${tenantId}/records?page=${page}&page_size=${pageSize}`,
+      token,
+    ),
   usageTelemetry: (token: string) =>
     request<UsageTelemetry>("/admin/usage-telemetry", token),
   listUsers: (token: string) => request<User[]>("/users", token),

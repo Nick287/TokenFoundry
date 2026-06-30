@@ -46,5 +46,8 @@ local.settings.json
 # Internal status/working notes (contain live infra endpoints — keep local)
 STATUS.md
 
+# AI assistant working dir (plans, research scratch — keep local)
+.claude/
+
 # TS incremental build cache (machine-generated)
 *.tsbuildinfo

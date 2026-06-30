@@ -47,9 +47,10 @@ class TenantStatus(StrEnum):
 
 
 class Provider(StrEnum):
-    OPENAI = "openai"            # incl. Azure OpenAI, Kimi, DeepSeek (OpenAI-compatible)
+    OPENAI = "openai"            # OpenAI / Kimi / DeepSeek (OpenAI-compatible, Bearer auth)
     ANTHROPIC = "anthropic"      # Claude (Anthropic Messages API)
     GOOGLE = "google"            # Gemini (OpenAI-compatible endpoint)
+    AZURE = "azure"              # Azure OpenAI (api-key header + deployment routing)
 
 
 class UserRole(StrEnum):

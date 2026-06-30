@@ -166,6 +166,7 @@ class ModelRouteCreate(BaseModel):
     provider: Provider
     tenant_id: str | None = None
     deployment_name: str | None = None
+    api_version: str | None = None  # Azure OpenAI API version
     backend_url: str | None = None
     owner_scope: OwnerScope = OwnerScope.PLATFORM
     auth_mode: AuthMode = AuthMode.MI
@@ -183,6 +184,7 @@ class ModelRouteOut(BaseModel):
     provider: Provider
     tenant_id: str | None
     deployment_name: str | None
+    api_version: str | None
     owner_scope: OwnerScope
     auth_mode: AuthMode
     price_in_per_1k: float
@@ -193,6 +195,8 @@ class ModelRouteOut(BaseModel):
 
 class ModelRouteUpdate(BaseModel):
     name: str | None = None
+    deployment_name: str | None = None
+    api_version: str | None = None
     price_in_per_1k: float | None = None
     price_out_per_1k: float | None = None
     markup_pct: float | None = None

@@ -83,8 +83,33 @@ PROVIDER_APIS: dict[str, dict] = {
         "bearer": True,
         "ops": [("chat", "/v1/chat/completions")],
     },
+    "azure": {
+        # Azure OpenAI: client SDK sends the subscription key in `api-key`, and
+        # the REAL upstream Azure key is also an `api-key` header (NOT a Bearer
+        # token — that's the key difference from "openai"). Uses Azure's new
+        # OpenAI-compatible surface (/openai/v1/...) so the deployment travels in
+        # the request body `model`, matching the shared-backend dispatch model.
+        "api_id": "llm-azure",
+        "display": "LLM Azure OpenAI",
+        "sub_header": "api-key",
+        "backend": "llm-azure",
+        "auth_header": "api-key",
+        "bearer": False,
+        "ops": [
+            ("chat", "/openai/v1/chat/completions"),
+            ("responses", "/openai/v1/responses"),
+        ],
+    },
 }
 _LLM_PRODUCTS = ("starter", "unlimited")
+
+# Providers whose `chat` operation speaks the OpenAI Chat Completions schema, so
+# a streaming request accepts `stream_options.include_usage` to make the backend
+# emit a final usage chunk (needed for accurate llm-emit-token-metric counts).
+# Anthropic Messages and Google have no such parameter; the OpenAI/Azure
+# `responses` op uses the Responses API which rejects it — hence injection is
+# scoped to the `chat` op only (see _build_chat_stream_policy).
+_CHAT_USAGE_PROVIDERS = ("openai", "azure")
 
 
 class ApimProvisioner:
@@ -184,8 +209,26 @@ class ApimProvisioner:
             self._service,
             cfg["api_id"],
             "policy",
-            PolicyContract(value=self._build_provider_policy(backend_id), format="rawxml"),
+            PolicyContract(
+                value=self._build_provider_policy(backend_id, provider), format="rawxml"
+            ),
         )
+
+        # For OpenAI-schema providers, attach an operation-level policy to the
+        # `chat` op that injects stream_options.include_usage on streaming
+        # requests (so llm-emit-token-metric gets accurate counts). Scoped to
+        # `chat` only — the `responses` op's Responses API rejects the field.
+        if provider in _CHAT_USAGE_PROVIDERS:
+            self.client.api_operation_policy.create_or_update(
+                self._rg,
+                self._service,
+                cfg["api_id"],
+                "chat",
+                "policy",
+                PolicyContract(
+                    value=self._build_chat_stream_policy(), format="rawxml"
+                ),
+            )
 
         # Authorize subscription keys (scoped to these products) to call the API.
         for product_id in _LLM_PRODUCTS:
@@ -228,15 +271,30 @@ class ApimProvisioner:
         )
         return backend.name or backend_id
 
-    def _build_provider_policy(self, backend_id: str) -> str:
+    def _build_provider_policy(self, backend_id: str, provider: str) -> str:
         """Inbound governance + outbound Cosmos usage write for a provider API.
 
         Each provider API binds one backend; the upstream (multi-model) backend
         dispatches by the body's `model`. Outbound writes one usage record per
-        successful call to the `usage` container (send-one-way-request,
-        fire-and-forget, MI auth) — the Cosmos endpoint comes from settings so it
-        always matches the deployed account (never a hardcoded host).
+        successful, NON-STREAMING call to the `usage` container
+        (send-one-way-request, fire-and-forget, MI auth) — the Cosmos endpoint
+        comes from settings so it always matches the deployed account (never a
+        hardcoded host).
+
+        Streaming (SSE) responses are deliberately NOT persisted to Cosmos: the
+        outbound `As<JObject>()` body read would force APIM to buffer the whole
+        response, defeating token-by-token passthrough, and an event-stream body
+        isn't a single JSON object anyway. Streaming token accounting therefore
+        rides on the native `llm-emit-token-metric` (App Insights), which counts
+        inside the pipeline without reading the body. The outbound write is gated
+        on the response Content-Type not being `text/event-stream` (provider-
+        agnostic — all four providers stream with that media type).
+
+        `provider` is accepted for symmetry with the per-operation streaming
+        policy (see `_build_chat_stream_policy`); the API-level policy itself is
+        provider-agnostic.
         """
+        _ = provider  # API-level policy is provider-agnostic; kept for symmetry
         docs = f"{self._cosmos_endpoint}/dbs/{self._cosmos_db}/colls/{self._cosmos_container}/docs"
         return f"""<policies>
   <inbound>
@@ -257,7 +315,7 @@ class ApimProvisioner:
   <outbound>
     <base />
     <choose>
-      <when condition="@(context.Response.StatusCode == 200 &amp;&amp; context.Variables.ContainsKey(&quot;cosmosToken&quot;))">
+      <when condition="@(context.Response.StatusCode == 200 &amp;&amp; context.Variables.ContainsKey(&quot;cosmosToken&quot;) &amp;&amp; !context.Response.Headers.GetValueOrDefault(&quot;Content-Type&quot;,&quot;&quot;).Contains(&quot;text/event-stream&quot;))">
         <send-one-way-request mode="new">
           <set-url>{docs}</set-url>
           <set-method>POST</set-method>
@@ -273,6 +331,36 @@ class ApimProvisioner:
       </when>
     </choose>
   </outbound>
+  <on-error><base /></on-error>
+</policies>"""
+
+    @staticmethod
+    def _build_chat_stream_policy() -> str:
+        """Operation-level policy for the `chat` op: inject
+        `stream_options.include_usage=true` on STREAMING chat-completions requests.
+
+        Why operation-scoped and not API-level: `stream_options` is a Chat
+        Completions-only field. The same provider API also exposes a `responses`
+        op (OpenAI Responses API) which rejects the field with HTTP 400, so the
+        injection must not reach it. Attaching this only to the `chat` operation
+        keeps `responses` untouched.
+
+        Only mutates the body when `stream == true`; non-streaming requests pass
+        through unchanged. `<base />` preserves the inherited API-level policy
+        (backend routing, token limit/metric, Cosmos write). `preserveContent:true`
+        keeps the body readable by the backend after the rewrite.
+        """
+        return """<policies>
+  <inbound>
+    <base />
+    <choose>
+      <when condition="@{ try { var b = context.Request.Body.As&lt;JObject&gt;(preserveContent:true); return b != null &amp;&amp; b[&quot;stream&quot;] != null &amp;&amp; b[&quot;stream&quot;].Type == JTokenType.Boolean &amp;&amp; (bool)b[&quot;stream&quot;]; } catch { return false; } }">
+        <set-body>@{ var b = context.Request.Body.As&lt;JObject&gt;(preserveContent:true); var so = b[&quot;stream_options&quot;] as JObject ?? new JObject(); so[&quot;include_usage&quot;] = true; b[&quot;stream_options&quot;] = so; return b.ToString(); }</set-body>
+      </when>
+    </choose>
+  </inbound>
+  <backend><base /></backend>
+  <outbound><base /></outbound>
   <on-error><base /></on-error>
 </policies>"""
 

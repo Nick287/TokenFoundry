@@ -1,6 +1,15 @@
 <!--
   Token Foundry — LLM inbound policy (Phase 1).
 
+  NOTE: This static file is illustrative and is NOT the policy actually
+  deployed. The live per-provider policies are generated at runtime by
+  app/services/apim_provisioner.py (_build_provider_policy + the chat-op
+  _build_chat_stream_policy), which is where streaming (SSE) support lives:
+    * outbound Cosmos write is skipped for text/event-stream responses so the
+      stream passes through token-by-token (reading the body would buffer it);
+    * the chat op injects stream_options.include_usage on streaming OpenAI/Azure
+      requests so llm-emit-token-metric still gets accurate token counts.
+
   Applies to the Unified Model API. The gateway does the real work here; the
   control plane never reimplements any of this:
     * llm-token-limit      — per-subscription TPM enforcement (returns 429)
