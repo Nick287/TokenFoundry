@@ -1,0 +1,21 @@
+# Token Foundry — example variables (mirrors infra/main.bicepparam).
+# Copy to terraform.tfvars and fill in, OR pass values via -var / TF_VAR_*.
+# NOTE: real terraform.tfvars is gitignored — never commit secrets.
+
+name_prefix         = "tokenfoundry"
+environment_name    = "dev"
+resource_group_name = "tokenfoundry-rg"
+# Subscription restricts some resources (e.g. PostgreSQL) from eastus —
+# deploy everything to centralus for consistency.
+location       = "centralus"
+pg_admin_login = "tfadmin"
+
+# Image tag only — the Container App image ref is assembled by Terraform as
+# <acr-login-server>/tokenfoundry:<image_tag>. scripts/deploy.sh builds & pushes
+# this tag for you, so you normally don't set it here.
+# image_tag = "latest"
+
+# --- Secrets: do NOT set here. Export before running plan/apply:
+#   export TF_VAR_pg_admin_password="$PG_PWD"
+#   export TF_VAR_jwt_secret="$JWT"
+#   export TF_VAR_admin_password="$ADMIN_PWD"

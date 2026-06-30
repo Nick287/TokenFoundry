@@ -1,0 +1,19 @@
+# Terraform state stores secrets in PLAINTEXT (PG password, Key Vault secret
+# values, Log Analytics keys) — never commit state or real tfvars.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.tfstate.lock.info
+
+# Real variable files may hold secrets; only the example is safe to commit.
+*.tfvars
+!terraform.tfvars.example
+
+# Saved plans can also embed secret values.
+*.tfplan
+*.plan
+tf.plan
+
+crash.log
+override.tf
+override.tf.json

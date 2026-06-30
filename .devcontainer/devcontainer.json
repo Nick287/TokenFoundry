@@ -5,7 +5,8 @@
     "ghcr.io/devcontainers/features/azure-cli:1": {},
     "ghcr.io/devcontainers/features/node:1": {
       "version": "22"
-    }
+    },
+    "ghcr.io/devcontainers/features/terraform:1": {}
   },
   "customizations": {
     "vscode": {
@@ -15,7 +16,8 @@
         "ms-python.vscode-pylance",
         "charliermarsh.ruff",
         "ms-azuretools.vscode-azurefunctions",
-        "dbaeumer.vscode-eslint"
+        "dbaeumer.vscode-eslint",
+        "hashicorp.terraform"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/usr/local/bin/python",
