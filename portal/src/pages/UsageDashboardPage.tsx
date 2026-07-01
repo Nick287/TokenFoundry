@@ -60,7 +60,8 @@ export function UsageDashboardPage() {
   const { t } = useTranslation();
   const [tenantId, setTenantId] = useState("");
   const [page, setPage] = useState(1);
-  const PAGE_SIZE = 25;
+  const [pageSize, setPageSize] = useState(15);
+  const PAGE_SIZE_OPTIONS = [10, 15, 20];
 
   const tenants = useQuery({
     queryKey: ["tenants"],
@@ -74,8 +75,8 @@ export function UsageDashboardPage() {
   });
 
   const records = useQuery({
-    queryKey: ["admin-usage-records", tenantId, page],
-    queryFn: () => api.tenantUsageRecords(principal.token, tenantId, page, PAGE_SIZE),
+    queryKey: ["admin-usage-records", tenantId, page, pageSize],
+    queryFn: () => api.tenantUsageRecords(principal.token, tenantId, page, pageSize),
     enabled: tenantId.length > 0,
     placeholderData: keepPreviousData,
   });
@@ -153,9 +154,25 @@ export function UsageDashboardPage() {
             </div>
             {(() => {
               const total = records.data.total;
-              const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+              const pages = Math.max(1, Math.ceil(total / pageSize));
               return (
                 <div className="pager">
+                  <label className="pager-size">
+                    {t("usage.pageSize")}
+                    <select
+                      value={pageSize}
+                      onChange={(e) => {
+                        setPageSize(Number(e.target.value));
+                        setPage(1);
+                      }}
+                    >
+                      {PAGE_SIZE_OPTIONS.map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                   <button
                     type="button"
                     className="btn-sm"

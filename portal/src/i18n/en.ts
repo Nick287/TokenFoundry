@@ -163,6 +163,7 @@ export const en = {
     pagePrev: "Previous",
     pageNext: "Next",
     pageIndicator: "Page {{page}} of {{pages}}",
+    pageSize: "Per page",
     totalCalls: "Total calls",
     colApi: "API",
     colCalls: "Calls",

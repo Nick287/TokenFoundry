@@ -164,6 +164,7 @@ export const zh: TranslationShape = {
     pagePrev: "上一页",
     pageNext: "下一页",
     pageIndicator: "第 {{page}} / {{pages}} 页",
+    pageSize: "每页",
     totalCalls: "总调用次数",
     colApi: "API",
     colCalls: "调用数",

@@ -102,6 +102,7 @@ PROVIDER_API = {
     "anthropic": {"path": "llm-anthropic", "sub_header": "x-api-key"},
     "openai": {"path": "llm-openai", "sub_header": "api-key"},
     "google": {"path": "llm-google", "sub_header": "api-key"},
+    "azure": {"path": "llm-azure", "sub_header": "api-key"},
 }
 
 # Reasoning models spend output budget on hidden reasoning tokens, so a small
@@ -252,6 +253,27 @@ def route_for(alias: str, provider: str) -> dict:
             "fmt": "responses",
             "body": {"model": alias, "input": PROMPT, "max_output_tokens": MAX_TOKENS},
             "extract": extract_responses,
+        }
+    # Azure OpenAI: same schemas as openai, but the client-facing paths carry the
+    # `/openai` prefix (llm-azure ops are /openai/v1/chat/completions and
+    # /openai/v1/responses). Route gpt-5.x to Responses like openai, rest to Chat.
+    if provider == "azure":
+        if is_responses_model(alias):
+            return {
+                "suffix": "/openai/v1/responses",
+                "fmt": "responses",
+                "body": {"model": alias, "input": PROMPT, "max_output_tokens": MAX_TOKENS},
+                "extract": extract_responses,
+            }
+        return {
+            "suffix": "/openai/v1/chat/completions",
+            "fmt": "chat",
+            "body": {
+                "model": alias,
+                "max_tokens": MAX_TOKENS,
+                "messages": [{"role": "user", "content": PROMPT}],
+            },
+            "extract": extract_chat,
         }
     # openai (non-5.x) and google -> Chat Completions
     return {
@@ -558,6 +580,19 @@ def main() -> int:
     print(f"Models  : {len(models)}")
     print(f"Mode    : {mode_label}")
     print(f"Prompt  : {PROMPT}\n")
+
+    # Preview the models about to be tested, grouped by provider, before the run
+    # starts — so a long run's scope is visible up front.
+    print("Models to test:")
+    current_provider = None
+    for alias, provider in models:
+        if provider != current_provider:
+            current_provider = provider
+            count = sum(1 for _, p in models if p == provider)
+            print(f"  {provider} ({count}):")
+        print(f"    - {alias}")
+    print()
+
     print(f"{'RESULT':<7} {'PROVIDER':<10} {'MODE':<7} {'FORMAT':<10} {'MODEL':<24} REPLY / ERROR")
     print("-" * 110)
 
