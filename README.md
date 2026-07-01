@@ -93,6 +93,69 @@ is a stub).
   health/performance but **must not** be used for billing — that's why the two
   sources are kept apart.
 
+## Why this architecture
+
+The design goal is to **own the control plane (tenancy, keys, billing, routing
+policy) while renting the data plane from a managed gateway** instead of
+building one. Concretely:
+
+### Why APIM, not a hand-rolled gateway
+
+- **Token governance is a built-in policy, not app code.** `llm-token-limit`
+  enforces per-virtual-key TPM/quota and returns `429`/`403` *inside the
+  gateway*, and `llm-emit-token-metric` streams prompt/completion/cached token
+  counts to App Insights — both dimensioned by tenant/subscription. Re-creating
+  this in a proxy means re-implementing token accounting for every provider's
+  response shape and keeping a distributed rate-limit counter yourself.
+- **These policies understand each provider's token shape — including
+  streaming.** The gateway counts tokens for OpenAI Chat/Responses, Anthropic
+  Messages, and Google natively, and keeps counting on **streamed (SSE)
+  responses** without buffering the stream. The control plane never parses a
+  provider payload to meter it.
+- **Resilience is configuration, not a library.** Per-backend **circuit
+  breakers** (trip on repeated 5xx, honor `Retry-After`) and **load-balanced
+  backend pools** are declared on the backend object — no Polly/Hystrix glue in
+  the request path.
+- **Scale is a SKU change, not a re-architecture.** APIM scales horizontally by
+  adding **units** (each a dedicated slice of throughput), supports **autoscale**
+  on a schedule or load, and a single instance can span **multiple regions** for
+  geo-distribution and HA. Because all of that lives on the gateway resource, the
+  control plane, policies, and routing logic are untouched when you scale — the
+  app never becomes the throughput ceiling.
+- **The provider's own SDK just works.** Each provider gets its own APIM API
+  carrying that provider's *native* subscription-key header (`x-api-key` for
+  Anthropic, `api-key` for OpenAI/Azure/Google), so a client points its existing
+  SDK at the gateway URL and changes nothing else.
+- **Usage capture costs zero app latency.** The **outbound policy** writes one
+  usage record per call straight to Cosmos via `send-one-way-request`
+  (fire-and-forget, managed-identity auth) — the LLM response is never blocked
+  on the write, and no app process sits in the response path.
+- **No upstream keys on the data path.** Real provider keys live in Key Vault
+  and are attached to the APIM backend; clients only ever hold a per-tenant
+  virtual key (an APIM subscription) that can be suspended/revoked
+  independently. The gateway authenticates to Azure resources (Cosmos, AOAI)
+  with its **managed identity** — secretless.
+
+### Why the rest of the shape
+
+- **Control/data-plane split.** FastAPI only *provisions and reads* (creates
+  APIM products/subscriptions/backends via ARM, parses usage at read time); it
+  is never in the per-request hot path, so a control-plane deploy can't take the
+  gateway down.
+- **One image, one Container App.** The API and the built React SPA ship in a
+  single image (no nginx sidecar), so an app change is one `az acr build` + one
+  revision roll — exactly the path used to ship the streaming update.
+- **Two usage sources, kept apart.** Cosmos is the billing source (exact,
+  per-call); App Insights is the telemetry source (sampled — call counts,
+  p50/p95, gateway-vs-backend latency split). Sampled data never feeds billing.
+- **Azure-native, secretless integration.** Managed identity + Key Vault
+  references everywhere; Cosmos runs with `disableLocalAuth` (AAD-only). Fewer
+  secrets to rotate, and IaC (Bicep) reproduces the whole stack.
+
+> Trade-off, stated honestly: the MVP usage write is fire-and-forget, so an
+> occasional dropped record is acceptable for *trend* usage. Billing-grade,
+> replayable accounting is the Event Hub path (provisioned, not yet wired).
+
 ## Layout
 
 ```text
