@@ -18,7 +18,6 @@ COPY pyproject.toml ./
 RUN pip install --no-cache-dir .
 
 COPY app ./app
-COPY worker ./worker
 
 # Bake the built SPA into ./static — app.main mounts it if present
 COPY --from=portal-build /portal/dist ./static

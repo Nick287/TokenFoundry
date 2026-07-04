@@ -73,7 +73,7 @@ PROVIDERS = {
         "path": "llm-openai",
         "suffix": "/v1/responses",
         "fmt": "responses",
-        "default": "gpt-5.5",
+        "default": "gpt-5.4-mini",
     },
     "google": {
         "auth": "api-key",

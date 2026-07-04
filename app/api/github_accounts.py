@@ -25,13 +25,14 @@ from __future__ import annotations
 import logging
 import uuid
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.api.auth import Principal, require_admin
 from app.db import SessionLocal, get_db
-from app.models.enums import DeployStatus
-from app.models.orm import GitHubAccount
+from app.models.enums import AuthMode, DeployStatus, OwnerScope, Provider
+from app.models.orm import GitHubAccount, ModelRoute
 from app.models.schemas import DevicePollOut, DeviceStartOut, GitHubAccountOut
 from app.services import copilot_device, terraform_runner
 from app.services.apim_provisioner import ApimProvisioner
@@ -39,6 +40,96 @@ from app.services.keyvault import KeyVaultService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_HUB_MODELS_TIMEOUT = 30.0
+
+
+def _provider_for_model(model_id: str) -> str | None:
+    """Map a hub model id to its client-facing APIM provider API. Mirrors
+    scripts/register_hub_models.py:
+      claude-* -> anthropic (Messages API),
+      gpt-*/o[0-9]-* -> openai (Chat Completions + Responses),
+      gemini-*  -> google (OpenAI-compatible).
+    Anything else (embeddings, experimental, mai-*, trajectory-*) has no
+    client-facing provider API, so it returns None and is skipped."""
+    m = model_id.lower()
+    if m.startswith("claude"):
+        return "anthropic"
+    if m.startswith(("gpt", "o1-", "o3-", "o4-", "chatgpt")):
+        return "openai"
+    if m.startswith("gemini"):
+        return "google"
+    return None
+
+
+def _fetch_hub_models(fqdn: str, admin_token: str) -> list[str]:
+    """Fetch the hub's chat-model catalog via its admin API (`GET /api/models`).
+    Returns model ids where type == 'chat'. Raises on transport/HTTP error so
+    the caller can log and continue (catalog registration is non-fatal)."""
+    url = f"https://{fqdn}/api/models"
+    with httpx.Client(timeout=_HUB_MODELS_TIMEOUT) as hc:
+        r = hc.get(url, headers={"x-admin-token": admin_token})
+        r.raise_for_status()
+        payload = r.json()
+    rows = payload.get("data", []) if isinstance(payload, dict) else payload
+    return [
+        m["id"]
+        for m in rows
+        if isinstance(m, dict) and m.get("id") and m.get("type") == "chat"
+    ]
+
+
+def _register_hub_catalog(db: Session, fqdn: str, admin_token: str) -> None:
+    """Discover the hub's chat models and register the not-yet-known ones as
+    platform-pooled model routes, wiring each provider's client-facing APIM API
+    to its LOAD-BALANCED POOL (`llm-<provider>-pool`) so requests fan out across
+    every account's hub with session affinity (prompt-cache warmth — see
+    docs/APIM-LLM-Gateway.md §2/§4).
+
+    Idempotent: routes already present (by name) are skipped and
+    ensure_pooled_provider_api is a no-op update, so running this on every
+    account deploy is safe — the first account seeds the catalog, later accounts
+    only add pool members."""
+    model_ids = _fetch_hub_models(fqdn, admin_token)
+    by_provider: dict[str, list[str]] = {}
+    for mid in model_ids:
+        prov = _provider_for_model(mid)
+        if prov:
+            by_provider.setdefault(prov, []).append(mid)
+    if not by_provider:
+        logger.warning("hub catalog empty/unmappable; no model routes registered")
+        return
+
+    existing = {r.name for r in db.query(ModelRoute).all()}
+    provisioner = ApimProvisioner()
+    created = 0
+    for provider, models in by_provider.items():
+        # Wire the provider's API -> its pool once (idempotent). This is what
+        # makes the APIs appear under APIM > APIs.
+        pool_id = provisioner.ensure_pooled_provider_api(provider)
+        for mid in models:
+            if mid in existing:
+                continue
+            db.add(
+                ModelRoute(
+                    id=f"rt_{uuid.uuid4().hex[:12]}",
+                    tenant_id=None,  # platform-pooled (RESELL/INTERNAL)
+                    name=mid,
+                    provider=Provider(provider),
+                    apim_backend_or_pool_id=pool_id,
+                    owner_scope=OwnerScope.PLATFORM,
+                    auth_mode=AuthMode.MI,
+                )
+            )
+            existing.add(mid)
+            created += 1
+    db.commit()
+    logger.info(
+        "hub catalog: registered %d new model routes across %d providers (%s)",
+        created,
+        len(by_provider),
+        ", ".join(sorted(by_provider)),
+    )
 
 
 def _github_token_name(account_id: str) -> str:
@@ -203,6 +294,19 @@ def _deploy_account(account_id: str) -> None:
         #    ends match, zero hub round-trip, no revision-rollout race.
         backend_ids = ApimProvisioner().add_hub_to_pools(account_id, fqdn, hub_api_key)
         acct.backend_ids = backend_ids
+
+        # 4) discover the hub's model catalog and register any new models as
+        #    platform-pooled routes, wiring each provider's client-facing API to
+        #    its POOL (so the APIs actually appear + fan out with affinity). The
+        #    first account seeds the catalog; later accounts just add pool members
+        #    (idempotent, skips already-known models). Non-fatal: a catalog hiccup
+        #    must not fail an otherwise-healthy deploy — the account is READY once
+        #    it's in the pools; models can be (re)synced later.
+        try:
+            _register_hub_catalog(db, fqdn, admin_token)
+        except Exception:  # noqa: BLE001 — catalog is best-effort, don't fail deploy
+            logger.exception("_deploy_account: %s catalog registration failed", account_id)
+
         acct.status = DeployStatus.READY
         acct.error_detail = None
         db.commit()

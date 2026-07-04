@@ -163,6 +163,10 @@ class ApimProvisioner:
         operations (paths), a simple inbound policy (set-backend-service + token
         limit/metering), and product associations. Provider-agnostic: driven by
         PROVIDER_APIS config.
+
+        This is the SINGLE-backend path (BYO / a lone upstream). For the
+        GitModel-hub fleet use `ensure_pooled_provider_api`, which targets the
+        load-balanced pool instead.
         """
         cfg = PROVIDER_APIS.get(provider)
         if not cfg:
@@ -172,7 +176,35 @@ class ApimProvisioner:
         backend_id = self._ensure_provider_backend(
             cfg["backend"], upstream_url, cfg["auth_header"], secret, cfg["bearer"]
         )
+        self._ensure_api_and_ops(provider, cfg, backend_id)
+        return backend_id
 
+    def ensure_pooled_provider_api(self, provider: str) -> str:
+        """Wire a provider's client-facing API to its load-balanced POOL
+        (`llm-<provider>-pool`) instead of a single backend, so requests fan out
+        across every GitHub-account hub with session affinity (keeping each chat
+        session pinned to one hub for prompt-cache warmth — see
+        docs/APIM-LLM-Gateway.md §2/§4).
+
+        The pool itself is created during pool-join (`add_hub_to_pools`); this
+        only (idempotently) creates the API, its operations, the inbound policy
+        that targets the pool, the OpenAI-schema streaming op policy, and the
+        product links. Returns the pool id used as the backend target.
+        """
+        cfg = PROVIDER_APIS.get(provider)
+        if not cfg:
+            logger.warning("unknown provider '%s'; skipping APIM wiring", provider)
+            return ""
+        pool_id = f"llm-{provider}-pool"
+        self._ensure_api_and_ops(provider, cfg, pool_id)
+        return pool_id
+
+    def _ensure_api_and_ops(self, provider: str, cfg: dict, backend_id: str) -> None:
+        """Create/update the provider's APIM API, its operations, the inbound
+        policy (routing to `backend_id` — a single backend OR a pool), the
+        OpenAI-schema streaming op policy, and product associations. Shared by
+        `ensure_provider_api` (single backend) and `ensure_pooled_provider_api`
+        (pool). `set-backend-service` references a pool exactly like a backend."""
         # API with the provider-native subscription-key header.
         self.client.api.begin_create_or_update(
             self._rg,
@@ -204,7 +236,7 @@ class ApimProvisioner:
                 ),
             )
 
-        # Simple inbound policy: route to this provider's backend + token govern.
+        # Simple inbound policy: route to this provider's backend/pool + govern.
         self.client.api_policy.create_or_update(
             self._rg,
             self._service,
@@ -239,8 +271,6 @@ class ApimProvisioner:
                 )
             except (ResourceNotFoundError, HttpResponseError) as exc:
                 logger.warning("link %s to product %s skipped: %s", cfg["api_id"], product_id, exc)
-
-        return backend_id
 
     def _ensure_provider_backend(
         self, backend_id: str, url: str, auth_header: str, secret: str, bearer: bool
@@ -607,7 +637,12 @@ class ApimProvisioner:
     def _pool_remove_service(self, pool_id: str, backend_id: str) -> None:
         """GET pool -> drop backend from services[] -> PUT. No-op if pool or
         member is absent."""
-        svc_suffix = f"/backends/{backend_id}"
+        # Match on the lowercased `/backends/<id>` suffix — same normalization as
+        # _pool_add_service. ARM stores the service id as a RELATIVE path with
+        # potentially different casing than we'd construct, so a case-sensitive
+        # endswith can silently fail to match and leave the (now-destroyed) hub's
+        # backend orphaned in the pool.
+        svc_suffix = f"/backends/{backend_id}".lower()
         url = f"{self._backend_base()}/{pool_id}?api-version={self._POOL_API_VERSION}"
         headers = {"Authorization": f"Bearer {self._arm_token()}"}
         with httpx.Client(timeout=30.0) as hc:
@@ -619,7 +654,9 @@ class ApimProvisioner:
             props = body.get("properties", {})
             pool = props.get("pool") or {}
             services = pool.get("services") or []
-            kept = [s for s in services if not s.get("id", "").endswith(svc_suffix)]
+            kept = [
+                s for s in services if not s.get("id", "").lower().endswith(svc_suffix)
+            ]
             if len(kept) == len(services):
                 return  # not a member — idempotent
             pool["services"] = kept
