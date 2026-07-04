@@ -55,7 +55,6 @@ variable "image_tag" {
   type        = string
   default     = "latest"
 }
-
 variable "publisher_email" {
   description = "Publisher email for APIM"
   type        = string

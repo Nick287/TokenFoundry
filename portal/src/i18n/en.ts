@@ -8,6 +8,7 @@ export const en = {
     projects: "Projects",
     keys: "Keys",
     models: "Models",
+    github: "GitHub Accounts",
     usage: "Usage",
     users: "Users",
     myUsage: "My Usage",
@@ -137,6 +138,35 @@ export const en = {
     deleteTitle: "Delete model route?",
     deleteImpact: "Removes the alias {{name}}. The shared provider backend stays.",
   },
+  github: {
+    title: "GitHub Accounts",
+    addNew: "GitHub account",
+    starting: "Starting…",
+    accountCol: "Account",
+    statusCol: "Status",
+    endpointCol: "Hub endpoint",
+    emptyTitle: "No GitHub accounts yet",
+    emptyHint:
+      "Add a GitHub account: authorize its Copilot subscription and a dedicated hub is deployed and pooled automatically.",
+    authorizeTitle: "Authorize GitHub Copilot",
+    userCodeHint: "Enter this code on GitHub to authorize the account:",
+    openGithub: "Open GitHub",
+    awaitingHint: "Waiting for you to authorize in the browser…",
+    deployingHint: "Deploying the hub and joining the pools — this takes a few minutes.",
+    readyHint: "The hub is deployed and serving through the gateway.",
+    failedHint: "Something went wrong. Delete the account and try again.",
+    runInBackground: "Run in background",
+    deleteTitle: "Delete GitHub account?",
+    deleteImpact:
+      "Tears down the hub for {{login}}: destroys its resource group, removes it from the pools, and deletes its secrets.",
+    status: {
+      pending: "Awaiting authorization",
+      deploying: "Deploying",
+      ready: "Ready",
+      failed: "Failed",
+      deleting: "Deleting",
+    },
+  },
   usage: {
     title: "Usage & Cost",
     tenantId: "Tenant ID (tn_…)",
@@ -217,6 +247,8 @@ export const en = {
       "Issue a virtual key for a project. Flow: create a tenant → create a project → pick it here and issue. The key value is shown ONCE — copy it immediately. It is stored in Key Vault; the platform never reveals it again.",
     models:
       "Register a client-facing model alias (e.g. claude-sonnet) mapped to a real backend. Provider sets the API format (Anthropic vs OpenAI-compatible). Prices and markup drive metering and resale billing.",
+    github:
+      "Add a GitHub account to back the model pools with its Copilot subscription. Authorize the account via GitHub device login and the control plane deploys a dedicated hub, joins it to the openai/anthropic/google pools (with session affinity so prompt caching stays warm), and meters all traffic through APIM. Delete tears down its resource group and secrets.",
     usage:
       "Admin view of any tenant's token usage and cost. Enter a tenant id (tn_…) to see prompt/completion tokens, cost and billed amounts.",
     myUsage:

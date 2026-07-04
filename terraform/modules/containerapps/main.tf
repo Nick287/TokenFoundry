@@ -33,6 +33,35 @@ variable "admin_username" {
   default = "admin"
 }
 
+# --- 方案 A: remote-state wiring (control plane reads hub outputs from state) ---
+variable "tfstate_storage_account" {
+  type        = string
+  description = "Storage account holding per-account terraform remote state."
+}
+variable "tfstate_container" {
+  type        = string
+  description = "Blob container for terraform remote state."
+}
+variable "tfstate_storage_account_id" {
+  type        = string
+  description = "Storage account id — scope for the control plane's Storage Blob Data Reader grant (reads per-account hub outputs from state)."
+}
+variable "github_repo_owner" {
+  type        = string
+  default     = "Nick287"
+  description = "Owner of the repo hosting deploy-hub.yml (injected as TF_GITHUB_REPO_OWNER)."
+}
+variable "github_repo_name" {
+  type        = string
+  default     = "TokenFoundry"
+  description = "Repo hosting deploy-hub.yml (injected as TF_GITHUB_REPO_NAME)."
+}
+variable "github_ref" {
+  type        = string
+  default     = "master"
+  description = "Git ref the workflow_dispatch targets (injected as TF_GITHUB_REF)."
+}
+
 resource "azurerm_container_app_environment" "env" {
   name                       = "${var.name_prefix}-cae"
   location                   = var.location
@@ -180,6 +209,32 @@ resource "azurerm_container_app" "app" {
         value = var.admin_username
       }
 
+      # 方案 A: the control plane triggers a GitHub Action (workflow_dispatch) that
+      # runs the hub terraform, then reads the resulting outputs from remote state.
+      # It does NOT run terraform itself. These point it at the state blob and the
+      # workflow to dispatch. (The GitHub token is read from Key Vault at runtime,
+      # not injected here.)
+      env {
+        name  = "TF_TFSTATE_STORAGE_ACCOUNT"
+        value = var.tfstate_storage_account
+      }
+      env {
+        name  = "TF_TFSTATE_CONTAINER"
+        value = var.tfstate_container
+      }
+      env {
+        name  = "TF_GITHUB_REPO_OWNER"
+        value = var.github_repo_owner
+      }
+      env {
+        name  = "TF_GITHUB_REPO_NAME"
+        value = var.github_repo_name
+      }
+      env {
+        name  = "TF_GITHUB_REF"
+        value = var.github_ref
+      }
+
       liveness_probe {
         transport        = "HTTP"
         path             = "/healthz"
@@ -240,4 +295,19 @@ resource "azurerm_cosmosdb_sql_role_assignment" "app_data_contributor" {
   role_definition_id  = "${var.cosmos_account_id}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002"
   principal_id        = azurerm_container_app.app.identity[0].principal_id
   scope               = var.cosmos_account_id
+}
+
+# --- 方案 A: control plane reads per-account hub outputs from remote state ---
+#
+# The hub terraform runs in a GitHub Action (SP auth) and writes state to the
+# tfstate storage. The control plane downloads hubs/<account_id>.tfstate to read
+# the app_url / resource_group outputs — so its system identity needs read on the
+# state blobs. Storage Blob Data READER (not Contributor): the control plane only
+# reads state, never writes it. This is the ONLY new privilege 方案 A adds — far
+# smaller than P2's subscription-Contributor deployer identity, which is gone.
+resource "azurerm_role_assignment" "app_tfstate_reader" {
+  scope                = var.tfstate_storage_account_id
+  role_definition_name = "Storage Blob Data Reader"
+  principal_id         = azurerm_container_app.app.identity[0].principal_id
+  principal_type       = "ServicePrincipal"
 }

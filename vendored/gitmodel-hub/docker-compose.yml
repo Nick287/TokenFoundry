@@ -1,0 +1,16 @@
+services:
+  hub:
+    build: .
+    image: gitmodel-hub
+    container_name: gitmodel-hub
+    ports:
+      - "8088:8088"
+    volumes:
+      # Persist SQLite DB (Copilot token, admin creds, usage stats).
+      - ./db-container:/data
+    environment:
+      # When exposing beyond localhost, require API keys on /v1/* requests.
+      HUB_REQUIRE_AUTH: "true"
+      # Optional: protect admin endpoints with a fixed token in addition to login.
+      # HUB_ADMIN_TOKEN: "change-me"
+    restart: unless-stopped

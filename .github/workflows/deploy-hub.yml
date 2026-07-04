@@ -1,0 +1,128 @@
+name: Deploy GitModel Hub
+
+# Deploy/destroy a per-account GitModel hub. Triggered by the TokenFoundry
+# control plane via workflow_dispatch (or manually). terraform authenticates
+# with a plain Service Principal (ARM_* repo secrets) — the standard azurerm
+# auth path, no `az login` for terraform itself, which sidesteps the ACA-Job
+# "CLI as Service Principal" deadlock.
+#
+# Per-account SECRETS (oauth/admin/hubkey) are NOT repo secrets — they are
+# per-account and written to Key Vault by the control plane before dispatch, then
+# read here (via the SP) so they never appear in dispatch inputs or run logs.
+#
+# The control plane correlates the run it triggered via `correlation_id` (echoed
+# into run-name), since workflow_dispatch doesn't reliably return a run id.
+
+run-name: "deploy ${{ inputs.account_id }} [${{ inputs.correlation_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      account_id:
+        description: "GitHub account id (e.g. gha_p2test01) — per-account RG + remote-state key"
+        required: true
+        default: "gha_ghatest01"
+      action:
+        description: "apply or destroy"
+        required: true
+        default: "apply"
+        type: choice
+        options: [apply, destroy]
+      correlation_id:
+        description: "Control-plane correlation id (echoed to run-name so the caller can find this run)"
+        required: false
+        default: "manual"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-hub:
+    runs-on: ubuntu-latest
+    env:
+      # --- Service Principal auth for terraform + reading the KV job-input ---
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      # --- Shared infra the hub deploy reuses (repo vars) ---
+      HUB_ACR_NAME: ${{ vars.HUB_ACR_NAME }}
+      HUB_ACR_RG: ${{ vars.HUB_ACR_RG }}
+      HUB_LOCATION: ${{ vars.HUB_LOCATION }}
+      HUB_IMAGE_REF: ${{ vars.HUB_IMAGE_REF }}
+      TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+      TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+      KEYVAULT_NAME: ${{ vars.HUB_KEYVAULT_NAME }}   # e.g. tokenfoundrykv86a2226cd4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: az login (Service Principal) — to read the per-account KV job-input
+        uses: azure/login@v2
+        with:
+          creds: >-
+            {"clientId":"${{ secrets.ARM_CLIENT_ID }}",
+             "clientSecret":"${{ secrets.ARM_CLIENT_SECRET }}",
+             "tenantId":"${{ secrets.ARM_TENANT_ID }}",
+             "subscriptionId":"${{ secrets.ARM_SUBSCRIPTION_ID }}"}
+
+      - name: Compute per-account values + read secrets from Key Vault
+        id: vars
+        run: |
+          set -euo pipefail
+          ACCT="${{ inputs.account_id }}"
+          echo "rg=tokenfoundry-hub-${ACCT}" >> "$GITHUB_OUTPUT"
+          hex="${ACCT#*_}"
+          echo "prefix=h${hex:0:8}" >> "$GITHUB_OUTPUT"
+          echo "state_key=hubs/${ACCT}.tfstate" >> "$GITHUB_OUTPUT"
+          # Per-account job input the control plane wrote (JSON): oauth/admin/hubkey.
+          dash="${ACCT//_/-}"
+          ji="$(az keyvault secret show --vault-name "$KEYVAULT_NAME" --name "gh-${dash}-jobinput" --query value -o tsv)"
+          # Mask + export as GITHUB_ENV (not step output → not in logs).
+          for k in oauth_token admin_token hub_api_key; do
+            v="$(printf '%s' "$ji" | jq -r ".${k} // \"\"")"
+            echo "::add-mask::$v"
+            case "$k" in
+              oauth_token) echo "TF_VAR_copilot_oauth_token=$v" >> "$GITHUB_ENV" ;;
+              admin_token) echo "TF_VAR_hub_admin_token=$v" >> "$GITHUB_ENV" ;;
+              hub_api_key) echo "TF_VAR_hub_api_key=$v" >> "$GITHUB_ENV" ;;
+            esac
+          done
+
+      - name: Terraform Init (remote state)
+        working-directory: vendored/gitmodel-hub/infra
+        run: |
+          terraform init -input=false \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=${{ steps.vars.outputs.state_key }}" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform Apply / Destroy
+        working-directory: vendored/gitmodel-hub/infra
+        env:
+          # Non-secret vars via env; the three secret TF_VAR_* were set in GITHUB_ENV above.
+          TF_VAR_resource_group_name: ${{ steps.vars.outputs.rg }}
+          TF_VAR_prefix: ${{ steps.vars.outputs.prefix }}
+          TF_VAR_location: ${{ env.HUB_LOCATION }}
+          TF_VAR_create_acr: "false"
+          TF_VAR_acr_name: ${{ env.HUB_ACR_NAME }}
+          TF_VAR_acr_resource_group_name: ${{ env.HUB_ACR_RG }}
+          TF_VAR_require_auth: "true"
+          TF_VAR_image_ref_override: ${{ env.HUB_IMAGE_REF }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.action }}" = "destroy" ]; then
+            terraform destroy -auto-approve -input=false
+          else
+            terraform apply -auto-approve -input=false
+            echo "### Hub deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- app_url: $(terraform output -raw app_url)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- resource_group: $(terraform output -raw resource_group)" >> "$GITHUB_STEP_SUMMARY"
+          fi

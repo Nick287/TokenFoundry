@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 
+import httpx
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.apimanagement import ApiManagementClient
@@ -489,3 +490,143 @@ class ApimProvisioner:
             )
         except (ResourceNotFoundError, HttpResponseError) as exc:
             logger.warning("backend %s delete skipped: %s", backend_id, exc)
+
+    # --- Backend pools (GitModel hub load-balancing + session affinity) ---
+    #
+    # Pools ride the PREVIEW ARM API (2023-09-01-preview): type=Pool +
+    # sessionAffinity are not in the stable azure-mgmt SDK surface, so these use
+    # raw ARM REST (same path we validated by hand with `az rest`). Adding a
+    # GitHub account = registering its hub as a per-account backend and appending
+    # it to the openai/anthropic/google pools; session affinity keeps a chat
+    # session pinned to one hub so prompt caching stays warm.
+
+    _POOL_API_VERSION = "2023-09-01-preview"
+
+    def _arm_token(self) -> str:
+        return DefaultAzureCredential().get_token("https://management.azure.com/.default").token
+
+    def _backend_base(self) -> str:
+        return (
+            f"https://management.azure.com/subscriptions/{self._sub_id}"
+            f"/resourceGroups/{self._rg}/providers/Microsoft.ApiManagement"
+            f"/service/{self._service}/backends"
+        )
+
+    def add_hub_to_pools(self, account_id: str, hub_fqdn: str, hub_key: str) -> list[str]:
+        """Register a hub (one GitHub account) into the 3 provider pools.
+
+        For each of openai/anthropic/google:
+          1. create a per-account single backend `llm-<provider>-<account_id>`
+             pointing at the hub (provider-native auth header + circuit breaker),
+          2. append it to the `llm-<provider>-pool` (creating the pool with
+             session affinity if it doesn't exist yet — first account still gets
+             a pool, per the plan).
+        Returns the list of per-account backend ids created (for later removal).
+
+        Idempotent: re-adding the same account is a no-op on the services list.
+        """
+        base = f"https://{hub_fqdn}"  # hub Container App ingress (https)
+        created: list[str] = []
+        for provider in ("openai", "anthropic", "google"):
+            cfg = PROVIDER_APIS[provider]
+            be_id = f"llm-{provider}-{account_id}"
+            # 1) single backend for this hub (reuse the SDK path — stable API)
+            self._ensure_provider_backend(
+                be_id, base, cfg["auth_header"], hub_key, cfg["bearer"]
+            )
+            # 2) append to the pool (preview REST)
+            self._pool_add_service(f"llm-{provider}-pool", be_id)
+            created.append(be_id)
+        return created
+
+    def remove_hub_from_pools(self, account_id: str, backend_ids: list[str] | None = None) -> None:
+        """Remove a hub's backends from the 3 pools and delete them. Idempotent."""
+        for provider in ("openai", "anthropic", "google"):
+            be_id = f"llm-{provider}-{account_id}"
+            self._pool_remove_service(f"llm-{provider}-pool", be_id)
+            self.remove_backend(be_id)
+        # Delete any extra recorded backends not covered by the naming scheme.
+        for be_id in backend_ids or []:
+            if not be_id.endswith(account_id):
+                self.remove_backend(be_id)
+
+    def _pool_add_service(self, pool_id: str, backend_id: str) -> None:
+        """GET pool -> append backend to services[] (preserving sessionAffinity)
+        -> PUT with If-Match ETag. Creates the pool with session affinity if it
+        doesn't exist yet."""
+        svc_id = f"{self._backend_base().rsplit('/backends', 1)[0]}/backends/{backend_id}"
+        member = {"id": svc_id, "priority": 1, "weight": 1}
+        # Idempotency match key. We CONSTRUCT an absolute id
+        # (https://management.azure.com/subscriptions/...), but ARM STORES the
+        # service id as a RELATIVE path (/subscriptions/...). So a full-string
+        # compare never matches an existing member and we'd append duplicates.
+        # Match on the stable `/backends/<id>` suffix instead.
+        svc_suffix = f"/backends/{backend_id}".lower()
+        url = f"{self._backend_base()}/{pool_id}?api-version={self._POOL_API_VERSION}"
+        headers = {"Authorization": f"Bearer {self._arm_token()}"}
+        with httpx.Client(timeout=30.0) as hc:
+            r = hc.get(url, headers=headers)
+            if r.status_code == 200:
+                body = r.json()
+                props = body.get("properties", {})
+                pool = props.get("pool") or {}
+                services = pool.get("services") or []
+                if any(s.get("id", "").lower().endswith(svc_suffix) for s in services):
+                    return  # already a member — idempotent
+                services.append(member)
+                pool["services"] = services
+                pool.setdefault(
+                    "sessionAffinity",
+                    {"sessionId": {"source": "Cookie", "name": "SessionId"}},
+                )
+                props["type"] = "Pool"
+                props["pool"] = pool
+                etag = r.headers.get("ETag")
+                put_headers = dict(headers)
+                if etag:
+                    put_headers["If-Match"] = etag
+                pr = hc.put(url, headers=put_headers, json={"properties": props})
+                pr.raise_for_status()
+            elif r.status_code == 404:
+                # First account: create the pool with this one member + affinity.
+                props = {
+                    "description": f"Hub pool for {pool_id.rsplit('-pool', 1)[0]}",
+                    "type": "Pool",
+                    "pool": {
+                        "services": [member],
+                        "sessionAffinity": {
+                            "sessionId": {"source": "Cookie", "name": "SessionId"}
+                        },
+                    },
+                }
+                pr = hc.put(url, headers=headers, json={"properties": props})
+                pr.raise_for_status()
+            else:
+                r.raise_for_status()
+
+    def _pool_remove_service(self, pool_id: str, backend_id: str) -> None:
+        """GET pool -> drop backend from services[] -> PUT. No-op if pool or
+        member is absent."""
+        svc_suffix = f"/backends/{backend_id}"
+        url = f"{self._backend_base()}/{pool_id}?api-version={self._POOL_API_VERSION}"
+        headers = {"Authorization": f"Bearer {self._arm_token()}"}
+        with httpx.Client(timeout=30.0) as hc:
+            r = hc.get(url, headers=headers)
+            if r.status_code == 404:
+                return
+            r.raise_for_status()
+            body = r.json()
+            props = body.get("properties", {})
+            pool = props.get("pool") or {}
+            services = pool.get("services") or []
+            kept = [s for s in services if not s.get("id", "").endswith(svc_suffix)]
+            if len(kept) == len(services):
+                return  # not a member — idempotent
+            pool["services"] = kept
+            props["pool"] = pool
+            etag = r.headers.get("ETag")
+            put_headers = dict(headers)
+            if etag:
+                put_headers["If-Match"] = etag
+            pr = hc.put(url, headers=put_headers, json={"properties": props})
+            pr.raise_for_status()

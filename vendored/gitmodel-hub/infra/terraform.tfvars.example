@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars and adjust. Run: terraform init && terraform apply
+#
+# Everything (resource group, ACR, image build, storage account + file share)
+# is created by Terraform. There are NO required variables — all have defaults.
+# The resource group is tagged SecurityControl=Ignore at creation time.
+
+# --- Optional overrides ---------------------------------------------------
+# resource_group_name     = "gitmodel-rg"
+# location                = "centralus"
+# prefix                  = "gitmodel"   # also used as the ACR & storage name prefix
+# create_acr              = true            # true: auto-create a new ACR; false: use existing
+# acr_name                = "azureaidemoacr"   # existing registry (only when create_acr = false)
+# acr_resource_group_name = "rg-azureaidemo"   # resource group of that registry
+# image_name              = "gitmodel"   # tag is auto-derived from a source hash
+# file_share_name     = "gitmodel-data"
+# require_auth        = true
+# login_max_fails     = 5     # failed admin logins per IP before lockout (0 = disable)
+# login_lock_seconds  = 900   # lockout duration in seconds

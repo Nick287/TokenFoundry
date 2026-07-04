@@ -37,6 +37,21 @@ class Settings(BaseSettings):
     # --- Key Vault (subscription keys + BYO provider secrets) ---
     keyvault_uri: str = ""
 
+    # --- Hub deploy via GitHub Action (方案 A) ---
+    # The control plane triggers a GitHub Action (workflow_dispatch) that runs the
+    # per-account hub terraform with Service Principal auth, polls the run, then
+    # reads terraform outputs from the remote state blob. It does NOT run
+    # terraform itself. tfstate_* identify the remote-state blob container.
+    tfstate_storage_account: str = ""
+    tfstate_container: str = ""
+    github_repo_owner: str = "Nick287"
+    github_repo_name: str = "TokenFoundry"
+    github_workflow_file: str = "deploy-hub.yml"
+    github_ref: str = "master"
+    # KV secret name holding the GitHub token (actions:read+write) the control
+    # plane uses to trigger + poll the workflow.
+    github_token_secret: str = "hub-deploy-github-token"
+
     # --- Observability (Application Insights via azure-monitor-query) ---
     app_insights_resource_id: str = ""
 

@@ -11,6 +11,7 @@ import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import { LANG_KEY } from "./i18n";
 import { useAuth, usePrincipal } from "./auth/AuthProvider";
 import { CustomerUsagePage } from "./pages/CustomerUsagePage";
+import { GitHubAccountsPage } from "./pages/GitHubAccountsPage";
 import { KeysPage } from "./pages/KeysPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ModelRoutesPage } from "./pages/ModelRoutesPage";
@@ -65,6 +66,7 @@ export function App() {
               <NavLink to="/projects">{t("nav.projects")}</NavLink>
               <NavLink to="/keys">{t("nav.keys")}</NavLink>
               <NavLink to="/routes">{t("nav.models")}</NavLink>
+              <NavLink to="/github">{t("nav.github")}</NavLink>
               <NavLink to="/usage">{t("nav.usage")}</NavLink>
               <NavLink to="/users">{t("nav.users")}</NavLink>
             </>
@@ -93,6 +95,7 @@ export function App() {
               <Route path="/projects" element={<ProjectsPage />} />
               <Route path="/keys" element={<KeysPage />} />
               <Route path="/routes" element={<ModelRoutesPage />} />
+              <Route path="/github" element={<GitHubAccountsPage />} />
               <Route path="/usage" element={<UsageDashboardPage />} />
               <Route path="/users" element={<UsersPage />} />
               <Route path="*" element={<Navigate to="/tenants" replace />} />

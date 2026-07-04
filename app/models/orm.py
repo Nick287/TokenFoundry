@@ -26,6 +26,7 @@ from app.models.enums import (
     AuthMode,
     BudgetAction,
     BudgetScope,
+    DeployStatus,
     KeyStatus,
     OwnerScope,
     Provider,
@@ -169,6 +170,47 @@ class User(Base, TimestampMixin):
     role: Mapped[UserRole] = mapped_column(Enum(UserRole), default=UserRole.CUSTOMER)
     tenant_id: Mapped[str | None] = mapped_column(String(64), index=True)
     disabled: Mapped[bool] = mapped_column(default=False)
+
+
+class GitHubAccount(Base, TimestampMixin):
+    """A GitHub account whose Copilot subscription backs one deployed hub.
+
+    Each account = one GitModel hub Container App (deployed in its OWN resource
+    group) registered as a backend in the openai/anthropic/google APIM pools.
+    "Adding a model" becomes "adding a GitHub account": device-flow login ->
+    terraform deploy a hub -> join the pools. Multiple accounts load-balance
+    within the pools (with session affinity so prompt caching stays warm).
+
+    The OAuth token is NEVER stored here — only a Key Vault reference. deploy
+    state is a DeployStatus machine driven by the control plane orchestrator.
+    """
+
+    __tablename__ = "github_accounts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # gha_xxx
+    github_login: Mapped[str | None] = mapped_column(String(128), index=True)
+    github_user_id: Mapped[str | None] = mapped_column(String(64))
+    # Key Vault reference to the Copilot OAuth token (secret name); value stays in KV.
+    oauth_token_kv_ref: Mapped[str | None] = mapped_column(String(512))
+    # Key Vault references to the deploy-time injected hub secrets (values in KV):
+    #   hub_key_kv_ref     -> HUB_API_KEY   (inbound /v1 credential, also the APIM backend key)
+    #   admin_token_kv_ref -> HUB_ADMIN_TOKEN (management-API override token)
+    hub_key_kv_ref: Mapped[str | None] = mapped_column(String(512))
+    admin_token_kv_ref: Mapped[str | None] = mapped_column(String(512))
+    status: Mapped[DeployStatus] = mapped_column(
+        Enum(DeployStatus), default=DeployStatus.PENDING
+    )
+    error_detail: Mapped[str | None] = mapped_column(String(2048))
+    # Device-flow handle kept only while status=pending (to poll GitHub).
+    device_code: Mapped[str | None] = mapped_column(String(128))
+    # Deployed-infra coordinates (populated once terraform apply succeeds).
+    resource_group: Mapped[str | None] = mapped_column(String(128))
+    container_app_fqdn: Mapped[str | None] = mapped_column(String(256))
+    tf_state_key: Mapped[str | None] = mapped_column(String(256))
+    # Names of the per-account APIM backends added to the three provider pools,
+    # e.g. ["llm-openai-<id>", "llm-anthropic-<id>", "llm-google-<id>"]. Used to
+    # remove them from the pools on delete.
+    backend_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
 
 
 # NOTE: UsageRecord is intentionally NOT an ORM model — it's a high-write,

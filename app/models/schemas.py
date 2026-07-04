@@ -14,6 +14,7 @@ from app.models.enums import (
     AuthMode,
     BudgetAction,
     BudgetScope,
+    DeployStatus,
     KeyStatus,
     OwnerScope,
     Provider,
@@ -200,6 +201,40 @@ class ModelRouteUpdate(BaseModel):
     price_in_per_1k: float | None = None
     price_out_per_1k: float | None = None
     markup_pct: float | None = None
+
+
+# ----- GitHubAccount (GitModel hub instances) -----
+
+
+class DeviceStartOut(BaseModel):
+    """Returned by POST /github-accounts/device/start — what the user needs to
+    authorize the GitHub Copilot account in their browser."""
+    account_id: str
+    user_code: str
+    verification_uri: str
+    interval: int
+    expires_in: int
+
+
+class DevicePollOut(BaseModel):
+    """Returned by POST /github-accounts/device/poll — current auth+deploy state.
+    status walks pending -> deploying -> ready (or failed)."""
+    account_id: str
+    status: DeployStatus
+    github_login: str | None = None
+    detail: str | None = None
+
+
+class GitHubAccountOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    github_login: str | None
+    status: DeployStatus
+    error_detail: str | None
+    resource_group: str | None
+    container_app_fqdn: str | None
+    backend_ids: list[str]
+    created_at: datetime
 
 
 # ----- Budget -----

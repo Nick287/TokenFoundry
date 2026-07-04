@@ -127,6 +127,20 @@ module "appsecrets" {
   secrets_ready = module.keyvault.secrets_ready
 }
 
+# --- 方案 A: remote-state storage for per-account hub deploys ---
+# The hub terraform runs in a GitHub Action (SP auth), not here — this module now
+# provides ONLY the shared blob storage for per-account remote state. The control
+# plane reads outputs from it (Storage Blob Data Reader granted in containerapps).
+module "deployer" {
+  source      = "./modules/deployer"
+  name_prefix = var.name_prefix
+  location    = var.location
+  tags        = local.tags
+
+  resource_group_name = azurerm_resource_group.this.name
+  suffix              = local.suffix
+}
+
 # --- Container App: single app (API + portal in one image) ---
 module "containerapps" {
   source      = "./modules/containerapps"
@@ -153,4 +167,9 @@ module "containerapps" {
   jwt_secret_uri             = module.appsecrets.jwt_secret_uri
   admin_password_secret_uri  = module.appsecrets.admin_password_secret_uri
   admin_username             = "admin"
+
+  # 方案 A: control plane reads hub outputs from remote state (no terraform here).
+  tfstate_storage_account    = module.deployer.tfstate_storage_account_name
+  tfstate_storage_account_id = module.deployer.tfstate_storage_account_id
+  tfstate_container          = module.deployer.tfstate_container_name
 }

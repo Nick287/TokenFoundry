@@ -13,6 +13,7 @@ dependencies = [
     "azure-identity>=1.19",
     "azure-mgmt-apimanagement>=4.0",
     "azure-keyvault-secrets>=4.9",
+    "azure-storage-blob>=12.20",
     "azure-cosmos>=4.7",
     "azure-monitor-query>=1.4",
     "python-jose[cryptography]>=3.3",
@@ -42,6 +43,12 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B"]
 # B008: FastAPI idiomatically calls Depends()/Header() in argument defaults.
 ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# apim_provisioner embeds APIM policy XML as multi-line string literals (URLs and
+# C# policy expressions). Those lines can't be wrapped without breaking the policy
+# semantics, so E501 (line length) is waived for this file only.
+"app/services/apim_provisioner.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"

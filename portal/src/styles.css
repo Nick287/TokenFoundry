@@ -693,3 +693,32 @@ tr:focus-within .row-actions { opacity: 1; }
     grid-template-columns: repeat(2, 1fr);
   }
 }
+
+/* GitHub device-flow modal: big monospace code + copy/open, status hints. */
+.device-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  margin: 0.25rem 0 1.1rem;
+}
+.device-code {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.device-code code {
+  font-size: 1.5rem;
+  letter-spacing: 0.15em;
+  font-weight: 700;
+  color: var(--ink);
+  background: var(--surface, #f5f3ee);
+  padding: 0.4rem 0.75rem;
+  border-radius: 6px;
+}
+/* Inline failure reason under a failed account's status badge. */
+.error-detail {
+  color: var(--error);
+  margin-top: 0.3rem;
+  max-width: 32rem;
+  word-break: break-word;
+}

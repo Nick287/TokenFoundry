@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import budgets, keys, login, routes, tenants, usage, users
+from app.api import budgets, github_accounts, keys, login, routes, tenants, usage, users
 from app.config import get_settings
 
 settings = get_settings()
@@ -67,6 +67,7 @@ app.include_router(users.router, prefix=_prefix, tags=["users"])
 app.include_router(tenants.router, prefix=_prefix, tags=["tenants"])
 app.include_router(keys.router, prefix=_prefix, tags=["keys"])
 app.include_router(routes.router, prefix=_prefix, tags=["routes"])
+app.include_router(github_accounts.router, prefix=_prefix, tags=["github-accounts"])
 app.include_router(budgets.router, prefix=_prefix, tags=["budgets"])
 app.include_router(usage.router, prefix=_prefix, tags=["usage"])
 

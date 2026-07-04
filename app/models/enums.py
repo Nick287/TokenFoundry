@@ -56,3 +56,17 @@ class Provider(StrEnum):
 class UserRole(StrEnum):
     ADMIN = "admin"              # platform operator (Entra ID)
     CUSTOMER = "customer"        # tenant user (Entra External ID / CIAM)
+
+
+class DeployStatus(StrEnum):
+    """Lifecycle of a GitHub-account-backed hub instance (GitModel).
+
+    Each GitHub account = one deployed hub Container App that fronts that
+    account's Copilot subscription. The control plane drives this state machine:
+    device-flow login -> deploy infra -> register in APIM pools -> ready.
+    """
+    PENDING = "pending"          # device flow started, awaiting GitHub authorization
+    DEPLOYING = "deploying"      # authorized; terraform apply + pool-join in progress
+    READY = "ready"             # hub deployed and joined to the provider pools
+    FAILED = "failed"            # deploy or pool-join errored (see error_detail)
+    DELETING = "deleting"        # terraform destroy + pool-removal in progress

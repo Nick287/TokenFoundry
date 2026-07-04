@@ -9,6 +9,7 @@ export const zh: TranslationShape = {
     projects: "项目",
     keys: "密钥",
     models: "模型",
+    github: "GitHub 账号",
     usage: "用量",
     users: "账号",
     myUsage: "我的用量",
@@ -138,6 +139,35 @@ export const zh: TranslationShape = {
     deleteTitle: "删除模型路由？",
     deleteImpact: "将删除别名 {{name}}。共享的供应商后端保留。",
   },
+  github: {
+    title: "GitHub 账号",
+    addNew: "GitHub 账号",
+    starting: "启动中…",
+    accountCol: "账号",
+    statusCol: "状态",
+    endpointCol: "Hub 端点",
+    emptyTitle: "还没有 GitHub 账号",
+    emptyHint:
+      "添加一个 GitHub 账号：授权其 Copilot 订阅，系统会自动部署一套专属 hub 并加入负载均衡池。",
+    authorizeTitle: "授权 GitHub Copilot",
+    userCodeHint: "在 GitHub 上输入此代码以授权该账号：",
+    openGithub: "打开 GitHub",
+    awaitingHint: "等待你在浏览器中完成授权…",
+    deployingHint: "正在部署 hub 并加入池 — 需要几分钟。",
+    readyHint: "hub 已部署，正通过网关提供服务。",
+    failedHint: "出错了。删除该账号后重试。",
+    runInBackground: "后台运行",
+    deleteTitle: "删除 GitHub 账号？",
+    deleteImpact:
+      "将拆除 {{login}} 的 hub：销毁其资源组、从池中移除、并删除相关密钥。",
+    status: {
+      pending: "等待授权",
+      deploying: "部署中",
+      ready: "就绪",
+      failed: "失败",
+      deleting: "删除中",
+    },
+  },
   usage: {
     title: "用量与成本",
     tenantId: "租户 ID（tn_…）",
@@ -218,6 +248,8 @@ export const zh: TranslationShape = {
       "为某个项目签发虚拟密钥。流程：创建租户 → 创建项目 → 在此选择并签发。密钥值仅显示一次 — 请立即复制。它存于 Key Vault，平台不会再次展示。",
     models:
       "登记一个面向客户的模型别名（如 claude-sonnet），映射到真实后端。供应商决定 API 格式（Anthropic 或 OpenAI 兼容）。价格与加价用于计量和转售计费。",
+    github:
+      "添加一个 GitHub 账号，用其 Copilot 订阅为模型池提供后端。通过 GitHub 设备登录授权后，控制面会自动部署一套专属 hub，加入 openai/anthropic/google 三池（带会话粘性以保持提示缓存命中），并把全部流量经 APIM 统一计量。删除时连带销毁其资源组与密钥。",
     usage:
       "管理员查看任意租户的 token 用量与成本。输入租户 ID（tn_…）查看输入/输出 token、成本与计费金额。",
     myUsage:

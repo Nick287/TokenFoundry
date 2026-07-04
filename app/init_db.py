@@ -39,6 +39,8 @@ def _ensure_columns() -> None:
     statements = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled boolean NOT NULL DEFAULT false",
         "ALTER TABLE model_routes ADD COLUMN IF NOT EXISTS api_version varchar(64)",
+        "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS hub_key_kv_ref varchar(512)",
+        "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS admin_token_kv_ref varchar(512)",
     ]
     with engine.begin() as conn:
         for stmt in statements:

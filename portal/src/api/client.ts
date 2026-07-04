@@ -62,6 +62,44 @@ export interface ModelRoute {
   created_at: string;
 }
 
+export type GitHubDeployStatus =
+  | "pending"
+  | "deploying"
+  | "ready"
+  | "failed"
+  | "deleting";
+
+// A GitHub account whose Copilot subscription backs one deployed GitModel hub.
+// Mirrors app/models/schemas.py:GitHubAccountOut.
+export interface GitHubAccount {
+  id: string;
+  github_login: string | null;
+  status: GitHubDeployStatus;
+  error_detail: string | null;
+  resource_group: string | null;
+  container_app_fqdn: string | null;
+  backend_ids: string[];
+  created_at: string;
+}
+
+// Returned by POST /github-accounts/device/start — what the user needs to
+// authorize the GitHub Copilot account in their browser.
+export interface DeviceStart {
+  account_id: string;
+  user_code: string;
+  verification_uri: string;
+  interval: number;
+  expires_in: number;
+}
+
+// Returned by POST /github-accounts/device/poll — current auth+deploy state.
+export interface DevicePoll {
+  account_id: string;
+  status: GitHubDeployStatus;
+  github_login: string | null;
+  detail: string | null;
+}
+
 export interface UsageSummary {
   tenant_id: string;
   total_prompt_tok: number;
@@ -269,4 +307,20 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
     }),
+  // --- GitHub accounts (GitModel hub instances) ---
+  listGithubAccounts: (token: string) =>
+    request<GitHubAccount[]>("/github-accounts", token),
+  startGithubDevice: (token: string) =>
+    request<DeviceStart>("/github-accounts/device/start", token, {
+      method: "POST",
+    }),
+  // device/poll takes account_id as a QUERY param and no body.
+  pollGithubDevice: (token: string, accountId: string) =>
+    request<DevicePoll>(
+      `/github-accounts/device/poll?account_id=${encodeURIComponent(accountId)}`,
+      token,
+      { method: "POST" },
+    ),
+  deleteGithubAccount: (token: string, id: string) =>
+    requestNoContent(`/github-accounts/${id}`, token, { method: "DELETE" }),
 };

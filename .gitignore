@@ -51,3 +51,18 @@ STATUS.md
 
 # TS incremental build cache (machine-generated)
 *.tsbuildinfo
+
+# Local dev SQLite (control-plane metadata scratch — never commit)
+*.db
+
+# Terraform (provider cache is ~250MB; state/vars carry secrets — never commit)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+*.tfplan
+*.plan
+
+# One-off verification / redeploy scratch scripts (underscore-prefixed)
+scripts/_*.py

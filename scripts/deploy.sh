@@ -83,12 +83,22 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
   [[ -n "$ACR_LOGIN_SERVER" ]] || die "ACR did not appear within timeout"
   ACR_NAME="${ACR_LOGIN_SERVER%%.*}"   # strip .azurecr.io
 
-  # --- 5. Build the image IN PARALLEL while the apply continues toward APIM ---
-  log "Building image ${ACR_LOGIN_SERVER}/tokenfoundry:${TAG} IN PARALLEL"
+  # --- 5. Build images IN PARALLEL while the apply continues toward APIM ---
+  # Two images share this ACR: the control-plane app, and the pre-built GitModel
+  # hub. The hub is built ONCE here (not per deploy) and referenced per-account by
+  # the GitHub Action's terraform (方案 A: the Action deploys hubs, not this
+  # script). No deploy-job image any more — 方案 A runs terraform in the Action.
+  log "Building app + hub images IN PARALLEL"
   ( az acr build -r "$ACR_NAME" -t "tokenfoundry:${TAG}" "$REPO_ROOT" ) &
-  BUILD_PID=$!
-  wait "$BUILD_PID" || { kill "$APPLY_PID" 2>/dev/null; die "Image build failed — check the az acr build output above"; }
-  log "Image build complete; apply continues toward the Container App"
+  BUILD_APP_PID=$!
+  # hub image: build context is the vendored hub root (has Dockerfile + hub/ +
+  # requirements.txt). The Action's per-account terraform references gitmodel:<tag>
+  # via its HUB_IMAGE_REF repo var (set by scripts/setup-github-deploy.sh).
+  ( az acr build -r "$ACR_NAME" -t "gitmodel:${TAG}" "$REPO_ROOT/vendored/gitmodel-hub" ) &
+  BUILD_HUB_PID=$!
+  wait "$BUILD_APP_PID" || { kill "$APPLY_PID" 2>/dev/null; die "app image build failed"; }
+  wait "$BUILD_HUB_PID" || { kill "$APPLY_PID" 2>/dev/null; die "hub image build failed"; }
+  log "All images built; apply continues toward the Container App"
 else
   log "Skipping build (reusing existing image tokenfoundry:${TAG})"
 fi

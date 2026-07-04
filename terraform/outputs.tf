@@ -19,3 +19,19 @@ output "acr_login_server" {
   description = "ACR login server, e.g. myreg.azurecr.io."
   value       = module.acr.login_server
 }
+
+# --- 方案 A: values scripts/setup-github-deploy.sh feeds to the GitHub Action ---
+output "tfstate_storage_account" {
+  description = "Storage account holding per-account hub terraform remote state (repo var TFSTATE_STORAGE_ACCOUNT + control-plane TF_TFSTATE_STORAGE_ACCOUNT)."
+  value       = module.deployer.tfstate_storage_account_name
+}
+
+output "tfstate_container" {
+  description = "Blob container for hub terraform remote state (repo var TFSTATE_CONTAINER)."
+  value       = module.deployer.tfstate_container_name
+}
+
+output "keyvault_name" {
+  description = "Key Vault name — the Action reads per-account gh-<id>-jobinput secrets from it (repo var HUB_KEYVAULT_NAME)."
+  value       = module.keyvault.vault_name
+}
