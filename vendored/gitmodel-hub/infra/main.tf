@@ -153,7 +153,7 @@ resource "azurerm_container_app" "hub" {
   # into the container as COPILOT_OAUTH_TOKEN so the hub is authenticated for its
   # GitHub account without going through the portal device flow.
   dynamic "secret" {
-    for_each = var.copilot_oauth_token != "" ? [1] : []
+    for_each = var.copilot_oauth_token != "" ? toset([1]) : toset([])
     content {
       name  = "copilot-oauth-token"
       value = var.copilot_oauth_token
@@ -164,7 +164,7 @@ resource "azurerm_container_app" "hub" {
   # Injected as HUB_ADMIN_TOKEN so the control plane can call the management API
   # (POST /api/keys to mint a hub key) without the portal login flow.
   dynamic "secret" {
-    for_each = var.hub_admin_token != "" ? [1] : []
+    for_each = var.hub_admin_token != "" ? toset([1]) : toset([])
     content {
       name  = "hub-admin-token"
       value = var.hub_admin_token
@@ -175,7 +175,7 @@ resource "azurerm_container_app" "hub" {
   # Injected as HUB_API_KEY — the durable inbound credential APIM authenticates
   # with (the hub is stateless, so portal-created SQLite keys don't persist).
   dynamic "secret" {
-    for_each = var.hub_api_key != "" ? [1] : []
+    for_each = var.hub_api_key != "" ? toset([1]) : toset([])
     content {
       name  = "hub-api-key"
       value = var.hub_api_key
@@ -228,7 +228,7 @@ resource "azurerm_container_app" "hub" {
       # COPILOT_OAUTH_TOKEN from the Container App secret (only when provided).
       # Authenticates the hub for its GitHub account without the portal flow.
       dynamic "env" {
-        for_each = var.copilot_oauth_token != "" ? [1] : []
+        for_each = var.copilot_oauth_token != "" ? toset([1]) : toset([])
         content {
           name        = "COPILOT_OAUTH_TOKEN"
           secret_name = "copilot-oauth-token"
@@ -238,7 +238,7 @@ resource "azurerm_container_app" "hub" {
       # HUB_ADMIN_TOKEN from the Container App secret (only when provided). Lets
       # the control plane call the management API to mint a hub key post-deploy.
       dynamic "env" {
-        for_each = var.hub_admin_token != "" ? [1] : []
+        for_each = var.hub_admin_token != "" ? toset([1]) : toset([])
         content {
           name        = "HUB_ADMIN_TOKEN"
           secret_name = "hub-admin-token"
@@ -249,7 +249,7 @@ resource "azurerm_container_app" "hub" {
       # durable inbound /v1/* credential the control plane / APIM authenticate
       # with (portal-created SQLite keys don't persist on a stateless hub).
       dynamic "env" {
-        for_each = var.hub_api_key != "" ? [1] : []
+        for_each = var.hub_api_key != "" ? toset([1]) : toset([])
         content {
           name        = "HUB_API_KEY"
           secret_name = "hub-api-key"
