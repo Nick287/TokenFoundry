@@ -63,17 +63,6 @@ jobs:
         with:
           terraform_version: "1.9.8"
 
-      - name: DEBUG probe SP secret shape (temporary)
-        run: |
-          set -eu
-          echo "CLIENT_ID    len=${#ARM_CLIENT_ID}    head=${ARM_CLIENT_ID:0:4} tail=${ARM_CLIENT_ID: -4}"
-          echo "TENANT_ID    len=${#ARM_TENANT_ID}    head=${ARM_TENANT_ID:0:4} tail=${ARM_TENANT_ID: -4}"
-          echo "SUBSCRIPTION len=${#ARM_SUBSCRIPTION_ID} head=${ARM_SUBSCRIPTION_ID:0:4} tail=${ARM_SUBSCRIPTION_ID: -4}"
-          echo "CLIENT_SECRET len=${#ARM_CLIENT_SECRET}"
-          # direct az SP login (bypasses azure/login) to isolate where it breaks
-          az login --service-principal -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" --tenant "$ARM_TENANT_ID" --output none \
-            && echo "DIRECT az login OK" || echo "DIRECT az login FAILED"
-
       - name: az login (Service Principal) — to read the per-account KV job-input
         uses: azure/login@v2
         with:
