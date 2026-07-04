@@ -130,8 +130,7 @@ A client calls a provider API with its **virtual key** in that provider's native
 header (`x-api-key` for Anthropic, `api-key`/`Authorization` for OpenAI-style).
 The virtual key **is an APIM subscription key**; APIM validates it and applies
 the per-key token-limit, keyed on the subscription id
-([`apim/policies/llm-inbound.xml`](../apim/policies/llm-inbound.xml),
-[`app/services/apim_provisioner.py`](../app/services/apim_provisioner.py)).
+(the inbound policy XML in [`app/services/apim_provisioner.py`](../app/services/apim_provisioner.py)).
 
 The **real upstream provider key** is never seen by the client:
 
@@ -198,7 +197,7 @@ These are deliberate MVP choices or noted TODOs — not surprises:
 5. **Semantic cache (Phase 2) must be tenant-partitioned.** Not yet enabled; when
    it is, it must `vary-by` the subscription id or it would leak responses across
    tenants — called out in the policy comments
-   ([`apim/policies/llm-inbound.xml`](../apim/policies/llm-inbound.xml)).
+   (the inbound policy XML in [`app/services/apim_provisioner.py`](../app/services/apim_provisioner.py)).
 6. **Virtual keys can't be recovered, only rotated.** The value is shown once and
    only a Key Vault reference is kept; a lost key is re-issued, not retrieved.
    (This is correct key hygiene, listed so the behavior isn't a surprise.)

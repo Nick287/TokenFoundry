@@ -29,11 +29,11 @@ Optional — enables auto-discovery of the live model list:
     TF_ADMIN_PASSWORD
 
 Usage (no dependencies — pure Python stdlib; python-dotenv optional):
-    python scripts/smoke_test_models.py                  # test all models, BOTH modes
-    python scripts/smoke_test_models.py claude-opus-4.7 gpt-4o   # test a subset
-    python scripts/smoke_test_models.py --prompt "Write a haiku about tokens."
-    python scripts/smoke_test_models.py --stream gpt-4o          # streaming only
-    python scripts/smoke_test_models.py --no-stream gpt-4o       # non-streaming only
+    python tests/manual/smoke_test_models.py                  # test all models, BOTH modes
+    python tests/manual/smoke_test_models.py claude-opus-4.7 gpt-4o   # test a subset
+    python tests/manual/smoke_test_models.py --prompt "Write a haiku about tokens."
+    python tests/manual/smoke_test_models.py --stream gpt-4o          # streaming only
+    python tests/manual/smoke_test_models.py --no-stream gpt-4o       # non-streaming only
 
 By default every model is exercised TWICE — once non-streaming (direct) and once
 streaming (SSE) — so a single run validates both paths. Use --stream or

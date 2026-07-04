@@ -80,8 +80,7 @@ writer. It now works as a single direct write:
 This is a deliberate MVP trade-off: `send-one-way-request` is fire-and-forget,
 so a failed write is **not retried** (occasional loss is acceptable for trend
 usage). Billing-grade, replayable accounting is the Event Hub path below — the
-namespace is provisioned but **not yet wired** (`worker/eventhub_consumer.py`
-is a stub).
+namespace is provisioned but **not yet wired** (the consumer is not built yet).
 
 ### The usage page has two data sources, shown separately
 
@@ -160,12 +159,11 @@ building one. Concretely:
 
 ```text
 app/            FastAPI control plane (models / services / api)
-worker/         Event Hub consumer (Phase 2 — stub, not wired)
 portal/         React + Vite frontend
-infra/          Bicep IaC (main + lite + modules + Grafana dashboards)
-apim/policies/  APIM policy XML (data-plane core)
+terraform/      Terraform IaC (root + modules; azapi for APIM preview API)
+vendored/       GitModel hub (per-account, deployed via GitHub Action)
 docs/           architecture diagram
-tests/          pytest (billing logic — pure, no Azure)
+tests/          pytest (billing logic — pure, no Azure); tests/manual = live-gateway scripts
 ```
 
 ## Infrastructure (Bicep)
@@ -348,7 +346,7 @@ az containerapp update -g <rg> -n <prefix>-aca-app \
     rejected by the tenant-scope middleware.
 
 To smoke-test every registered model end-to-end through the gateway, run
-`python scripts/smoke_test_models.py` — it auto-discovers the models from the
+`python tests/manual/smoke_test_models.py` — it auto-discovers the models from the
 control plane, calls each through its provider path (routing `gpt-5.x` to the
 Responses API), and prints a pass/fail table. Configure the gateway URL and a
 virtual key via a local `.env` (gitignored); see the script's header for the

@@ -47,7 +47,7 @@ ANTHROPIC_MODELS = [
     "claude-haiku-4.5",
 ]
 # gpt-* go through the OpenAI-compatible endpoint.
-# This list matches STATIC_MODELS in scripts/smoke_test_models.py (the list
+# This list matches STATIC_MODELS in tests/manual/smoke_test_models.py (the list
 # verified against the live gateway), including the dated Azure-OpenAI aliases
 # and older versions, so registration and smoke test cover the same set.
 OPENAI_MODELS = [

@@ -75,7 +75,7 @@ flowchart LR
 
 这是一个有意为之的 MVP 取舍:`send-one-way-request` 是即发即忘,写入失败**不会重试**
 (对趋势性用量来说偶尔丢失可以接受)。计费级、可重放的精确记账走下面的 Event Hub 链路 ——
-该命名空间已开通但**尚未接通**(`worker/eventhub_consumer.py` 还是个 stub)。
+该命名空间已开通但**尚未接通**(消费者尚未构建)。
 
 ### 用量页有两个数据源,分开展示
 
@@ -139,12 +139,11 @@ flowchart LR
 
 ```text
 app/            FastAPI 控制平面(models / services / api)
-worker/         Event Hub 消费者(第二阶段 —— stub,未接通)
 portal/         React + Vite 前端
-infra/          Bicep 基础设施即代码(main + lite + 模块 + Grafana 仪表盘)
-apim/policies/  APIM 策略 XML(数据平面核心)
+terraform/      Terraform 基础设施即代码(根 + 模块;APIM preview API 用 azapi)
+vendored/       GitModel hub(每账号,经 GitHub Action 部署)
 docs/           架构图
-tests/          pytest(计费逻辑 —— 纯逻辑,不依赖 Azure)
+tests/          pytest(计费逻辑 —— 纯逻辑,不依赖 Azure);tests/manual = 联网网关脚本
 ```
 
 ## 基础设施(Bicep)
@@ -322,7 +321,7 @@ az containerapp update -g <rg> -n <prefix>-aca-app \
 9. Azure Monitor 告警 → 预算阈值触发 Action Group。
 10. 客户门户:客户只能看到自己的租户;跨租户访问被租户作用域中间件拒绝。
 
-要端到端冒烟测试每个已登记模型,运行 `python scripts/smoke_test_models.py` ——
+要端到端冒烟测试每个已登记模型,运行 `python tests/manual/smoke_test_models.py` ——
 它会从控制平面自动发现模型,沿各自的供应商路径调用(把 `gpt-5.x` 路由到
 Responses API),并打印一张通过/失败表。通过本地 `.env`(已 gitignore)配置网关
 URL 和一个虚拟密钥;所需变量见脚本头部。

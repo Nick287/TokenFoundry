@@ -29,10 +29,10 @@ NO SECRETS IN THIS FILE. Configure via environment or a local .env (gitignored):
     TF_VIRTUAL_KEY     an APIM subscription (virtual) key
 
 Usage (pure stdlib, python-dotenv optional):
-    python scripts/cache_test.py                       # default: azure gpt-5.4-mini
-    python scripts/cache_test.py --model gpt-5.4-mini --provider azure
-    python scripts/cache_test.py --turns 6             # number of chat turns
-    python scripts/cache_test.py --prefix-tokens 3000  # size of the stable prefix
+    python tests/manual/cache_test.py                       # default: azure gpt-5.4-mini
+    python tests/manual/cache_test.py --model gpt-5.4-mini --provider azure
+    python tests/manual/cache_test.py --turns 6             # number of chat turns
+    python tests/manual/cache_test.py --prefix-tokens 3000  # size of the stable prefix
 
 Exit code is non-zero if caching never engaged (cached_tokens stayed 0 across
 all turns after the prefix exceeded the threshold), so it can gate CI.

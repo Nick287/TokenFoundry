@@ -1,49 +1,54 @@
 #!/usr/bin/env python3
-"""Token Foundry — prompt-caching smoke test for OpenAI / Google / Anthropic.
+"""Token Foundry — prompt-caching test against the UPSTREAM HUB (direct, no APIM).
 
-Companion to azure_cache_test.py (which covers Azure OpenAI). This one verifies
-prompt caching THROUGH THE GATEWAY for the other three providers, each of which
-has a DIFFERENT caching shape — all confirmed by probing the live gateway:
+Companion / A-B counterpart to apim_cache_test_providers.py. That script goes
+THROUGH the APIM gateway; THIS one hits the upstream hub DIRECTLY, so you can
+compare the two side by side and see whether the gateway layer changes caching
+behavior at all (it shouldn't — caching is an upstream/model feature; APIM just
+forwards).
 
-  provider    auth header   endpoint / format          cached-tokens field
-  ---------   -----------   ------------------------   -----------------------------
-  openai      api-key       /v1/responses (gpt-5.x)    usage.input_tokens_details.cached_tokens
-  google      api-key       /v1/chat/completions       usage.prompt_tokens_details.cached_tokens
-  anthropic   x-api-key     /v1/messages               usage.cache_read_input_tokens
+Differences from the APIM script (all confirmed by probing the live hub):
+  * Base URL is the hub, not the APIM gateway.
+  * Auth is a single Bearer token for ALL providers (the hub is an OpenAI-
+    compatible front). NOTE: on the hub, Anthropic caching engages under Bearer
+    auth (the hub adds cache_control on that path); through APIM, Anthropic uses
+    its native x-api-key header instead. Same cache field either way.
+  * No /llm-<provider> path prefix — endpoints are the bare /v1/... paths.
 
-All three cache AUTOMATICALLY on this gateway's upstream (the hub adds Anthropic
-cache_control for you), so no cache_control flag is needed here. Caching is
-BEST-EFFORT: it needs a large stable prefix (roughly 1024+ tokens for
-OpenAI/Azure) AND a turn or two of warm-up — the first call(s) populate the
-cache and report cached=0, hits start shortly after, and an occasional lone miss
-mid-run is normal. Google's implicit cache has a stricter bar, so it may report 0
-(raise --prefix-tokens rather than assuming it's unsupported).
-
-Like azure_cache_test.py, this SIMULATES a growing multi-turn chat: a big stable
-context up front, then each turn appends the reply + a new message so the prompt
-grows like a real session, and prints the per-turn cached-token breakdown.
+Cached-tokens fields (identical to the APIM side — the hub emits them, APIM just
+passes them through):
+  openai     /v1/responses           usage.input_tokens_details.cached_tokens
+  google     /v1/chat/completions    usage.prompt_tokens_details.cached_tokens
+  anthropic  /v1/messages            usage.cache_read_input_tokens
 
 ------------------------------------------------------------------------------
 NO SECRETS IN THIS FILE. Configure via env or a local .env (gitignored):
 
-    TF_GATEWAY_URL     e.g. https://<your-apim>.azure-api.net
-    TF_VIRTUAL_KEY     an APIM subscription (virtual) key
+    TF_HUB_URL      the upstream hub base URL, e.g. https://<hub>.azurecontainerapps.io
+    TF_HUB_KEY      a hub API key (sk-hub-...)
 
 Usage (pure stdlib, python-dotenv optional):
-    python scripts/apim_cache_test_providers.py                      # all three, default models
-    python scripts/apim_cache_test_providers.py --provider anthropic # just one
-    python scripts/apim_cache_test_providers.py --provider openai --model gpt-5.4
-    python scripts/apim_cache_test_providers.py --turns 6 --prefix-tokens 3000
+    python tests/manual/hub_cache_test.py                       # all three
+    python tests/manual/hub_cache_test.py --provider anthropic  # just one
+    python tests/manual/hub_cache_test.py --turns 6 --prefix-tokens 3000
+
+Run this and apim_cache_test_providers.py back to back to compare hub-direct vs
+APIM.
+Exit code is non-zero if a tested provider that CAN cache never engaged.
 
 Notes from live testing (so results aren't misread):
-  * gpt-5.5 caches fine — measured ~85% hit rate over 20 back-to-back calls
-    (first hit on the 2nd call). An earlier "gpt-5.5 doesn't cache" impression
-    was a too-short run plus a param bug, not the model.
-  * gpt-5.x (reasoning models) REQUIRE max_output_tokens >= 16, else HTTP 400
-    (which looks like a miss if you swallow the error). This script uses 256 so
-    reasoning models have room to both think and emit a visible reply.
-
-Exit code is non-zero if a tested provider that CAN cache never engaged.
+  * Caching is BEST-EFFORT: the first call(s) with a fresh prefix populate the
+    cache and report cached=0; hits start a turn or two later. A lone miss
+    mid-run is normal, not a failure.
+  * gpt-5.5 caches fine despite a slower warm-up — measured ~85% hit rate over
+    20 back-to-back calls (first hit on the 2nd call). Earlier "gpt-5.5 doesn't
+    cache" impressions were a too-short run + a param bug (see below), not the
+    model.
+  * gpt-5.x (reasoning models) REQUIRE max_output_tokens >= 16; a smaller value
+    returns HTTP 400, not a cache miss. This script uses 256 so reasoning models
+    have room to both think and emit a visible reply.
+  * Google's implicit cache has a stricter bar; if it reports 0, raise
+    --prefix-tokens rather than assuming it's unsupported.
 """
 
 from __future__ import annotations
@@ -61,39 +66,18 @@ HTTP_TIMEOUT = 90
 FILLER = "You are an expert assistant; always consider the following reference note carefully. "
 TOKENS_PER_FILLER = 15
 
-# Per-provider wiring. `fmt` selects how we build the request body and read usage.
-#   auth   : subscription-key header name the provider's SDK naturally sends
-#   path   : gateway API path
-#   suffix : operation path under it
+# Per-provider wiring for the HUB (direct). All use Bearer auth; no path prefix.
+#   suffix : bare operation path on the hub
 #   fmt    : "responses" (OpenAI gpt-5.x) | "chat" (Google) | "messages" (Anthropic)
-#   default: a sensible default model for a quick run
 PROVIDERS = {
-    "openai": {
-        "auth": "api-key",
-        "path": "llm-openai",
-        "suffix": "/v1/responses",
-        "fmt": "responses",
-        "default": "gpt-5.5",
-    },
-    "google": {
-        "auth": "api-key",
-        "path": "llm-google",
-        "suffix": "/v1/chat/completions",
-        "fmt": "chat",
-        "default": "gemini-2.5-pro",
-    },
-    "anthropic": {
-        "auth": "x-api-key",
-        "path": "llm-anthropic",
-        "suffix": "/v1/messages",
-        "fmt": "messages",
-        "default": "claude-opus-4.8",
-    },
+    "openai": {"suffix": "/v1/responses", "fmt": "responses", "default": "gpt-5.5"},
+    "google": {"suffix": "/v1/chat/completions", "fmt": "chat", "default": "gemini-2.5-pro"},
+    "anthropic": {"suffix": "/v1/messages", "fmt": "messages", "default": "claude-opus-4.8"},
 }
 
 
 # --------------------------------------------------------------------------- #
-# Config + HTTP (mirrors azure_cache_test.py / smoke_test_models.py)           #
+# Config + HTTP                                                                #
 # --------------------------------------------------------------------------- #
 def load_dotenv_if_present() -> None:
     try:
@@ -145,7 +129,7 @@ def _parse_json(raw: bytes) -> dict | str:
 
 
 # --------------------------------------------------------------------------- #
-# Per-format request builders + usage readers                                 #
+# Per-format request builders + usage readers (same shapes as the APIM script) #
 # --------------------------------------------------------------------------- #
 def build_prefix(target_tokens: int) -> str:
     n = max(1, target_tokens // TOKENS_PER_FILLER)
@@ -153,12 +137,8 @@ def build_prefix(target_tokens: int) -> str:
 
 
 def build_body(fmt: str, model: str, prefix: str, history: list[dict], turn: int) -> dict:
-    """Construct the request body for this provider's format, embedding the
-    stable `prefix` as the leading (cacheable) context and the running history."""
     user_msg = f"(turn {turn}) Reply with a short sentence."
     if fmt == "messages":
-        # Anthropic: system is a top-level field (the cacheable prefix); messages
-        # alternate user/assistant.
         return {
             "model": model,
             "max_tokens": 256,
@@ -166,15 +146,12 @@ def build_body(fmt: str, model: str, prefix: str, history: list[dict], turn: int
             "messages": history + [{"role": "user", "content": user_msg}],
         }
     if fmt == "responses":
-        # OpenAI Responses API: single `input` string. Keep the big prefix at the
-        # front every turn so the cacheable prefix stays byte-identical.
         convo = "\n".join(f"{m['role']}: {m['content']}" for m in history)
         return {
             "model": model,
             "max_output_tokens": 256,
             "input": f"{prefix}\n{convo}\nuser: {user_msg}",
         }
-    # chat (Google + OpenAI-compatible): system message leads, then history.
     return {
         "model": model,
         "max_tokens": 256,
@@ -185,7 +162,6 @@ def build_body(fmt: str, model: str, prefix: str, history: list[dict], turn: int
 
 
 def read_usage(fmt: str, body: dict) -> dict:
-    """Return {prompt, completion, cached} normalized across the three shapes."""
     u = body.get("usage", {}) or {}
     if fmt == "messages":
         prompt = u.get("input_tokens", 0) or 0
@@ -224,8 +200,6 @@ def read_reply(fmt: str, body: dict) -> str:
 
 
 def append_reply(fmt: str, history: list[dict], user_turn: int, reply: str) -> None:
-    """Grow the conversation so the next prompt is longer (real-chat simulation).
-    For `responses` we keep history as pseudo messages that build_body joins."""
     history.append({"role": "user", "content": f"(turn {user_turn}) Reply with a short sentence."})
     history.append({"role": "assistant", "content": reply or "ok"})
 
@@ -234,16 +208,16 @@ def append_reply(fmt: str, history: list[dict], user_turn: int, reply: str) -> N
 # Runner                                                                      #
 # --------------------------------------------------------------------------- #
 def run_provider(
-    gateway: str, key: str, provider: str, model: str, turns: int, prefix_tokens: int
+    hub: str, key: str, provider: str, model: str, turns: int, prefix_tokens: int
 ) -> tuple[str, int]:
     cfg = PROVIDERS[provider]
-    url = f"{gateway}/{cfg['path']}{cfg['suffix']}"
-    headers = {cfg["auth"]: key}
+    url = f"{hub}{cfg['suffix']}"
+    headers = {"Authorization": f"Bearer {key}"}  # hub: single Bearer for all providers
     prefix = build_prefix(prefix_tokens)
     history: list[dict] = []
 
     print(f"\n{'='*90}")
-    print(f"PROVIDER: {provider}  ({cfg['path']}{cfg['suffix']}, fmt={cfg['fmt']}, auth={cfg['auth']})")
+    print(f"PROVIDER: {provider}  (HUB {cfg['suffix']}, fmt={cfg['fmt']}, auth=Bearer)")
     print(f"MODEL   : {model}   PREFIX ~{prefix_tokens} tok   TURNS {turns}")
     print(f"{'-'*90}")
     print(f"{'TURN':<5} {'PROMPT':>8} {'CACHED':>8} {'HIT%':>6} {'OUT':>6}  REPLY / ERROR")
@@ -271,44 +245,42 @@ def run_provider(
         )
         append_reply(cfg["fmt"], history, turn, reply)
         if turn < turns:
-            time.sleep(5)
+            time.sleep(2)
 
-    # verdict per provider
     if not prefix_ok:
         print(f"  -> INCONCLUSIVE: prompt never hit the ~1024-token threshold; raise --prefix-tokens.")
         return provider, 3
     if any_hit:
-        print(f"  -> PASS: caching engaged (cached_tokens > 0); gateway passes it through.")
+        print(f"  -> PASS: caching engaged (cached_tokens > 0).")
         return provider, 0
-    print(f"  -> FAIL/NA: prefix over threshold but cached stayed 0 (this model may not cache, "
-          f"or Google's implicit cache didn't trigger).")
+    print(f"  -> FAIL/NA: prefix over threshold but cached stayed 0.")
     return provider, 1
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Verify prompt caching for openai/google/anthropic.")
+    p = argparse.ArgumentParser(description="Verify prompt caching directly against the upstream hub.")
     p.add_argument("--provider", choices=sorted(PROVIDERS), help="test one provider (default: all)")
     p.add_argument("--model", help="override the model (only valid with --provider)")
     p.add_argument("--turns", type=int, default=5)
     p.add_argument("--prefix-tokens", type=int, default=2500)
     args = p.parse_args()
 
-    gateway = require("TF_GATEWAY_URL").rstrip("/")
-    key = require("TF_VIRTUAL_KEY")
+    hub = require("TF_HUB_URL").rstrip("/")
+    key = require("TF_HUB_KEY")
 
     targets = [args.provider] if args.provider else list(PROVIDERS)
     if args.model and not args.provider:
         sys.exit("--model requires --provider")
 
-    print(f"Gateway : {gateway}")
+    print(f"HUB     : {hub}   (DIRECT — no APIM)")
     print(f"Testing : {', '.join(targets)}")
 
     results = []
     for prov in targets:
         model = args.model if (args.model and args.provider == prov) else PROVIDERS[prov]["default"]
-        results.append(run_provider(gateway, key, prov, model, args.turns, args.prefix_tokens))
+        results.append(run_provider(hub, key, prov, model, args.turns, args.prefix_tokens))
 
-    print(f"\n{'='*90}\nSUMMARY")
+    print(f"\n{'='*90}\nSUMMARY (hub-direct)")
     worst = 0
     for prov, code in results:
         label = {0: "PASS", 1: "FAIL/NA", 2: "ERROR", 3: "INCONCLUSIVE"}.get(code, "?")

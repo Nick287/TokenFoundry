@@ -38,9 +38,9 @@ NO SECRETS IN THIS FILE. Configure via env or a local .env (gitignored):
     TF_VIRTUAL_KEY   an APIM subscription (virtual) key
 
 Usage (pure stdlib):
-    python scripts/apim_pool_session_cache_test.py                    # all three
-    python scripts/apim_pool_session_cache_test.py --provider openai  # just one
-    python scripts/apim_pool_session_cache_test.py --turns 8 --prefix-tokens 3000
+    python tests/manual/apim_pool_session_cache_test.py                    # all three
+    python tests/manual/apim_pool_session_cache_test.py --provider openai  # just one
+    python tests/manual/apim_pool_session_cache_test.py --turns 8 --prefix-tokens 3000
 """
 
 from __future__ import annotations

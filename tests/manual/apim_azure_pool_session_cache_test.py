@@ -28,9 +28,9 @@ NO SECRETS IN THIS FILE. Configure via env or a local .env (gitignored):
     TF_VIRTUAL_KEY   an APIM subscription (virtual) key
 
 Usage (pure stdlib):
-    python scripts/pool_session_cache_test.py
-    python scripts/pool_session_cache_test.py --turns 8 --prefix-tokens 3000
-    python scripts/pool_session_cache_test.py --model gpt-5.4-mini
+    python tests/manual/pool_session_cache_test.py
+    python tests/manual/pool_session_cache_test.py --turns 8 --prefix-tokens 3000
+    python tests/manual/pool_session_cache_test.py --model gpt-5.4-mini
 """
 
 from __future__ import annotations
