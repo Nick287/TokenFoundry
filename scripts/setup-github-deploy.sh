@@ -126,10 +126,13 @@ printf '  Key Vault          : %s\n' "$KV_NAME"
 
 # --- 1. repo SECRETS: the Service Principal creds the Action's terraform uses ---
 log "Setting repo secrets (ARM_* Service Principal creds)"
-printf '%s' "$ARM_CLIENT_ID"       | gh secret set ARM_CLIENT_ID       --repo "$REPO" --body -
-printf '%s' "$ARM_CLIENT_SECRET"   | gh secret set ARM_CLIENT_SECRET   --repo "$REPO" --body -
-printf '%s' "$ARM_TENANT_ID"       | gh secret set ARM_TENANT_ID       --repo "$REPO" --body -
-printf '%s' "$ARM_SUBSCRIPTION_ID" | gh secret set ARM_SUBSCRIPTION_ID --repo "$REPO" --body -
+# NOTE: pass the value via --body "$VALUE" directly. Do NOT use `| gh secret set
+# --body -`: gh treats `-` as the LITERAL body (a 1-char secret), it does NOT read
+# stdin — that silently stored a 1-char tenant/secret and broke azure/login.
+gh secret set ARM_CLIENT_ID       --repo "$REPO" --body "$ARM_CLIENT_ID"
+gh secret set ARM_CLIENT_SECRET   --repo "$REPO" --body "$ARM_CLIENT_SECRET"
+gh secret set ARM_TENANT_ID       --repo "$REPO" --body "$ARM_TENANT_ID"
+gh secret set ARM_SUBSCRIPTION_ID --repo "$REPO" --body "$ARM_SUBSCRIPTION_ID"
 ok "repo secrets set"
 
 # --- 2. repo VARS: non-secret infra the Action reuses ---
