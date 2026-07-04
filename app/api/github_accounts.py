@@ -13,10 +13,11 @@ Endpoints (admin-only, mirrors app/api/routes.py):
   GET  /github-accounts               -> list accounts + their deploy status
   DELETE /github-accounts/{id}        -> destroy the hub + remove from pools
 
-Deploy/teardown are slow (terraform, minutes) so they run as FastAPI background
-tasks; the DB row is a DeployStatus state machine the frontend polls. This is the
-P1 shape (in-process background task); P2 moves it to an ACA Job with remote
-state and a dedicated deployer identity (see the plan).
+Deploy/teardown are slow (minutes) so they run as FastAPI background tasks; the
+DB row is a DeployStatus state machine the frontend polls. The actual hub
+terraform runs in a GitHub Action (方案 A) — the background task here triggers
+that Action, polls the run, and reads the resulting outputs from remote state
+(see app/services/terraform_runner.py).
 """
 
 from __future__ import annotations
@@ -175,8 +176,8 @@ def _deploy_account(account_id: str) -> None:
             _fail(db, acct, "oauth token not found in Key Vault")
             return
 
-        # 1) deploy the hub via the ACA Job (P2). deploy_hub generates and
-        #    injects HUB_ADMIN_TOKEN + HUB_API_KEY into the (stateless) hub and
+        # 1) deploy the hub via the GitHub Action (方案 A). deploy_hub generates
+        #    and injects HUB_ADMIN_TOKEN + HUB_API_KEY into the (stateless) hub and
         #    returns both, so we never round-trip the hub to mint a key — the
         #    hub_api_key we hold IS the inbound credential the hub accepts.
         deployed = terraform_runner.deploy_hub(account_id, token)

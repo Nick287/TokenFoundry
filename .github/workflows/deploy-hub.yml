@@ -66,11 +66,7 @@ jobs:
       - name: az login (Service Principal) — to read the per-account KV job-input
         uses: azure/login@v2
         with:
-          creds: >-
-            {"clientId":"${{ secrets.ARM_CLIENT_ID }}",
-             "clientSecret":"${{ secrets.ARM_CLIENT_SECRET }}",
-             "tenantId":"${{ secrets.ARM_TENANT_ID }}",
-             "subscriptionId":"${{ secrets.ARM_SUBSCRIPTION_ID }}"}
+          creds: '{"clientId":"${{ secrets.ARM_CLIENT_ID }}","clientSecret":"${{ secrets.ARM_CLIENT_SECRET }}","tenantId":"${{ secrets.ARM_TENANT_ID }}","subscriptionId":"${{ secrets.ARM_SUBSCRIPTION_ID }}"}'
 
       - name: Compute per-account values + read secrets from Key Vault
         id: vars
