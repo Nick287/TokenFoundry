@@ -61,7 +61,11 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.9.8"
+          # Pin to the SAME terraform the dev container / control-plane infra uses
+          # (v1.15.x). An older Action pin (1.9.8) rejected `for_each = cond ? [1] : []`
+          # that the dev version accepted — keep dev and CI on one version so
+          # "works locally" means "works in the Action".
+          terraform_version: "1.15.7"
 
       - name: az login (Service Principal) — to read the per-account KV job-input
         uses: azure/login@v2
