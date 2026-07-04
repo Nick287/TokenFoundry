@@ -190,7 +190,7 @@ def run_phase(gateway: str, key: str, model: str, turns: int, prefix_tokens: int
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Pool round-robin vs session affinity, cache effect.")
-    p.add_argument("--model", default="gpt-5.4")
+    p.add_argument("--model", default="gpt-5.4-mini")
     p.add_argument("--turns", type=int, default=6)
     p.add_argument("--prefix-tokens", type=int, default=2500)
     args = p.parse_args()

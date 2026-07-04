@@ -60,18 +60,25 @@ from pathlib import Path
 HTTP_TIMEOUT = 90
 FILLER = "You are an expert assistant; always consider the following reference note carefully. "
 TOKENS_PER_FILLER = 15
+_MARKER_TOKENS = 6  # ~token cost of the per-segment "[<6hex>#<i>] " nonce marker
 
 # Per-provider wiring for the pooled hub APIs.
-#   auth   : subscription-key header the provider's SDK naturally sends
-#   suffix : gateway path for this provider
-#   fmt    : "chat" (openai/google) | "messages" (anthropic)
-#   default: a model that exists on both hubs
+#   auth       : subscription-key header the provider's SDK naturally sends
+#   suffix     : gateway path for this provider
+#   fmt        : "chat" (openai/google) | "messages" (anthropic)
+#   default    : a model that exists on both hubs
+#   min_prefix : per-provider FLOOR on prefix tokens (optional). A provider's
+#                implicit prompt cache only kicks in above a minimum context
+#                size; below it, cached_tokens is always 0. gemini-2.5-pro needs
+#                ~2048 tokens (vs ~1024 for OpenAI/Anthropic), so google gets a
+#                floor so its cache actually engages. Effective prefix =
+#                max(--prefix-tokens, min_prefix).
 PROVIDERS = {
     "openai": {
         "auth": "api-key",
         "suffix": "/llm-openai/v1/responses",
         "fmt": "responses",
-        "default": "gpt-5.5",
+        "default": "gpt-5.4-mini",
     },
     "anthropic": {
         "auth": "x-api-key",
@@ -84,6 +91,7 @@ PROVIDERS = {
         "suffix": "/llm-google/v1/chat/completions",
         "fmt": "chat",
         "default": "gemini-2.5-pro",
+        "min_prefix": 2200,  # gemini-2.5-pro implicit cache needs ~2048 tok
     },
 }
 
@@ -115,16 +123,51 @@ def require(name: str) -> str:
 
 
 def build_prefix(target_tokens: int) -> str:
-    # Unique nonce up front so every phase/run starts from a cold, never-cached
-    # prefix (byte-identical prefix is what the cache keys on).
-    nonce = f"[session {uuid.uuid4().hex}] "
-    return (nonce + FILLER * max(1, target_tokens // TOKENS_PER_FILLER)).strip()
+    # A single nonce ONLY at the front isn't enough for prefix-caching providers
+    # like Anthropic: everything AFTER the nonce is byte-identical filler across
+    # runs, so Claude's prefix cache hits that shared tail from a breakpoint and
+    # turn 1 already shows cached>0 (pre-warmed by an earlier run). Weave a short
+    # per-run nonce into EVERY filler segment so the whole prefix — not just its
+    # first line — is unique this run, guaranteeing a genuinely cold turn 1.
+    #
+    # Keep the marker SHORT (6 hex, not a full 32-char uuid): a full uuid per
+    # segment nearly TRIPLES prompt_tokens, blowing the APIM per-subscription
+    # token-limit (50k TPM) after a couple of turns. Account for the marker's
+    # own token cost so the built prefix still lands near target_tokens.
+    nonce = uuid.uuid4().hex[:6]
+    per_seg = TOKENS_PER_FILLER + _MARKER_TOKENS
+    n = max(1, target_tokens // per_seg)
+    segments = [f"[{nonce}#{i}] {FILLER}" for i in range(n)]
+    return "".join(segments).strip()
 
 
 def decode_backend(cookie_val: str) -> str:
-    """The SessionId cookie value is base64(backend-name) on this gateway."""
+    """The SessionId cookie value is base64(backend-name) on this gateway.
+
+    Two gotchas this handles (both bit the naive version):
+      * URL-ENCODED PADDING: APIM percent-encodes the trailing '=' base64 padding
+        as %3D, so a backend whose name base64-encodes WITH padding (e.g.
+        'llm-openai-ext_gitmodelliang' -> '...==') arrives as '...%3D%3D'. Must
+        unquote BEFORE b64decode, else it throws and the backend shows as '?'.
+        (A name that happens to encode without padding, like the gha one, decoded
+        fine — which is why only some rows were '?', misleading the routing view.)
+      * TRAILING GARBAGE: some values carry a couple of stray bytes after the
+        name (b'...liang\\r\\xff\\xff'); keep only the leading printable-ASCII run
+        so the label is clean.
+    """
     try:
-        return base64.b64decode(urllib.parse.unquote(cookie_val)).decode()
+        raw = urllib.parse.unquote(cookie_val)
+        # Restore any base64 padding the transport stripped, then decode leniently.
+        padded = raw + "=" * (-len(raw) % 4)
+        decoded = base64.b64decode(padded).decode("utf-8", "replace")
+        # Trim at the first non-(printable-ascii) byte — drops stray tail bytes.
+        out = []
+        for ch in decoded:
+            if 32 <= ord(ch) < 127:
+                out.append(ch)
+            else:
+                break
+        return "".join(out) or "?"
     except Exception:
         return "?"
 
@@ -230,7 +273,7 @@ def run_phase(gateway: str, cfg: dict, key: str, model: str, turns: int,
               prefix_tokens: int, sticky: bool) -> dict:
     label = "SESSION AFFINITY (cookie)" if sticky else "ROUND-ROBIN (no cookie)"
     print(f"\n{'-'*92}\nPHASE: {label}")
-    print(f"{'TURN':<5} {'BACKEND':<22} {'PROMPT':>7} {'CACHED':>7} {'HIT%':>6}  REPLY / ERROR")
+    print(f"{'TURN':<5} {'BACKEND':<44} {'PROMPT':>7} {'CACHED':>7} {'HIT%':>6}  REPLY / ERROR")
 
     # Each phase builds its OWN cold prefix so round-robin can't pre-warm affinity.
     prefix = build_prefix(prefix_tokens)
@@ -244,7 +287,7 @@ def run_phase(gateway: str, cfg: dict, key: str, model: str, turns: int,
         r = call(gateway, cfg["auth"], key, cfg["suffix"], cfg["fmt"],
                  model, prefix, history, turn, cookie)
         if r["status"] != 200:
-            print(f"{turn:<5} {'—':<22} {'—':>7} {'—':>7} {'—':>6}  HTTP {r['status']}: {r.get('err','')}")
+            print(f"{turn:<5} {'—':<44} {'—':>7} {'—':>7} {'—':>6}  HTTP {r['status']}: {r.get('err','')}")
             return {"error": True}
 
         if sticky and cookie is None and r.get("set_cookie_raw"):
@@ -265,7 +308,7 @@ def run_phase(gateway: str, cfg: dict, key: str, model: str, turns: int,
             prefix_ok = True
         if r["cached"] > 0:
             hits += 1
-        print(f"{turn:<5} {display_be:<22} {r['prompt']:>7} {r['cached']:>7} {hit:>5.0f}%  "
+        print(f"{turn:<5} {display_be:<44} {r['prompt']:>7} {r['cached']:>7} {hit:>5.0f}%  "
               f"{' '.join(r['reply'].split())[:30]}")
         history.append({"role": "user", "content": f"(turn {turn}) Reply with a short sentence."})
         history.append({"role": "assistant", "content": r["reply"] or "ok"})
@@ -278,11 +321,17 @@ def run_phase(gateway: str, cfg: dict, key: str, model: str, turns: int,
 def run_provider(gateway: str, key: str, provider: str, model: str,
                  turns: int, prefix_tokens: int) -> tuple[str, dict, dict]:
     cfg = PROVIDERS[provider]
+    # Raise the prefix to this provider's cache floor if needed (e.g. google's
+    # gemini-2.5-pro won't cache below ~2048 tok). max() so an explicit larger
+    # --prefix-tokens still wins.
+    floor = cfg.get("min_prefix", 0)
+    eff_prefix = max(prefix_tokens, floor)
     print(f"\n{'='*92}")
     print(f"PROVIDER: {provider}  ({cfg['suffix']}, fmt={cfg['fmt']}, auth={cfg['auth']})")
-    print(f"MODEL   : {model}   prefix ~{prefix_tokens} tok   turns {turns}")
-    rr = run_phase(gateway, cfg, key, model, turns, prefix_tokens, sticky=False)
-    sa = run_phase(gateway, cfg, key, model, turns, prefix_tokens, sticky=True)
+    note = f"  (raised from {prefix_tokens} to meet cache floor {floor})" if eff_prefix > prefix_tokens else ""
+    print(f"MODEL   : {model}   prefix ~{eff_prefix} tok   turns {turns}{note}")
+    rr = run_phase(gateway, cfg, key, model, turns, eff_prefix, sticky=False)
+    sa = run_phase(gateway, cfg, key, model, turns, eff_prefix, sticky=True)
     return provider, rr, sa
 
 
@@ -291,7 +340,7 @@ def main() -> int:
     p.add_argument("--provider", choices=sorted(PROVIDERS), help="test one provider (default: all)")
     p.add_argument("--model", help="override model (only valid with --provider)")
     p.add_argument("--turns", type=int, default=6)
-    p.add_argument("--prefix-tokens", type=int, default=2500)
+    p.add_argument("--prefix-tokens", type=int, default=1500)
     args = p.parse_args()
 
     gateway = require("TF_GATEWAY_URL").rstrip("/")
