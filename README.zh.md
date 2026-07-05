@@ -7,46 +7,60 @@ Azure 原生的 LLM token 中枢 / AI 网关。在 Azure API Management 的 GenA
 虚拟密钥、token/成本计量,以及一个 React 门户。每个供应商都有自己独立的 APIM API,
 沿用该供应商原生的订阅密钥请求头,因此供应商自家的 SDK 可以直接对着网关工作。
 
+模型算力来自云端自动接入的 **GitModel hub**(**方案 A**):添加一个 GitHub Copilot 账号,
+就会(经由一个 GitHub Action)部署一套专属的 hub Container App,并把它加入 APIM 的
+负载均衡池 —— 于是每个供应商池都以会话粘性跨多个账号扇出。
+
 ## 架构
 
 ```mermaid
-flowchart LR
-    Clients["客户端 (SDK)"]
-
-    subgraph ACA["aca-app — 单个 Azure Container App"]
-        Portal["React 门户<br/>(管理端 + 客户端 SPA)"]
-        API["FastAPI 控制平面<br/>租户 · 项目 · 密钥 ·<br/>路由 · 预算 · 用量"]
-        Portal -. "/api" .-> API
+flowchart TB
+    subgraph client[客户端]
+        SDK[供应商 SDK<br/>OpenAI / Anthropic / Google]
     end
 
-    APIM["Azure API Management — AI 网关<br/>token 限流 · 负载均衡 · 熔断"]
+    subgraph dataplane[数据平面 — APIM 网关]
+        API[按供应商的 API<br/>llm-openai / llm-anthropic / llm-google]
+        POOL[后端池<br/>会话粘性 + 熔断]
+        POL[策略<br/>token 限流 · 计量 · 写 Cosmos]
+    end
 
-    Claude["Anthropic Claude"]
-    Gemini["Google Gemini"]
-    OpenAI["OpenAI"]
+    subgraph hubs[GitModel hub — 每个 GitHub 账号一个]
+        H1[hub gha_A<br/>Copilot 订阅]
+        H2[hub gha_B<br/>Copilot 订阅]
+    end
 
-    PG[("PostgreSQL<br/>元数据")]
-    Cosmos[("Cosmos DB<br/>用量")]
-    KV["Key Vault<br/>密钥"]
-    Insights["App Insights<br/>遥测"]
+    subgraph ctrl[控制平面 — 单个 Azure Container App]
+        PORTAL[React 门户 SPA]
+        APISRV[FastAPI: 租户 / 密钥 / 路由 /<br/>github-accounts / deploy-config]
+        PROV[ApimProvisioner]
+        TRUN[terraform_runner<br/>方案 A 触发/轮询]
+    end
 
-    Clients -->|虚拟密钥| APIM
-    APIM -->|路由| Claude
-    APIM -->|路由| Gemini
-    APIM -->|路由| OpenAI
-    APIM -->|"出站策略:写用量"| Cosmos
+    subgraph stores[存储]
+        KV[(Key Vault<br/>所有密钥)]
+        PG[(PostgreSQL<br/>元数据,仅引用)]
+        COS[(Cosmos DB<br/>用量记录)]
+        INS[App Insights<br/>延迟遥测]
+    end
 
-    API -->|管理 · ARM| APIM
-    API <-->|读 / 写| PG
-    API <-->|读 / 写| KV
-    API -->|读| Cosmos
-    API -->|读| Insights
+    SDK -->|虚拟密钥| API --> POOL --> H1 & H2
+    POL -.用量文档.-> COS
+    PORTAL --> APISRV --> PROV -->|ARM REST| API & POOL
+    APISRV --> TRUN -->|workflow_dispatch| GHA[GitHub Action<br/>deploy-hub.yml]
+    GHA -->|SP + terraform| H1 & H2
+    APISRV -->|仅引用| PG
+    APISRV -->|set/get| KV
+    APISRV -->|读用量| COS
+    APISRV -->|读延迟| INS
+    TRUN -->|读 state blob| TFSTATE[(tfstate 存储)]
 ```
 
-> 全系统只有**一个** Cosmos DB。APIM 在每次调用时把一条用量记录*写*进去
-> (出站策略);FastAPI 从**同一个**库里*读*出来给用量页 —— 这就是为什么
-> 同一个节点既有一条写入箭头、又有一条读出箭头。上方的 Mermaid 图是权威来源;
-> 下方是精修版渲染图。
+> **唯一不变量:** 控制平面配置网关(管理平面),**绝不介入请求路径**。LLM 流量走
+> 客户端 → APIM → hub,由 APIM 策略计量。全系统只有**一个** Cosmos DB —— APIM 每次
+> 调用写一条用量记录(出站策略),FastAPI 从同一个库读出来给用量页。完整的系统图、
+> 方案 A 接入时序、实体模型见
+> **[docs/architecture.md](docs/architecture.md)** ([中文](docs/architecture.zh.md))。
 
 ![Token Foundry 架构](docs/architecture.png)
 
@@ -74,8 +88,8 @@ flowchart LR
    虚拟密钥 id 与 PostgreSQL 比对(`虚拟密钥 → 项目 → 租户`)来确定该记录归属的租户。
 
 这是一个有意为之的 MVP 取舍:`send-one-way-request` 是即发即忘,写入失败**不会重试**
-(对趋势性用量来说偶尔丢失可以接受)。计费级、可重放的精确记账走下面的 Event Hub 链路 ——
-该命名空间已开通但**尚未接通**(消费者尚未构建)。
+(对趋势性用量来说偶尔丢失可以接受)。计费级、可重放的精确记账走**计划中的** Event Hub
+链路(第二阶段 —— 流和消费者都尚未构建)。
 
 ### 用量页有两个数据源,分开展示
 
@@ -129,11 +143,11 @@ flowchart LR
   是遥测来源(会采样 —— 调用数、p50/p95、网关 vs 后端的延迟拆分)。采样数据绝不
   用于计费。
 - **Azure 原生、无密钥集成。** 处处用托管身份 + Key Vault 引用;Cosmos 以
-  `disableLocalAuth`(仅 AAD)运行。要轮换的密钥更少,而且 IaC(Bicep)能复现整套
-  环境。
+  `disableLocalAuth`(仅 AAD)运行。要轮换的密钥更少,而且 Terraform
+  (按环境用 workspace 隔离)能复现整套环境。
 
 > 诚实地说明取舍:MVP 的用量写入是发完即走的,所以偶尔丢一条记录、对*趋势*用量
-> 是可接受的。计费级、可重放的精确记账走 Event Hub 那条路(已开通、尚未接通)。
+> 是可接受的。计费级、可重放的精确记账走计划中的 Event Hub 那条路(第二阶段)。
 
 ## 目录结构
 
@@ -141,60 +155,39 @@ flowchart LR
 app/            FastAPI 控制平面(models / services / api)
 portal/         React + Vite 前端
 terraform/      Terraform 基础设施即代码(根 + 模块;APIM preview API 用 azapi)
+scripts/        bootstrap.sh · deploy.sh · create-deployer-sp.sh · update-app.sh
 vendored/       GitModel hub(每账号,经 GitHub Action 部署)
-docs/           架构图
-tests/          pytest(计费逻辑 —— 纯逻辑,不依赖 Azure);tests/manual = 联网网关脚本
+.github/        deploy-hub.yml —— 方案 A 每账号 hub 的 Action
+docs/           架构 / 安全 / 部署 / APIM 网关 文档
+tests/          pytest(纯逻辑,不依赖 Azure);tests/manual = 联网网关脚本
 ```
 
-## 基础设施(Bicep)
+## 基础设施(Terraform)
 
-两个入口:
+整套环境用 **Terraform**,state **按环境用 workspace 隔离**(没有远程 backend 块 —— 每个
+环境是自己的 `terraform workspace`,state 互不冲突)。资源名**由资源组 id 派生**
+(`suffix = substr(md5(rg.id), 0, 13)`),所以新环境不会和旧环境撞名 —— 连软删除的
+Key Vault / APIM 残留都不会撞。
 
-| 文件 | 部署什么 | 何时用 |
-|---|---|---|
-| `infra/main.lite.bicep` | Monitor、Key Vault、PostgreSQL、Cosmos、Event Hub、ACR | 快速首发 —— 先把便宜的数据 + 可观测层立起来,这样在 APIM 开通期间就能 `az acr build`。 |
-| `infra/main.bicep` | lite 的全部**外加** APIM(约 30–45 分钟)、APIM 后端池、Grafana、应用密钥、Container App | 完整部署。 |
+`scripts/deploy.sh` 跑一次 `terraform apply`,并用 `az acr build` 并行构建两个镜像
+(控制平面 app + 预建的 GitModel hub)。`scripts/bootstrap.sh` 把它和
+`create-deployer-sp.sh`(方案 A 的服务主体)串起来。完整的三阶段流程见
+**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** ([中文](docs/DEPLOYMENT.zh.md))。
 
-### 部署参数(传给 `main.bicep`)
-
-这些是你在部署时**自己提供**的值,在 `infra/main.bicepparam`(非密钥)
-或命令行(密钥)中定义:
-
-| 参数 | 是否密钥 | 默认值 | 含义 |
-|---|---|---|---|
-| `namePrefix` | 否 | `tokenfoundry` | 所有资源名的前缀(如 `tokenfoundry-apim`)。全局唯一的资源(Cosmos / Key Vault / ACR)还会追加一段资源组 id 的哈希。 |
-| `location` | 否 | `centralus` | 所有资源的 Azure 区域。**保持 `centralus`** —— 本订阅在某些区域(如 eastus)禁用 PostgreSQL;统一一个区域可避免跨区问题。 |
-| `environmentName` | 否 | `dev` | 仅作标签(`dev` \| `prod`);打到每个资源上用于成本归集。 |
-| `pgAdminLogin` | 否 | `tfadmin` | PostgreSQL 管理员用户名。 |
-| `pgAdminPassword` | **是** | — | PostgreSQL 管理员密码。通过 `-p pgAdminPassword=$PG_PWD` 传入;**切勿**写死在 `.bicepparam` 里。会被拼进数据库连接串并存为 Key Vault 密钥(`tf-database-url`)。 |
-| `jwtSecret` | **是** | — | 自托管登录 JWT 的 HS256 签名密钥。存为 `tf-jwt-secret`。 |
-| `adminPassword` | **是** | — | 首次启动时创建的种子 `admin` 账号的密码。存为 `tf-admin-password`。 |
-| `appImage` | 否 | 占位符 | Container App 运行的完整镜像引用,如 `<acr>.azurecr.io/tokenfoundry:v6`。先有鸡还是先有蛋:先部署 lite → `az acr build` → 设置此值 → 再部署完整版。 |
-
-示例:
-
-```bash
-az deployment group create -g <rg> -f infra/main.bicep \
-  -p infra/main.bicepparam \
-  -p pgAdminPassword=$PG_PWD -p jwtSecret=$JWT -p adminPassword=$ADMIN_PWD \
-  -p appImage=<acr>.azurecr.io/tokenfoundry:v6
-```
-
-### 各模块开通了什么(以及那些不显然的设置)
+### 各模块开通了什么(`terraform/modules/`)
 
 | 模块 | 资源 | 值得知道的点 |
 |---|---|---|
 | `monitor` | Log Analytics + App Insights | 工作区保留 30 天。App Insights 是用量页通过 KQL 查询的延迟/遥测源。 |
 | `keyvault` | Key Vault | **RBAC 授权**(而非访问策略);软删除 7 天。各身份的角色在使用它的模块里授予。 |
-| `postgres` | PostgreSQL Flexible Server 16 | `Standard_B1ms` 突发型,32 GB。防火墙规则 `AllowAzureServices`(0.0.0.0)让 Container Apps 能连上 —— 生产环境应收紧为 VNet。 |
-| `cosmos` | Cosmos DB for NoSQL | **Serverless**,`disableLocalAuth: true`(仅 AAD —— 无密钥)。库 `tokenfoundry`,容器 `usage`,分区键 `/pk`(`subscriptionId_yyyymm`),原始文档 **90 天 TTL**。 |
-| `eventhub` | Event Hub 命名空间 + `usage` hub | 为第二阶段计费流开通;**尚未接通**。Standard 层,2 分区,1 天保留,`billing` 消费者组。 |
-| `acr` | 容器注册表(Basic) | `adminUserEnabled: false` —— 拉取走 Container App 的托管身份(AcrPull)。 |
-| `apim` | API Management(Developer SKU) | 系统分配身份。配置 App Insights 的 **logger + diagnostic**(采样 **100%** —— 成本/细节的旋钮,见模块注释),并给自己的身份授予 **Cosmos Data Contributor**,使出站策略能写用量。 |
-| `apim-backends` | 后端池 + 熔断器 | 使用**预览版** API 版本(Bicep 原生支持 —— 这正是我们选 Bicep 而非 Terraform 的原因)。占位池;真正的每供应商后端由 FastAPI provisioner 在运行时创建。 |
-| `grafana` | Azure Managed Grafana | 系统身份被授予资源组级 **Monitoring Reader**,使仪表盘能出数(以前是手动步骤)。 |
-| `appsecrets` | Key Vault 密钥 | 拼装 Postgres 连接串(让密码绝不落进应用设置),并写入 `tf-database-url` / `tf-jwt-secret` / `tf-admin-password`。 |
-| `containerapps` | Container App(API + 门户) | 见下方身份/RBAC。 |
+| `postgres` | PostgreSQL Flexible Server 16 | `Standard_B1ms` 突发型。防火墙规则 `AllowAzureServices` 让 Container Apps 能连上 —— 生产环境应收紧为 VNet。 |
+| `cosmos` | Cosmos DB for NoSQL | **Serverless**,`disableLocalAuth: true`(仅 AAD)。库 `tokenfoundry`,容器 `usage`,分区键 `/pk`(`subscriptionId_yyyymm`),**90 天 TTL**。 |
+| `acr` | 容器注册表(Basic) | `adminUserEnabled: false` —— 拉取走 Container App 的托管身份(AcrPull)。同时存 `tokenfoundry:<tag>` **和** `gitmodel:<tag>`(hub 镜像)。 |
+| `apim` | API Management(Developer SKU) | 系统分配身份。配置 App Insights 的 logger + diagnostic,并给自己的身份授予 **Cosmos Data Contributor**,使出站策略能写用量。 |
+| `apim-backends` | 后端池 + 熔断器 | 经 `azapi` 使用**预览版** API 版本。占位池;真正的每供应商池 + 每账号 hub 后端由 FastAPI provisioner 在**运行时**创建。 |
+| `deployer` | tfstate 存储账户 | **方案 A** 的 GitHub Action 读写每账号 hub state(`hubs/<id>.tfstate`)的远程 state blob 容器;控制平面从中读输出。 |
+| `appsecrets` | Key Vault 密钥 | 拼装 Postgres 连接串,并写入 `tf-database-url` / `tf-jwt-secret` / `tf-admin-password`。 |
+| `containerapps` | Container App(API + 门户) | 注入所有 `TF_*` env(含 deploy-config 流程需要的 `TF_ACR_NAME` / `TF_KEYVAULT_NAME` / `TF_HUB_IMAGE_TAG`)。见下方身份/RBAC。 |
 
 ### 身份与 RBAC(谁能动什么)
 
@@ -210,6 +203,12 @@ Container App 有意使用**两个**身份:
 
 APIM 的系统身份另外被单独授予 **Cosmos DB Data Contributor**,用于出站策略的写入链路。
 
+**方案 A 的部署服务主体**(由 `scripts/create-deployer-sp.sh` 创建)是一个独立身份 ——
+订阅级 **Contributor** + **User Access Administrator**,外加 tfstate 存储账户上的
+**Key Vault Secrets User** 和 **Storage Blob Data Contributor**。它在 GitHub Action 里
+跑每账号的 hub Terraform;creds 存在 GitHub repo secrets(以及 Key Vault)。见
+[docs/SECURITY.md](docs/SECURITY.md)。
+
 ### 运行时配置(`TF_*` 环境变量)
 
 `app/config.py` 读取这些变量(前缀 `TF_`);Container Apps 注入它们,密钥以
@@ -224,12 +223,15 @@ Key Vault 引用形式注入:
 | `TF_APIM_SERVICE_NAME` | apim 模块 | 运行时开通的目标。 |
 | `TF_APP_INSIGHTS_RESOURCE_ID` | monitor 模块 | 用量遥测 KQL 查询的目标资源。没有它,App Insights 区块会退化为空。 |
 | `TF_RESOURCE_GROUP` / `TF_AZURE_SUBSCRIPTION_ID` | 部署时 | provisioner 的 ARM 作用域。 |
+| `TF_ACR_NAME` / `TF_KEYVAULT_NAME` / `TF_ACR_LOGIN_SERVER` / `TF_AZURE_LOCATION` | terraform | 门户 deploy-config 流程发布成 `HUB_*` GitHub Actions 变量的纯值。 |
+| `TF_HUB_IMAGE_TAG` | terraform(`image_tag`) | hub 部署要拉的 `gitmodel:<tag>` —— 设为 `deploy.sh` 实际构建的 tag(绝非写死的 `:latest`)。 |
+| `TF_TFSTATE_STORAGE_ACCOUNT` / `TF_TFSTATE_CONTAINER` | deployer 模块 | 方案 A 远程 state 位置。 |
 | `TF_ENVIRONMENT` | 静态 `prod` | 控制本地 dev-token 鉴权旁路是否开启。 |
 
 ## 运行(在 Dev Container 内)
 
 在 Dev Container 中打开仓库(VS Code:"Reopen in Container")。它会安装
-Python + Node + azure-cli(含 `az bicep`),并运行 `pip install -e .[dev]` 和
+Python + Node + azure-cli + Terraform,并运行 `pip install -e .[dev]` 和
 `npm install`。
 
 ### 1. 登录 Azure
@@ -239,23 +241,21 @@ az login
 az account set --subscription <your-sub-id>
 ```
 
-`DefaultAzureCredential`(后端)和 `az deployment`(Bicep)都复用这次登录。
+`DefaultAzureCredential`(后端)和 Terraform 都复用这次 `az login`。
 
 ### 2. 全面校验(无需云端)
 
 ```bash
 # 后端:lint、类型检查、单元测试
-ruff check app worker tests
+ruff check app tests
 mypy app
 pytest -q
 
 # 前端:类型检查 + 生产构建
-cd portal && npm run typecheck && npm run build && cd ..
+cd portal && npm run build && cd ..
 
-# Bicep:编译 + 对某个资源组做预演
-az bicep build --file infra/main.bicep
-az deployment group what-if -g <rg> -f infra/main.bicep \
-  -p infra/main.bicepparam -p pgAdminPassword=<pwd>
+# Terraform:格式化 + 校验
+cd terraform && terraform fmt -check && terraform validate && cd ..
 ```
 
 ### 3. 本地运行整套
@@ -276,50 +276,51 @@ npm run dev                   # http://localhost:5173,代理 /api -> :8000
 
 ### 4. 部署
 
+一条命令立起整套环境。先选中 workspace 并设好 RG 名(tfvars 细节见
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)):
+
 ```bash
-az group create -n <rg> -l centralus
+cd terraform && terraform workspace new dev-a01 && cd ..   # 隔离 state
+# 编辑 terraform/terraform.tfvars: resource_group_name = "tokenfoundry-rg-dev-a01"(+ 密码)
 
-# (可选)快速首发 —— 仅数据 + 可观测层
-az deployment group create -g <rg> -f infra/main.lite.bicep \
-  -p namePrefix=tokenfoundry -p pgAdminPassword=<pwd>
-
-# 构建并推送单一镜像(根 Dockerfile 同时构建门户 + API)
-az acr build -r <acr> -t tokenfoundry:v6 .
-
-# 完整部署
-az deployment group create -g <rg> -f infra/main.bicep \
-  -p infra/main.bicepparam \
-  -p pgAdminPassword=<pwd> -p jwtSecret=<jwt> -p adminPassword=<admin-pwd> \
-  -p appImage=<acr>.azurecr.io/tokenfoundry:v6
+az login && az account set --subscription <id>
+./scripts/bootstrap.sh -g tokenfoundry-rg-dev-a01
 ```
 
-后续仅更新应用时,跳过整套部署 —— 重新构建并滚动修订版即可:
+`bootstrap.sh` 先跑 `deploy.sh`(一次 `terraform apply` + 并行 `az acr build` 构建
+app **和** hub 镜像;APIM 是约 30–45 分钟的长杆;结尾做 `/healthz` 冒烟测试),
+再跑 `create-deployer-sp.sh`(方案 A 的 SP)。之后在**门户里**粘贴两个 GitHub PAT ——
+GitHub 无法通过 API 生成 PAT。然后添加一个 GitHub 账号即可接入一套 GitModel hub(方案 A)。
+
+后续仅更新应用时跳过 Terraform —— 重新构建并滚动修订版即可(自动发现 RG 里的
+ACR / Container App):
 
 ```bash
-az acr build -r <acr> -t tokenfoundry:v7 .
-az containerapp update -g <rg> -n <prefix>-aca-app \
-  --image <acr>.azurecr.io/tokenfoundry:v7
+./scripts/update-app.sh -g tokenfoundry-rg-dev-a01           # az acr build + 滚动修订版
 ```
 
 ## 验证(端到端清单)
 
-1. 在容器内 `az login`。
-2. `az deployment group create …` —— APIM / PostgreSQL / Cosmos / Monitor /
-   Grafana 起来;后端池 + 熔断器创建完成(预览版 API)。
-3. 管理控制台 → 创建租户 + 项目 + 签发密钥 + 添加模型别名 → APIM 拿到
-   产品/订阅/后端,密钥落进 Key Vault。
-4. 用密钥调用某供应商 API(如 `POST {gateway}/llm-openai/v1/chat/completions`,
-   虚拟密钥放在 `api-key` 请求头)→ 拿到补全;超过 TPM → 429。
-5. 多供应商:改一下 body 里的 `model`,调用对应供应商路径 —— `claude-*`
+1. 容器内 `az login`;`./scripts/bootstrap.sh -g <rg>` —— APIM / PostgreSQL /
+   Cosmos / Monitor / ACR / Container App 起来;部署 SP 建好,`/healthz`
+   返回 `{"status":"ok"}`。
+2. 门户 → **GitHub 账号 → 部署配置**:粘贴两个 PAT → SP creds 自动推到 repo
+   (`ARM_*` secrets + `HUB_*`/`TFSTATE_*` 变量);徽章翻成 **Ready**。
+3. 门户 → **+ GitHub 账号** → 设备流登录 → 部署一套 hub Container App
+   (方案 A GitHub Action),加入 3 个供应商池,其 chat 模型注册成池化路由;
+   账号变 **READY**。
+4. 管理控制台 → 创建租户 + 项目 + 签发虚拟密钥(可选设每 key 的 TPM 和一个
+   token-quota 档) → APIM 拿到产品/订阅,密钥落进 Key Vault。
+5. 用密钥调用某供应商 API(如 `POST {gateway}/llm-openai/v1/chat/completions`,
+   虚拟密钥放在 `api-key` 请求头)→ 拿到补全;超 TPM → 429,超配额 → 403。
+6. 多供应商:改一下 body 里的 `model`,调用对应供应商路径 —— `claude-*`
    → `/llm-anthropic/v1/messages`(`x-api-key` 头),`gpt-5.x`
    → `/llm-openai/v1/responses`,其余 OpenAI/Gemini → `/v1/chat/completions`
-   → 全部正确路由。
-6. **用量页 → 选租户**:*Cosmos* 区块显示真实的输入/输出 token + 每次调用明细;
+   → 全部以会话粘性路由到池化的 hub。
+7. **用量页 → 选租户**:*Cosmos* 区块显示真实的输入/输出 token + 每次调用明细;
    *App Insights* 区块显示调用次数、p50/p95、网关 vs 后端拆分,以及每小时趋势。
-7. Grafana 渲染跨租户的用量/成本/TPM。
 8. 设个很小的预算 → `budget_enforcer` 暂停订阅 → 此后 401。
-9. Azure Monitor 告警 → 预算阈值触发 Action Group。
-10. 客户门户:客户只能看到自己的租户;跨租户访问被租户作用域中间件拒绝。
+9. 客户门户:客户只能看到自己的租户;跨租户访问被租户作用域中间件拒绝。
 
 要端到端冒烟测试每个已登记模型,运行 `python tests/manual/smoke_test_models.py` ——
 它会从控制平面自动发现模型,沿各自的供应商路径调用(把 `gpt-5.x` 路由到
@@ -335,8 +336,11 @@ URL 和一个虚拟密钥;所需变量见脚本头部。
 ## 实现状态
 
 - **当前可用:** 数据模型、控制平面 API + 租户作用域鉴权、APIM 开通服务、
-  多供应商模型路由、管理端 + 客户端门户、覆盖全部 PaaS 的 Bicep、
-  token 限流 + emit-token-metric 策略、**APIM→Cosmos 直写用量采集**、
-  **双数据源用量页**(Cosmos 计费 + App Insights 延迟)、Grafana 仪表盘。
-- **第二阶段(已开通,未接通):** 用于可重放/可重试记账的 Event Hub 计费 worker、
+  多供应商模型路由、管理端 + 客户端门户、**覆盖全部 PaaS 的 Terraform**
+  (按环境用 workspace 隔离)、token 限流 + emit-token-metric 策略、
+  **每 key 的 TPM + token-quota 限额**(named-value 驱动)、
+  **方案 A 云端自动 GitModel hub 接入**(设备流 → GitHub Action → 入池)、
+  **APIM→Cosmos 直写用量采集**,以及**双数据源用量页**
+  (Cosmos 计费 + App Insights 延迟)。
+- **第二阶段(计划中):** 用于可重放/可重试记账的 Event Hub 计费 worker、
   语义缓存、BYO 凭据隔离、经由流的预算 $ 强制、成本分摊(chargeback)。

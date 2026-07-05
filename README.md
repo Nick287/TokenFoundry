@@ -8,46 +8,63 @@ Gemini / OpenAI), per-tenant virtual keys, token/cost metering, and a React
 portal. Each provider gets its own APIM API with the provider's native
 subscription-key header, so the provider's own SDK works against the gateway.
 
+Model capacity comes from **GitModel hubs** onboarded cloud-automatically
+(**方案 A**): adding a GitHub Copilot account deploys a dedicated hub Container
+App (via a GitHub Action) and joins it to APIM's load-balanced pools — so every
+provider pool fans out across accounts with session affinity.
+
 ## Architecture
 
 ```mermaid
-flowchart LR
-    Clients["Clients (SDKs)"]
-
-    subgraph ACA["aca-app — single Azure Container App"]
-        Portal["React portal<br/>(admin + customer SPA)"]
-        API["FastAPI control plane<br/>tenants · projects · keys ·<br/>routes · budgets · usage"]
-        Portal -. "/api" .-> API
+flowchart TB
+    subgraph client[Clients]
+        SDK[Provider SDKs<br/>OpenAI / Anthropic / Google]
     end
 
-    APIM["Azure API Management — AI gateway<br/>token-limit · load-balance · circuit-breaker"]
+    subgraph dataplane[Data plane — APIM gateway]
+        API[Per-provider APIs<br/>llm-openai / llm-anthropic / llm-google]
+        POOL[Backend pools<br/>session affinity + circuit breaker]
+        POL[Policies<br/>token-limit · emit-metric · Cosmos write]
+    end
 
-    Claude["Anthropic Claude"]
-    Gemini["Google Gemini"]
-    OpenAI["OpenAI"]
+    subgraph hubs[GitModel hubs — one per GitHub account]
+        H1[hub gha_A<br/>Copilot subscription]
+        H2[hub gha_B<br/>Copilot subscription]
+    end
 
-    PG[("PostgreSQL<br/>metadata")]
-    Cosmos[("Cosmos DB<br/>usage")]
-    KV["Key Vault<br/>secrets"]
-    Insights["App Insights<br/>telemetry"]
+    subgraph ctrl[Control plane — one Azure Container App]
+        PORTAL[React portal SPA]
+        APISRV[FastAPI: tenants / keys / routes /<br/>github-accounts / deploy-config]
+        PROV[ApimProvisioner]
+        TRUN[terraform_runner<br/>方案 A trigger/poll]
+    end
 
-    Clients -->|virtual key| APIM
-    APIM -->|route| Claude
-    APIM -->|route| Gemini
-    APIM -->|route| OpenAI
-    APIM -->|"outbound policy: write usage"| Cosmos
+    subgraph stores[Stores]
+        KV[(Key Vault<br/>all secrets)]
+        PG[(PostgreSQL<br/>metadata, refs only)]
+        COS[(Cosmos DB<br/>usage records)]
+        INS[App Insights<br/>latency telemetry]
+    end
 
-    API -->|manage · ARM| APIM
-    API <-->|read / write| PG
-    API <-->|read / write| KV
-    API -->|read| Cosmos
-    API -->|read| Insights
+    SDK -->|virtual key| API --> POOL --> H1 & H2
+    POL -.usage doc.-> COS
+    PORTAL --> APISRV --> PROV -->|ARM REST| API & POOL
+    APISRV --> TRUN -->|workflow_dispatch| GHA[GitHub Action<br/>deploy-hub.yml]
+    GHA -->|SP + terraform| H1 & H2
+    APISRV -->|refs only| PG
+    APISRV -->|set/get| KV
+    APISRV -->|read usage| COS
+    APISRV -->|read latency| INS
+    TRUN -->|read state blob| TFSTATE[(tfstate storage)]
 ```
 
-> There is **one** Cosmos DB. APIM *writes* a usage record to it on every call
-> (outbound policy); FastAPI *reads* from that same store for the usage page —
-> that's why one node has both a write arrow in and a read arrow out. The Mermaid
-> diagram above is the authoritative source; a polished rendering is below.
+> **The one invariant:** the control plane configures the gateway (management
+> plane) and **never sits in the request path**. LLM traffic goes client → APIM
+> → hub, metered by APIM policy. There is **one** Cosmos DB — APIM *writes* a
+> usage record on every call (outbound policy), and FastAPI *reads* that same
+> store for the usage page. The full system diagram, the 方案 A onboarding
+> sequence, and the entity model live in
+> **[docs/architecture.md](docs/architecture.md)** ([中文](docs/architecture.zh.md)).
 
 ![Token Foundry architecture](docs/architecture.png)
 
@@ -79,8 +96,8 @@ writer. It now works as a single direct write:
 
 This is a deliberate MVP trade-off: `send-one-way-request` is fire-and-forget,
 so a failed write is **not retried** (occasional loss is acceptable for trend
-usage). Billing-grade, replayable accounting is the Event Hub path below — the
-namespace is provisioned but **not yet wired** (the consumer is not built yet).
+usage). Billing-grade, replayable accounting is the **planned** Event Hub path
+(Phase 2 — the stream + consumer are not built yet).
 
 ### The usage page has two data sources, shown separately
 
@@ -149,11 +166,12 @@ building one. Concretely:
   p50/p95, gateway-vs-backend latency split). Sampled data never feeds billing.
 - **Azure-native, secretless integration.** Managed identity + Key Vault
   references everywhere; Cosmos runs with `disableLocalAuth` (AAD-only). Fewer
-  secrets to rotate, and IaC (Bicep) reproduces the whole stack.
+  secrets to rotate, and Terraform (workspace-isolated per env) reproduces the
+  whole stack.
 
 > Trade-off, stated honestly: the MVP usage write is fire-and-forget, so an
 > occasional dropped record is acceptable for *trend* usage. Billing-grade,
-> replayable accounting is the Event Hub path (provisioned, not yet wired).
+> replayable accounting is the planned Event Hub path (Phase 2).
 
 ## Layout
 
@@ -161,60 +179,41 @@ building one. Concretely:
 app/            FastAPI control plane (models / services / api)
 portal/         React + Vite frontend
 terraform/      Terraform IaC (root + modules; azapi for APIM preview API)
+scripts/        bootstrap.sh · deploy.sh · create-deployer-sp.sh · update-app.sh
 vendored/       GitModel hub (per-account, deployed via GitHub Action)
-docs/           architecture diagram
-tests/          pytest (billing logic — pure, no Azure); tests/manual = live-gateway scripts
+.github/        deploy-hub.yml — the 方案 A per-account hub Action
+docs/           architecture / security / deployment / APIM-gateway docs
+tests/          pytest (pure, no Azure); tests/manual = live-gateway scripts
 ```
 
-## Infrastructure (Bicep)
+## Infrastructure (Terraform)
 
-Two entry points:
+The whole environment is **Terraform**, state isolated **per environment via a
+workspace** (no remote backend block — each env is its own `terraform workspace`,
+so states never collide). Resource names are **derived from the resource-group
+id** (`suffix = substr(md5(rg.id), 0, 13)`), so a new environment can't collide
+with an old one's names — even soft-deleted Key Vault / APIM.
 
-| File | What it deploys | When to use |
-|---|---|---|
-| `infra/main.lite.bicep` | Monitor, Key Vault, PostgreSQL, Cosmos, Event Hub, ACR | Fast first pass — stands up the cheap data + observability tier so you can `az acr build` while APIM provisions. |
-| `infra/main.bicep` | Everything in lite **plus** APIM (~30–45 min), the APIM backend pool, Grafana, app secrets, and the Container App | Full deployment. |
+`scripts/deploy.sh` runs one `terraform apply` and builds two images in parallel
+(the control-plane app + the pre-built GitModel hub) with `az acr build`.
+`scripts/bootstrap.sh` chains that with `create-deployer-sp.sh` (the 方案 A
+Service Principal). See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** for the full
+three-phase flow.
 
-### Deploy parameters (passed to `main.bicep`)
-
-These are the values **you provide** at deploy time, defined in
-`infra/main.bicepparam` (non-secrets) or on the command line (secrets):
-
-| Parameter | Secret | Default | Meaning |
-|---|---|---|---|
-| `namePrefix` | no | `tokenfoundry` | Prefix for every resource name (e.g. `tokenfoundry-apim`). Globally-unique resources (Cosmos / Key Vault / ACR) also append a hash of the resource-group id. |
-| `location` | no | `centralus` | Azure region for all resources. **Keep it `centralus`** — this subscription blocks PostgreSQL in some regions (e.g. eastus); one region avoids cross-region issues. |
-| `environmentName` | no | `dev` | Tag only (`dev` \| `prod`); applied to every resource for cost grouping. |
-| `pgAdminLogin` | no | `tfadmin` | PostgreSQL administrator username. |
-| `pgAdminPassword` | **yes** | — | PostgreSQL admin password. Pass via `-p pgAdminPassword=$PG_PWD`; **never** hardcode it in the `.bicepparam`. Assembled into the DB connection string and stored as a Key Vault secret (`tf-database-url`). |
-| `jwtSecret` | **yes** | — | HS256 signing secret for the self-hosted login JWTs. Stored as `tf-jwt-secret`. |
-| `adminPassword` | **yes** | — | Password for the seed `admin` account created on first boot. Stored as `tf-admin-password`. |
-| `appImage` | no | placeholder | Full image ref the Container App runs, e.g. `<acr>.azurecr.io/tokenfoundry:v6`. Chicken-and-egg: deploy lite → `az acr build` → set this → deploy full. |
-
-Example:
-
-```bash
-az deployment group create -g <rg> -f infra/main.bicep \
-  -p infra/main.bicepparam \
-  -p pgAdminPassword=$PG_PWD -p jwtSecret=$JWT -p adminPassword=$ADMIN_PWD \
-  -p appImage=<acr>.azurecr.io/tokenfoundry:v6
-```
-
-### What each module provisions (and the non-obvious settings)
+### What each module provisions (`terraform/modules/`)
 
 | Module | Resource | Notes worth knowing |
 |---|---|---|
 | `monitor` | Log Analytics + App Insights | Workspace retention 30 days. App Insights is the latency/telemetry source the usage page queries via KQL. |
 | `keyvault` | Key Vault | **RBAC authorization** (not access policies); soft-delete 7 days. Identities are granted roles in the consuming modules. |
-| `postgres` | PostgreSQL Flexible Server 16 | `Standard_B1ms` burstable, 32 GB. Firewall rule `AllowAzureServices` (0.0.0.0) lets Container Apps reach it — tighten to VNet in prod. |
-| `cosmos` | Cosmos DB for NoSQL | **Serverless**, `disableLocalAuth: true` (AAD-only — no keys). DB `tokenfoundry`, container `usage`, partition key `/pk` (`subscriptionId_yyyymm`), **90-day TTL** on raw docs. |
-| `eventhub` | Event Hub namespace + `usage` hub | Provisioned for the Phase-2 billing stream; **not wired yet**. Standard tier, 2 partitions, 1-day retention, `billing` consumer group. |
-| `acr` | Container Registry (Basic) | `adminUserEnabled: false` — pull is via the Container App's managed identity (AcrPull). |
-| `apim` | API Management (Developer SKU) | System-assigned identity. Sets up the App Insights **logger + diagnostic** (sampling **100%** — the cost/detail knob, see the module comment) and grants its own identity **Cosmos Data Contributor** so the outbound policy can write usage. |
-| `apim-backends` | Backend pool + circuit breakers | Uses the **preview** API version (native in Bicep — the reason we chose Bicep over Terraform). Placeholder pool; real per-provider backends are created at runtime by the FastAPI provisioner. |
-| `grafana` | Azure Managed Grafana | System identity granted **Monitoring Reader** on the RG so dashboards render (previously a manual step). |
-| `appsecrets` | Key Vault secrets | Assembles the Postgres connection string (so the password never lands in app settings) and writes `tf-database-url` / `tf-jwt-secret` / `tf-admin-password`. |
-| `containerapps` | Container App (API + portal) | See identity/RBAC below. |
+| `postgres` | PostgreSQL Flexible Server 16 | `Standard_B1ms` burstable. Firewall rule `AllowAzureServices` lets Container Apps reach it — tighten to VNet in prod. |
+| `cosmos` | Cosmos DB for NoSQL | **Serverless**, `disableLocalAuth: true` (AAD-only). DB `tokenfoundry`, container `usage`, partition key `/pk` (`subscriptionId_yyyymm`), **90-day TTL**. |
+| `acr` | Container Registry (Basic) | `adminUserEnabled: false` — pull is via the Container App's managed identity (AcrPull). Holds `tokenfoundry:<tag>` **and** `gitmodel:<tag>` (the hub image). |
+| `apim` | API Management (Developer SKU) | System-assigned identity. Sets up the App Insights logger + diagnostic and grants its identity **Cosmos Data Contributor** so the outbound policy can write usage. |
+| `apim-backends` | Backend pool + circuit breakers | Uses the **preview** API version via `azapi`. Placeholder pool; real per-provider pools + per-account hub backends are created at **runtime** by the FastAPI provisioner. |
+| `deployer` | tfstate storage account | Remote-state blob container the **方案 A** GitHub Action reads/writes per-account hub state (`hubs/<id>.tfstate`); the control plane reads outputs from it. |
+| `appsecrets` | Key Vault secrets | Assembles the Postgres connection string and writes `tf-database-url` / `tf-jwt-secret` / `tf-admin-password`. |
+| `containerapps` | Container App (API + portal) | Injects all `TF_*` env (incl. `TF_ACR_NAME` / `TF_KEYVAULT_NAME` / `TF_HUB_IMAGE_TAG` the deploy-config flow needs). See identity/RBAC below. |
 
 ### Identities & RBAC (who can touch what)
 
@@ -232,6 +231,13 @@ The Container App uses **two** identities by design:
 APIM's system identity is separately granted **Cosmos DB Data Contributor** for
 the outbound-policy write path.
 
+The **方案 A deployment Service Principal** (created by
+`scripts/create-deployer-sp.sh`) is a separate identity — subscription
+**Contributor** + **User Access Administrator**, plus **Key Vault Secrets User**
+and **Storage Blob Data Contributor** on the tfstate account. It runs the
+per-account hub Terraform inside the GitHub Action; its creds live in GitHub repo
+secrets (and Key Vault). See [docs/SECURITY.md](docs/SECURITY.md).
+
 ### Runtime configuration (`TF_*` env vars)
 
 `app/config.py` reads these (prefix `TF_`); Container Apps injects them, secrets
@@ -246,12 +252,15 @@ as Key Vault references:
 | `TF_APIM_SERVICE_NAME` | apim module | Target for runtime provisioning. |
 | `TF_APP_INSIGHTS_RESOURCE_ID` | monitor module | Resource the usage-telemetry KQL runs against. Without it the App Insights block degrades to empty. |
 | `TF_RESOURCE_GROUP` / `TF_AZURE_SUBSCRIPTION_ID` | deployment | ARM scope for the provisioner. |
+| `TF_ACR_NAME` / `TF_KEYVAULT_NAME` / `TF_ACR_LOGIN_SERVER` / `TF_AZURE_LOCATION` | terraform | Pure values the Portal's deploy-config flow publishes as `HUB_*` GitHub Actions variables. |
+| `TF_HUB_IMAGE_TAG` | terraform (`image_tag`) | The `gitmodel:<tag>` the hub deploy pulls — set to the tag `deploy.sh` actually built (never a hard-coded `:latest`). |
+| `TF_TFSTATE_STORAGE_ACCOUNT` / `TF_TFSTATE_CONTAINER` | deployer module | 方案 A remote-state location. |
 | `TF_ENVIRONMENT` | static `prod` | Gates the local dev-token auth bypass. |
 
 ## Run it (inside the Dev Container)
 
 Open the repo in the Dev Container (VS Code: "Reopen in Container"). It installs
-Python + Node + azure-cli (with `az bicep`) and runs `pip install -e .[dev]` and
+Python + Node + azure-cli + Terraform, and runs `pip install -e .[dev]` and
 `npm install`.
 
 ### 1. Authenticate to Azure
@@ -261,23 +270,21 @@ az login
 az account set --subscription <your-sub-id>
 ```
 
-`DefaultAzureCredential` (backend) and `az deployment` (Bicep) both reuse this.
+`DefaultAzureCredential` (backend) and Terraform both reuse this `az login`.
 
 ### 2. Validate everything (no cloud needed)
 
 ```bash
 # Backend: lint, type-check, unit tests
-ruff check app worker tests
+ruff check app tests
 mypy app
 pytest -q
 
 # Frontend: type-check + production build
-cd portal && npm run typecheck && npm run build && cd ..
+cd portal && npm run build && cd ..
 
-# Bicep: compile + preview against a resource group
-az bicep build --file infra/main.bicep
-az deployment group what-if -g <rg> -f infra/main.bicep \
-  -p infra/main.bicepparam -p pgAdminPassword=<pwd>
+# Terraform: format + validate
+cd terraform && terraform fmt -check && terraform validate && cd ..
 ```
 
 ### 3. Run the stack locally
@@ -298,52 +305,57 @@ when `TF_ENVIRONMENT=local` — no Entra needed to exercise the flow end-to-end.
 
 ### 4. Deploy
 
+One command stands up a whole environment. First select the workspace and set
+the RG name (see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for tfvars details):
+
 ```bash
-az group create -n <rg> -l centralus
+cd terraform && terraform workspace new dev-a01 && cd ..   # isolated state
+# edit terraform/terraform.tfvars: resource_group_name = "tokenfoundry-rg-dev-a01" (+ passwords)
 
-# (optional) fast first pass — data + observability tier only
-az deployment group create -g <rg> -f infra/main.lite.bicep \
-  -p namePrefix=tokenfoundry -p pgAdminPassword=<pwd>
-
-# build & push the single image (root Dockerfile builds portal + API)
-az acr build -r <acr> -t tokenfoundry:v6 .
-
-# full deployment
-az deployment group create -g <rg> -f infra/main.bicep \
-  -p infra/main.bicepparam \
-  -p pgAdminPassword=<pwd> -p jwtSecret=<jwt> -p adminPassword=<admin-pwd> \
-  -p appImage=<acr>.azurecr.io/tokenfoundry:v6
+az login && az account set --subscription <id>
+./scripts/bootstrap.sh -g tokenfoundry-rg-dev-a01
 ```
 
-Subsequent app-only updates skip the deployment — rebuild and roll the revision:
+`bootstrap.sh` runs `deploy.sh` (one `terraform apply` + parallel `az acr build`
+of the app **and** hub images; APIM is the ~30–45 min long pole; ends with a
+`/healthz` smoke test) then `create-deployer-sp.sh` (the 方案 A SP). The two
+GitHub PATs are pasted **in the Portal** afterwards — GitHub can't mint PATs via
+API. Then adding a GitHub account onboards a GitModel hub (方案 A).
+
+App-only updates skip Terraform — rebuild + roll the revision (auto-discovers the
+ACR / Container App in the RG):
 
 ```bash
-az acr build -r <acr> -t tokenfoundry:v7 .
-az containerapp update -g <rg> -n <prefix>-aca-app \
-  --image <acr>.azurecr.io/tokenfoundry:v7
+./scripts/update-app.sh -g tokenfoundry-rg-dev-a01           # az acr build + revision roll
 ```
 
 ## Verification (end-to-end checklist)
 
-1. `az login` in the container.
-2. `az deployment group create …` — APIM / PostgreSQL / Cosmos / Monitor /
-   Grafana up; backend pool + circuit breaker created (preview API version).
-3. Admin console → create tenant + project + issue key + add model alias → APIM
-   gets the Product/Subscription/backend, key lands in Key Vault.
-4. Call a provider API with the key (e.g. `POST {gateway}/llm-openai/v1/chat/completions`
-   with the virtual key in the `api-key` header) → completion; over-TPM → 429.
-5. Multi-provider: switch the `model` in the body and call the matching provider
+1. `az login` in the container; `./scripts/bootstrap.sh -g <rg>` — APIM /
+   PostgreSQL / Cosmos / Monitor / ACR / Container App up; deployer SP created,
+   `/healthz` returns `{"status":"ok"}`.
+2. Portal → **GitHub Accounts → Deploy configuration**: paste the two PATs → SP
+   creds auto-push to the repo (`ARM_*` secrets + `HUB_*`/`TFSTATE_*` variables);
+   the badge flips **Ready**.
+3. Portal → **+ GitHub account** → device-flow login → a hub Container App
+   deploys (方案 A GitHub Action), joins the 3 provider pools, and its chat
+   models register as pooled routes; account goes **READY**.
+4. Admin console → create tenant + project + issue a virtual key (optionally a
+   per-key TPM and a token-quota tier) → APIM gets the Product/Subscription, key
+   lands in Key Vault.
+5. Call a provider API with the key (e.g. `POST {gateway}/llm-openai/v1/chat/completions`
+   with the virtual key in the `api-key` header) → completion; over-TPM → 429,
+   over-quota → 403.
+6. Multi-provider: switch the `model` in the body and call the matching provider
    path — `claude-*` → `/llm-anthropic/v1/messages` (`x-api-key` header),
    `gpt-5.x` → `/llm-openai/v1/responses`, other OpenAI/Gemini →
-   `/v1/chat/completions` → all route correctly.
-6. **Usage page → pick the tenant**: the *Cosmos* block shows real prompt/
+   `/v1/chat/completions` → all route to the pooled hubs with session affinity.
+7. **Usage page → pick the tenant**: the *Cosmos* block shows real prompt/
    completion tokens + a per-call log; the *App Insights* block shows call
    counts, p50/p95, gateway-vs-backend split, and the hourly trend.
-7. Grafana renders cross-tenant usage/cost/TPM.
 8. Small budget → `budget_enforcer` suspends the subscription → 401 thereafter.
-9. Azure Monitor alert → Action Group on budget threshold.
-10. Customer portal: customer sees only their tenant; cross-tenant access
-    rejected by the tenant-scope middleware.
+9. Customer portal: customer sees only their tenant; cross-tenant access
+   rejected by the tenant-scope middleware.
 
 To smoke-test every registered model end-to-end through the gateway, run
 `python tests/manual/smoke_test_models.py` — it auto-discovers the models from the
@@ -372,9 +384,11 @@ list of trade-offs — is documented in
 
 - **Working today:** data model, control-plane API + tenant-scope auth, APIM
   provisioning service, multi-provider model routes, admin + customer portal,
-  Bicep for all PaaS, token-limit + emit-token-metric policy, **APIM→Cosmos
-  direct usage capture**, **dual-source usage page** (Cosmos billing + App
-  Insights latency), Grafana dashboards.
-- **Phase 2 (provisioned, not wired):** Event Hub billing worker for
-  replayable/retry-safe accounting, semantic cache, BYO credential isolation,
-  budget $-enforcement via the stream, chargeback.
+  **Terraform for all PaaS** (workspace-isolated per env), token-limit +
+  emit-token-metric policy, **per-key TPM + token-quota limits** (named-value
+  driven), **方案 A cloud-automatic GitModel hub onboarding** (device flow →
+  GitHub Action → pool join), **APIM→Cosmos direct usage capture**, and the
+  **dual-source usage page** (Cosmos billing + App Insights latency).
+- **Phase 2 (planned):** Event Hub billing worker for replayable/retry-safe
+  accounting, semantic cache, BYO credential isolation, budget $-enforcement via
+  the stream, chargeback.
