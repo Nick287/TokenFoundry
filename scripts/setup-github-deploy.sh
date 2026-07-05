@@ -15,26 +15,28 @@
 #      TFSTATE_STORAGE_ACCOUNT / TFSTATE_CONTAINER / HUB_KEYVAULT_NAME.
 #   3. KV secret     (az keyvault)     — the GitHub PAT the CONTROL PLANE uses to
 #      trigger + poll the workflow, written to `hub-deploy-github-token`.
-#   4. RBAC          (az role)         — the SP needs to READ per-account
-#      `gh-<id>-jobinput` secrets from Key Vault at run time → Key Vault Secrets
-#      User on the vault.
+#
+# The SP itself (and its role bundle: Contributor + User Access Administrator +
+# Key Vault Secrets User + Storage Blob Data Contributor) is created SEPARATELY by
+# `scripts/create-deployer-sp.sh` — run that FIRST. This script only consumes the
+# SP's creds (from env) to populate the repo secrets; it does not grant roles.
 #
 # Most infra values are auto-discovered from `terraform output` (run against the
-# target env's state). Secrets come from ENV VARS — never hardcoded, never args
-# (args show up in process lists / shell history):
+# target env's state). The Service Principal creds are read from KEY VAULT
+# (deployer-sp-* secrets, written by create-deployer-sp.sh); an env var of the
+# same name OVERRIDES the KV value. Only the GitHub PAT must come from env:
 #
-#   ARM_CLIENT_ID          Service Principal appId
-#   ARM_CLIENT_SECRET      Service Principal password
-#   ARM_TENANT_ID          tenant id
-#   ARM_SUBSCRIPTION_ID    subscription id
-#   GITHUB_DEPLOY_PAT      GitHub PAT (fine-grained: target repo Actions RW +
-#                          Contents read) the control plane uses to dispatch/poll
+#   ARM_CLIENT_ID          (optional) SP appId — overrides KV deployer-sp-client-id
+#   ARM_CLIENT_SECRET      (optional) SP password — overrides KV deployer-sp-client-secret
+#   ARM_TENANT_ID          (optional) tenant id — overrides KV deployer-sp-tenant-id
+#   ARM_SUBSCRIPTION_ID    (optional) subscription id — overrides KV deployer-sp-subscription-id
+#   GITHUB_DEPLOY_PAT      (required) GitHub PAT (fine-grained: target repo Actions
+#                          RW + Contents read) the control plane uses to dispatch/poll
 #
-# Usage:
-#   export ARM_CLIENT_ID=... ARM_CLIENT_SECRET=... ARM_TENANT_ID=... ARM_SUBSCRIPTION_ID=...
+# Usage (after deploy.sh + create-deployer-sp.sh have run):
 #   export GITHUB_DEPLOY_PAT=github_pat_...
-#   ./scripts/setup-github-deploy.sh -g tokenfoundry-rg            # dev-01
-#   ./scripts/setup-github-deploy.sh -g tokenfoundry-rg-dev-02     # dev-02
+#   ./scripts/setup-github-deploy.sh -g tokenfoundry-rg-dev-001
+#   ./scripts/setup-github-deploy.sh -g tokenfoundry-rg-dev-02
 #
 # Options:
 #   -g <rg>       (required) resource group of the target environment
@@ -42,7 +44,8 @@
 #   -h            help
 #
 # Prereqs: `az login` (subscription selected) + `gh auth login` (or GH_TOKEN set)
-# with admin on the repo (needed to set secrets/vars). SP + PAT created out-of-band.
+# with admin on the repo (needed to set secrets/vars). Run create-deployer-sp.sh
+# FIRST — it creates the SP and stores its creds in Key Vault.
 
 set -euo pipefail
 
@@ -51,7 +54,7 @@ ok()   { printf '\033[1;32m%s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 die()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # --- args ---
 RG=""
@@ -77,11 +80,10 @@ gh auth status  >/dev/null 2>&1 || die "Not logged in to GitHub. Run: gh auth lo
 [[ -n "$RG" ]] || die "resource group is required: -g <rg>"
 az group show -n "$RG" >/dev/null 2>&1 || die "resource group '$RG' not found (or no access)"
 
-# --- preflight: required secrets in env (never args/hardcoded) ---
-: "${ARM_CLIENT_ID:?export ARM_CLIENT_ID (Service Principal appId)}"
-: "${ARM_CLIENT_SECRET:?export ARM_CLIENT_SECRET (Service Principal password)}"
-: "${ARM_TENANT_ID:?export ARM_TENANT_ID}"
-: "${ARM_SUBSCRIPTION_ID:?export ARM_SUBSCRIPTION_ID}"
+# --- preflight: required secret in env (never args/hardcoded) ---
+# The SP creds (ARM_*) are read from Key Vault below (written there by
+# create-deployer-sp.sh); env vars, if set, OVERRIDE the KV values. The GitHub
+# PAT has no KV source at this point, so it must come from env.
 : "${GITHUB_DEPLOY_PAT:?export GITHUB_DEPLOY_PAT (GitHub PAT for dispatch/poll)}"
 
 # --- resolve target repo ---
@@ -111,6 +113,22 @@ ACR_LOGIN="$(tf_out acr_login_server)"
 [[ -n "$KV_NAME"    ]] || die "could not resolve Key Vault name (checked tf output + $RG)"
 [[ -n "$TFSTATE_SA" ]] || die "could not resolve tfstate storage account (checked tf output + $RG)"
 [[ -n "$TFSTATE_CT" ]] || TFSTATE_CT="hub-tfstate"
+
+# --- resolve SP creds: Key Vault first (方案 A), env vars override ---
+# create-deployer-sp.sh stored these as deployer-sp-* secrets. An explicit env
+# var wins (lets you override without touching KV). A missing value after both
+# sources is fatal — setup can't set the repo secrets without it.
+log "Reading Service Principal creds from Key Vault $KV_NAME (deployer-sp-*)"
+kv_get() { az keyvault secret show --vault-name "$KV_NAME" --name "$1" --query value -o tsv 2>/dev/null || true; }
+ARM_CLIENT_ID="${ARM_CLIENT_ID:-$(kv_get deployer-sp-client-id)}"
+ARM_CLIENT_SECRET="${ARM_CLIENT_SECRET:-$(kv_get deployer-sp-client-secret)}"
+ARM_TENANT_ID="${ARM_TENANT_ID:-$(kv_get deployer-sp-tenant-id)}"
+ARM_SUBSCRIPTION_ID="${ARM_SUBSCRIPTION_ID:-$(kv_get deployer-sp-subscription-id)}"
+[[ -n "$ARM_CLIENT_ID"       ]] || die "ARM_CLIENT_ID not in KV or env — run create-deployer-sp.sh first"
+[[ -n "$ARM_CLIENT_SECRET"   ]] || die "ARM_CLIENT_SECRET not in KV or env — run create-deployer-sp.sh (or --reset-password)"
+[[ -n "$ARM_TENANT_ID"       ]] || die "ARM_TENANT_ID not in KV or env"
+[[ -n "$ARM_SUBSCRIPTION_ID" ]] || die "ARM_SUBSCRIPTION_ID not in KV or env"
+ok "SP creds resolved (client-id ${ARM_CLIENT_ID:0:8}…)"
 
 ACR_NAME="${ACR_LOGIN%%.*}"        # strip .azurecr.io
 HUB_LOCATION="$(az group show -n "$RG" --query location -o tsv)"
@@ -153,8 +171,12 @@ az keyvault secret set --vault-name "$KV_NAME" --name "hub-deploy-github-token" 
   || die "failed to write PAT to KV (need Key Vault Secrets Officer on $KV_NAME)"
 ok "PAT stored in Key Vault"
 
-# --- 4. RBAC: SP reads per-account gh-<id>-jobinput secrets at run time ---
-log "Granting the Service Principal Key Vault Secrets User on $KV_NAME"
+# --- 4. RBAC safety-net: ensure the SP can read gh-<id>-jobinput at run time ---
+# The full SP role bundle is create-deployer-sp.sh's job; this is a belt-and-
+# suspenders re-grant of the ONE role this script's outputs depend on (the Action
+# reads the per-account jobinput secret from KV). Idempotent — a no-op if
+# create-deployer-sp.sh already granted it.
+log "Ensuring the Service Principal has Key Vault Secrets User on $KV_NAME"
 KV_ID="$(az keyvault show -n "$KV_NAME" --query id -o tsv)"
 SP_OBJECT_ID="$(az ad sp show --id "$ARM_CLIENT_ID" --query id -o tsv 2>/dev/null || true)"
 [[ -n "$SP_OBJECT_ID" ]] || die "could not resolve SP object id for appId $ARM_CLIENT_ID"
@@ -163,7 +185,7 @@ az role assignment create \
   --assignee-principal-type ServicePrincipal \
   --role "Key Vault Secrets User" \
   --scope "$KV_ID" --output none 2>/dev/null \
-  && ok "SP granted Key Vault Secrets User" \
+  && ok "SP has Key Vault Secrets User" \
   || warn "role assignment may already exist (or insufficient perms) — verify manually"
 
 log "Done. 方案 A is configured for $REPO against env $RG."
