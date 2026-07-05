@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import {
   api,
+  type DeployConfigStatus,
   type DeviceStart,
   type GitHubAccount,
   type GitHubDeployStatus,
@@ -44,6 +45,14 @@ export function GitHubAccountsPage() {
       (q.state.data ?? []).some((a) => TRANSITIONAL.includes(a.status)) ? 3000 : false,
   });
 
+  // Deploy readiness gates the "add account" button: adding an account triggers
+  // a cloud deploy that needs the GitHub PATs + repo secrets configured first.
+  const deployStatus = useQuery({
+    queryKey: ["deploy-status"],
+    queryFn: () => api.getDeployStatus(principal.token),
+  });
+  const ready = deployStatus.data?.ready ?? false;
+
   const start = useMutation({
     mutationFn: () => api.startGithubDevice(principal.token),
     onSuccess: (d) => {
@@ -66,17 +75,23 @@ export function GitHubAccountsPage() {
       <h2>{t("github.title")}</h2>
       <p className="help-card">{t("help.github")}</p>
 
+      <DeployConfigSection />
+
       <div className="list-toolbar">
         <button
           type="button"
           className="add-toggle"
           onClick={() => start.mutate()}
-          disabled={start.isPending}
+          disabled={start.isPending || !ready}
+          title={!ready ? t("github.gateHint") : undefined}
         >
           {start.isPending ? t("github.starting") : `+ ${t("github.addNew")}`}
         </button>
         <span className="count">{accounts.data?.length ?? 0}</span>
       </div>
+      {!ready && !deployStatus.isLoading && (
+        <p className="hint">{t("github.gateHint")}</p>
+      )}
       {start.isError && <p className="error">{String(start.error)}</p>}
 
       {accounts.isLoading ? (
@@ -237,5 +252,121 @@ function DeviceFlowModal({ flow, onClose }: { flow: DeviceStart; onClose: () => 
         </button>
       </div>
     </Modal>
+  );
+}
+
+// Deploy configuration: paste the two GitHub PATs (bootstrap + deploy). Saving
+// stores them in Key Vault and auto-pushes the Azure SP creds into the repo's
+// Actions secrets; once that succeeds `ready` flips true and the add-account
+// button unlocks. GitHub can't mint PATs via API, so the admin generates them
+// and pastes them here. Secret VALUES are never returned — set PATs show a mask.
+function DeployConfigSection() {
+  const principal = usePrincipal()!;
+  const qc = useQueryClient();
+  const { t } = useTranslation();
+  const toast = useToast();
+  const [bootstrapPat, setBootstrapPat] = useState("");
+  const [deployPat, setDeployPat] = useState("");
+
+  const status = useQuery({
+    queryKey: ["deploy-status"],
+    queryFn: () => api.getDeployStatus(principal.token),
+  });
+
+  const save = useMutation({
+    mutationFn: () =>
+      api.saveDeployPats(principal.token, {
+        // Only send non-empty fields — empty means "leave unchanged".
+        ...(bootstrapPat ? { bootstrap_pat: bootstrapPat } : {}),
+        ...(deployPat ? { deploy_pat: deployPat } : {}),
+      }),
+    onSuccess: (s: DeployConfigStatus) => {
+      setBootstrapPat("");
+      setDeployPat("");
+      if (s.pushed) toast(t("github.pushedOk"));
+      else if (s.detail) toast(s.detail, "error");
+      qc.setQueryData(["deploy-status"], s);
+      qc.invalidateQueries({ queryKey: ["deploy-status"] });
+    },
+  });
+
+  const push = useMutation({
+    mutationFn: () => api.pushSpCreds(principal.token),
+    onSuccess: (s: DeployConfigStatus) => {
+      toast(t("github.pushedOk"));
+      qc.setQueryData(["deploy-status"], s);
+    },
+  });
+
+  const s = status.data;
+  const canSave = (!!bootstrapPat || !!deployPat) && !save.isPending;
+
+  return (
+    <details className="card deploy-config" open={!s?.ready}>
+      <summary>
+        <strong>{t("github.deployConfigTitle")}</strong>{" "}
+        {status.isLoading ? (
+          <span className="badge">{t("common.loading")}</span>
+        ) : s?.ready ? (
+          <span className="badge badge-active">{t("github.status.ready")}</span>
+        ) : (
+          <span className="badge badge-suspended">{t("github.notConfigured")}</span>
+        )}
+      </summary>
+
+      <p className="help-card">{t("help.deployConfig")}</p>
+
+      <form
+        className="form-grid"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (canSave) save.mutate();
+        }}
+      >
+        <label>
+          {t("github.bootstrapPat")}
+          <input
+            type="password"
+            autoComplete="off"
+            placeholder={s?.bootstrap_pat_set ? t("github.patSet") : t("github.patPlaceholder")}
+            value={bootstrapPat}
+            onChange={(e) => setBootstrapPat(e.target.value)}
+          />
+          <span className="hint">{t("github.bootstrapPatHint")}</span>
+        </label>
+        <label>
+          {t("github.deployPat")}
+          <input
+            type="password"
+            autoComplete="off"
+            placeholder={s?.deploy_pat_set ? t("github.patSet") : t("github.patPlaceholder")}
+            value={deployPat}
+            onChange={(e) => setDeployPat(e.target.value)}
+          />
+          <span className="hint">{t("github.deployPatHint")}</span>
+        </label>
+        <div className="row-actions">
+          <button type="submit" disabled={!canSave}>
+            {save.isPending ? t("github.saving") : t("github.savePats")}
+          </button>
+          {s?.bootstrap_pat_set && s?.sp_creds_present && (
+            <button
+              type="button"
+              className="btn-sm"
+              onClick={() => push.mutate()}
+              disabled={push.isPending}
+            >
+              {push.isPending ? t("github.pushing") : t("github.pushSp")}
+            </button>
+          )}
+        </div>
+      </form>
+
+      {s && !s.sp_creds_present && <p className="hint">{t("github.spMissing")}</p>}
+      {s?.detail && !s.pushed && <p className="error">{s.detail}</p>}
+      {(save.isError || push.isError) && (
+        <p className="error">{String(save.error ?? push.error)}</p>
+      )}
+    </details>
   );
 }

@@ -297,3 +297,25 @@ class UsageSummary(BaseModel):
     total_billed_usd: float = 0.0
     period_start: datetime | None = None
     period_end: datetime | None = None
+
+
+# ----- Deploy config (方案 A: GitHub PAT + SP push, drives the add-account gate) -----
+
+
+class DeployPatsIn(BaseModel):
+    """Body for POST /deploy-config/pats. Both optional so either PAT can be
+    updated independently; a value of None means 'leave unchanged'."""
+    bootstrap_pat: str | None = None
+    deploy_pat: str | None = None
+
+
+class DeployConfigStatus(BaseModel):
+    """Readiness of the 方案 A GitHub wiring — drives the 'Add GitHub account'
+    gate. Never carries secret VALUES, only presence booleans."""
+    bootstrap_pat_set: bool = False
+    deploy_pat_set: bool = False
+    sp_creds_present: bool = False
+    pushed: bool = False
+    ready: bool = False
+    detail: str | None = None  # last push error, surfaced to the Portal
+

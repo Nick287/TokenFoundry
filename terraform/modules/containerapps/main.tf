@@ -25,6 +25,8 @@ variable "apim_service_name" { type = string }
 variable "apim_id" { type = string }
 variable "acr_id" { type = string }
 variable "acr_login_server" { type = string }
+variable "acr_name" { type = string }
+variable "keyvault_name" { type = string }
 variable "database_url_secret_uri" { type = string }
 variable "jwt_secret_uri" { type = string }
 variable "admin_password_secret_uri" { type = string }
@@ -233,6 +235,27 @@ resource "azurerm_container_app" "app" {
       env {
         name  = "TF_GITHUB_REF"
         value = var.github_ref
+      }
+      # Repo-variable sources for the Portal's "push SP creds to GitHub" flow
+      # (app/api/deploy_config.py): the control plane sets GitHub Actions
+      # variables HUB_ACR_NAME / HUB_LOCATION / HUB_KEYVAULT_NAME straight from
+      # these — terraform hands over the bare names/region so the app does zero
+      # string parsing (no runtime az query / terraform state).
+      env {
+        name  = "TF_ACR_LOGIN_SERVER"
+        value = var.acr_login_server
+      }
+      env {
+        name  = "TF_ACR_NAME"
+        value = var.acr_name
+      }
+      env {
+        name  = "TF_AZURE_LOCATION"
+        value = var.location
+      }
+      env {
+        name  = "TF_KEYVAULT_NAME"
+        value = var.keyvault_name
       }
 
       liveness_probe {

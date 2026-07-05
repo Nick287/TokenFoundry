@@ -24,6 +24,16 @@ class Settings(BaseSettings):
     azure_subscription_id: str = ""
     resource_group: str = ""
     apim_service_name: str = ""
+    # ACR + Key Vault names + region — injected by terraform (TF_ACR_NAME /
+    # TF_KEYVAULT_NAME / TF_AZURE_LOCATION, plus TF_ACR_LOGIN_SERVER for image
+    # refs). The Portal's "push SP creds to GitHub" flow (app/api/deploy_config.py)
+    # feeds these straight into the HUB_ACR_NAME / HUB_KEYVAULT_NAME / HUB_LOCATION
+    # GitHub Actions variables the deploy-hub.yml workflow reads — no string
+    # parsing in the app.
+    acr_login_server: str = ""
+    acr_name: str = ""
+    azure_location: str = ""
+    keyvault_name: str = ""
 
     # --- Metadata DB (PostgreSQL Flexible Server) ---
     # Full SQLAlchemy URL, e.g. postgresql+psycopg://user:pass@host:5432/tokenfoundry

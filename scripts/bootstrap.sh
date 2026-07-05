@@ -13,10 +13,11 @@
 #                                       role bundle, and store its creds in the
 #                                       env's Key Vault (deployer-sp-*).
 #
-# It deliberately STOPS before scripts/setup-github-deploy.sh: that step needs a
-# GitHub PAT (GITHUB_DEPLOY_PAT) and `gh auth login`, which are interactive /
-# out-of-band. Run it yourself afterwards — the tail of this script prints the
-# exact command.
+# After both steps, the GitHub wiring (paste two PATs, push SP creds to the repo)
+# is done in the Token Foundry Portal — GitHub Accounts -> Deploy configuration —
+# not a shell script. GitHub can't mint PATs via API, so a human pastes them; the
+# Portal stores them in Key Vault and pushes the SP creds. The tail of this
+# script points you there.
 #
 # Usage:
 #   az login && az account set --subscription <id>
@@ -96,7 +97,9 @@ SP_ARGS=(-g "$RG")
 bash "$CREATE_SP" "${SP_ARGS[@]}" || die "create-deployer-sp.sh failed"
 ok "STEP 2/2 complete — SP is ready, creds stored in Key Vault"
 
-# --- next step (left to you: needs GitHub PAT + gh auth) ---
-log "Bootstrap done. Final step is manual (needs a GitHub PAT + gh login):"
-printf '    export GITHUB_DEPLOY_PAT=github_pat_...\n'
-printf '    ./scripts/setup-github-deploy.sh -g %s\n' "$RG"
+# --- next step (left to you: paste GitHub PATs in the Portal) ---
+log "Bootstrap done. Final step is in the Token Foundry Portal:"
+printf '    Open the Portal -> GitHub Accounts -> Deploy configuration\n'
+printf '    Paste the two GitHub PATs (you generate them on GitHub — it has no\n'
+printf '    API to mint them). Saving stores them in Key Vault and pushes the SP\n'
+printf '    creds into the repo, which unlocks adding GitHub accounts.\n'

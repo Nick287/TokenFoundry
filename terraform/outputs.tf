@@ -20,7 +20,7 @@ output "acr_login_server" {
   value       = module.acr.login_server
 }
 
-# --- 方案 A: values scripts/setup-github-deploy.sh feeds to the GitHub Action ---
+# --- 方案 A: values the Portal's deploy-config flow feeds to the GitHub Action ---
 output "tfstate_storage_account" {
   description = "Storage account holding per-account hub terraform remote state (repo var TFSTATE_STORAGE_ACCOUNT + control-plane TF_TFSTATE_STORAGE_ACCOUNT)."
   value       = module.deployer.tfstate_storage_account_name

@@ -154,6 +154,7 @@ module "containerapps" {
   log_analytics_workspace_id = module.monitor.log_analytics_id
   image_tag                  = var.image_tag
   key_vault_uri              = module.keyvault.vault_uri
+  keyvault_name              = module.keyvault.vault_name
   vault_id                   = module.keyvault.vault_id
   cosmos_endpoint            = module.cosmos.endpoint
   cosmos_account_name        = module.cosmos.account_name
@@ -163,6 +164,7 @@ module "containerapps" {
   apim_id                    = module.apim.apim_id
   acr_id                     = module.acr.registry_id
   acr_login_server           = module.acr.login_server
+  acr_name                   = module.acr.registry_name
   database_url_secret_uri    = module.appsecrets.database_url_secret_uri
   jwt_secret_uri             = module.appsecrets.jwt_secret_uri
   admin_password_secret_uri  = module.appsecrets.admin_password_secret_uri

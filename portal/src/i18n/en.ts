@@ -159,6 +159,25 @@ export const en = {
     deleteTitle: "Delete GitHub account?",
     deleteImpact:
       "Tears down the hub for {{login}}: destroys its resource group, removes it from the pools, and deletes its secrets.",
+    deployConfigTitle: "Deploy configuration",
+    notConfigured: "Not configured",
+    bootstrapPat: "Bootstrap PAT",
+    bootstrapPatHint:
+      "Fine-grained PAT with repo Administration + Secrets: write. Used once to push the Azure Service Principal creds into this repo's Actions secrets.",
+    deployPat: "Deploy PAT",
+    deployPatHint:
+      "Fine-grained PAT with Actions: read+write. The control plane uses it to trigger and poll the hub-deploy workflow.",
+    generateOnGithub: "Generate on GitHub ↗",
+    savePats: "Save & configure",
+    saving: "Saving…",
+    patSet: "•••••••• (set)",
+    patPlaceholder: "github_pat_…",
+    pushSp: "Re-push SP creds",
+    pushing: "Pushing…",
+    pushedOk: "Repo configured — SP creds pushed to GitHub.",
+    spMissing:
+      "Service Principal creds not in Key Vault yet — run create-deployer-sp.sh, then Re-push.",
+    gateHint: "Complete the deploy configuration above to enable adding accounts.",
     status: {
       pending: "Awaiting authorization",
       deploying: "Deploying",
@@ -249,6 +268,8 @@ export const en = {
       "Register a client-facing model alias (e.g. claude-sonnet) mapped to a real backend. Provider sets the API format (Anthropic vs OpenAI-compatible). Prices and markup drive metering and resale billing.",
     github:
       "Add a GitHub account to back the model pools with its Copilot subscription. Authorize the account via GitHub device login and the control plane deploys a dedicated hub, joins it to the openai/anthropic/google pools (with session affinity so prompt caching stays warm), and meters all traffic through APIM. Delete tears down its resource group and secrets.",
+    deployConfig:
+      "One-time setup for cloud hub deploys. Paste two GitHub PATs you generate yourself (GitHub can't mint them via API). The control plane stores them in Key Vault and pushes the Azure Service Principal creds into this repo's Actions secrets, so the deploy workflow can run. Adding GitHub accounts stays disabled until this succeeds.",
     usage:
       "Admin view of any tenant's token usage and cost. Enter a tenant id (tn_…) to see prompt/completion tokens, cost and billed amounts.",
     myUsage:

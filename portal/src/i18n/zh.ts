@@ -160,6 +160,25 @@ export const zh: TranslationShape = {
     deleteTitle: "删除 GitHub 账号？",
     deleteImpact:
       "将拆除 {{login}} 的 hub：销毁其资源组、从池中移除、并删除相关密钥。",
+    deployConfigTitle: "部署配置",
+    notConfigured: "未配置",
+    bootstrapPat: "Bootstrap PAT",
+    bootstrapPatHint:
+      "细粒度 PAT，需要 repo Administration + Secrets：写权限。一次性用于把 Azure 服务主体凭据推送到本仓库的 Actions secrets。",
+    deployPat: "Deploy PAT",
+    deployPatHint:
+      "细粒度 PAT，需要 Actions：读+写权限。控制面用它触发并轮询 hub 部署工作流。",
+    generateOnGithub: "去 GitHub 生成 ↗",
+    savePats: "保存并配置",
+    saving: "保存中…",
+    patSet: "•••••••• (已设置)",
+    patPlaceholder: "github_pat_…",
+    pushSp: "重新推送 SP 凭据",
+    pushing: "推送中…",
+    pushedOk: "仓库已配置 — SP 凭据已推送到 GitHub。",
+    spMissing:
+      "Key Vault 中还没有服务主体凭据 — 先运行 create-deployer-sp.sh，再点重新推送。",
+    gateHint: "请先完成上方的部署配置，才能添加账号。",
     status: {
       pending: "等待授权",
       deploying: "部署中",
@@ -250,6 +269,8 @@ export const zh: TranslationShape = {
       "登记一个面向客户的模型别名（如 claude-sonnet），映射到真实后端。供应商决定 API 格式（Anthropic 或 OpenAI 兼容）。价格与加价用于计量和转售计费。",
     github:
       "添加一个 GitHub 账号，用其 Copilot 订阅为模型池提供后端。通过 GitHub 设备登录授权后，控制面会自动部署一套专属 hub，加入 openai/anthropic/google 三池（带会话粘性以保持提示缓存命中），并把全部流量经 APIM 统一计量。删除时连带销毁其资源组与密钥。",
+    deployConfig:
+      "云端 hub 部署的一次性配置。粘贴两个你自己在 GitHub 生成的 PAT（GitHub 不支持 API 生成）。控制面会把它们存入 Key Vault，并将 Azure 服务主体凭据推送到本仓库的 Actions secrets，让部署工作流得以运行。此步骤成功前，添加 GitHub 账号保持禁用。",
     usage:
       "管理员查看任意租户的 token 用量与成本。输入租户 ID（tn_…）查看输入/输出 token、成本与计费金额。",
     myUsage:

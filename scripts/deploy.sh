@@ -93,7 +93,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
   BUILD_APP_PID=$!
   # hub image: build context is the vendored hub root (has Dockerfile + hub/ +
   # requirements.txt). The Action's per-account terraform references gitmodel:<tag>
-  # via its HUB_IMAGE_REF repo var (set by scripts/setup-github-deploy.sh).
+  # via its HUB_IMAGE_REF repo var (set by the Portal's deploy-config flow).
   ( az acr build -r "$ACR_NAME" -t "gitmodel:${TAG}" "$REPO_ROOT/vendored/gitmodel-hub" ) &
   BUILD_HUB_PID=$!
   wait "$BUILD_APP_PID" || { kill "$APPLY_PID" 2>/dev/null; die "app image build failed"; }

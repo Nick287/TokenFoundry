@@ -100,6 +100,18 @@ export interface DevicePoll {
   detail: string | null;
 }
 
+// Readiness of the 方案 A GitHub deploy wiring (drives the add-account gate).
+// Never carries secret VALUES — only presence booleans. Mirrors
+// app/models/schemas.py:DeployConfigStatus.
+export interface DeployConfigStatus {
+  bootstrap_pat_set: boolean;
+  deploy_pat_set: boolean;
+  sp_creds_present: boolean;
+  pushed: boolean;
+  ready: boolean;
+  detail: string | null;
+}
+
 export interface UsageSummary {
   tenant_id: string;
   total_prompt_tok: number;
@@ -323,4 +335,19 @@ export const api = {
     ),
   deleteGithubAccount: (token: string, id: string) =>
     requestNoContent(`/github-accounts/${id}`, token, { method: "DELETE" }),
+  // --- Deploy config (GitHub PATs + SP push; gates add-account) ---
+  getDeployStatus: (token: string) =>
+    request<DeployConfigStatus>("/deploy-config/status", token),
+  saveDeployPats: (
+    token: string,
+    body: { bootstrap_pat?: string; deploy_pat?: string },
+  ) =>
+    request<DeployConfigStatus>("/deploy-config/pats", token, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  pushSpCreds: (token: string) =>
+    request<DeployConfigStatus>("/deploy-config/push-sp", token, {
+      method: "POST",
+    }),
 };

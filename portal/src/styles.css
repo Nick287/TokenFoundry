@@ -722,3 +722,24 @@ tr:focus-within .row-actions { opacity: 1; }
   max-width: 32rem;
   word-break: break-word;
 }
+
+/* Deploy configuration section (GitHub page) — collapsible PAT setup card. */
+.deploy-config {
+  margin-bottom: 1rem;
+}
+.deploy-config summary {
+  cursor: pointer;
+  list-style: revert;
+  margin-bottom: 0.5rem;
+}
+.deploy-config .form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.deploy-config .form-grid label .hint {
+  font-weight: 400;
+}
+
