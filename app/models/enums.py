@@ -29,6 +29,41 @@ class BudgetAction(StrEnum):
     BLOCK = "block"          # suspend subscription when exceeded
 
 
+class TokenQuotaPeriod(StrEnum):
+    """Fixed-window period for a virtual key's token quota. Values are the EXACT
+    strings APIM's llm-token-limit `token-quota-period` accepts, so the DB value
+    drops straight into the gateway policy expression — no mapping. Fixed window,
+    UTC-aligned: the counter resets at the natural boundary (e.g. Daily -> UTC
+    00:00), NOT a rolling window from first use."""
+    HOURLY = "Hourly"
+    DAILY = "Daily"
+    WEEKLY = "Weekly"
+    MONTHLY = "Monthly"
+    YEARLY = "Yearly"
+
+
+class TokenQuotaTier(StrEnum):
+    """Preset token-quota amount. APIM's llm-token-limit `token-quota` attribute
+    does NOT accept policy expressions (verified on dev-a01), so a per-key quota
+    can't be an arbitrary value pushed via named value — it must be a literal in
+    a <choose> branch. Hence fixed tiers: the policy has one branch per tier with
+    the literal amount baked in. TOKEN_QUOTA_AMOUNTS maps each tier to its value;
+    NONE means no quota gate. Edit these numbers to retune the tiers."""
+    NONE = "none"
+    SMALL = "small"
+    MEDIUM = "medium"
+    LARGE = "large"
+
+
+# Tier -> literal token amount baked into the policy's <choose> branch.
+# NONE has no entry (no quota gate applied). Retune freely.
+TOKEN_QUOTA_AMOUNTS: dict[TokenQuotaTier, int] = {
+    TokenQuotaTier.SMALL: 1_000_000,
+    TokenQuotaTier.MEDIUM: 10_000_000,
+    TokenQuotaTier.LARGE: 100_000_000,
+}
+
+
 class BudgetScope(StrEnum):
     TENANT = "TENANT"
     PROJECT = "PROJECT"

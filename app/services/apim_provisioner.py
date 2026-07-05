@@ -18,6 +18,7 @@ into the unified API is isolated in `_attach_alias`.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import timedelta
 
@@ -33,6 +34,7 @@ from azure.mgmt.apimanagement.models import (
     CircuitBreakerFailureCondition,
     CircuitBreakerRule,
     FailureStatusCodeRange,
+    NamedValueCreateContract,
     OperationContract,
     PolicyContract,
     SubscriptionCreateParameters,
@@ -40,6 +42,7 @@ from azure.mgmt.apimanagement.models import (
 )
 
 from app.config import get_settings
+from app.models.enums import TOKEN_QUOTA_AMOUNTS
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +114,71 @@ _LLM_PRODUCTS = ("starter", "unlimited")
 # `responses` op uses the Responses API which rejects it — hence injection is
 # scoped to the `chat` op only (see _build_chat_stream_policy).
 _CHAT_USAGE_PROVIDERS = ("openai", "azure")
+
+# --- Per-key token limits (llm-token-limit driven by a shared named value) ----
+# One APIM named value holds a JSON map {subId: {t?, qt?, p?}} of every key's
+# limits (t=tokens/min, qt=quota TIER label, p=period); the shared API-level
+# policy parses it per request and looks up the calling subscription. Missing
+# keys/fields fall back to sentinels = "effectively unlimited". The named value
+# is loaded into gateway memory (no per-request network call); parse is µs.
+#
+# Why a tier LABEL for quota (not the number): APIM's llm-token-limit
+# `token-quota` attribute REJECTS policy expressions (verified on dev-a01), so
+# the amount can't come from the named value — it must be a literal baked into a
+# policy <choose> branch. So the map stores the tier label ("small"/...) and the
+# policy branches on it (see enums.TOKEN_QUOTA_AMOUNTS). `tokens-per-minute` and
+# `token-quota-period` DO accept expressions, so those come from the map directly.
+KEY_LIMITS_NV = "tf-key-token-limits"
+# APIM named value values cap at ~4096 chars; each entry is ~40-60 chars, so this
+# map holds ~60-70 keys. _merge_key_limit raises past this so an over-cap issue
+# surfaces at key-issuance (502) rather than silently dropping a limit.
+_KEY_LIMITS_MAX_BYTES = 4000
+# Sentinels for "no limit of this kind" — large enough to never bite in practice.
+_TPM_UNLIMITED = 1_000_000_000
+_PERIOD_DEFAULT = "Yearly"
+
+
+def _merge_key_limit(
+    mapping: dict,
+    sub_id: str,
+    tpm: int | None,
+    quota_tier: str | None,
+    period: str | None,
+) -> dict:
+    """Return a NEW map with sub_id's limit entry set (or removed if all empty).
+
+    Entry shape uses short keys to conserve the ~4096-char named value budget:
+    {"t": tpm, "qt": quota_tier, "p": period}; absent fields are omitted. A
+    quota_tier of "none" (or None) is treated as absent. Pure — no Azure calls —
+    so it's unit-testable. Raises ValueError if the resulting map would exceed the
+    named value size cap (surfaces at issuance, never silent)."""
+    out = dict(mapping)
+    entry: dict[str, object] = {}
+    if tpm is not None:
+        entry["t"] = tpm
+    if quota_tier is not None and quota_tier != "none":
+        entry["qt"] = quota_tier
+    if period is not None:
+        entry["p"] = period
+    if entry:
+        out[sub_id] = entry
+    else:
+        out.pop(sub_id, None)
+    serialized = json.dumps(out, separators=(",", ":"))
+    if len(serialized) > _KEY_LIMITS_MAX_BYTES:
+        raise ValueError(
+            f"per-key limits map would exceed {_KEY_LIMITS_MAX_BYTES} bytes "
+            f"({len(serialized)}); too many keys have custom limits for the "
+            f"single-named-value scheme — see docs/APIM-LLM-Gateway.md §4.5"
+        )
+    return out
+
+
+def _remove_key_limit(mapping: dict, sub_id: str) -> dict:
+    """Return a NEW map with sub_id's entry removed (idempotent). Pure."""
+    out = dict(mapping)
+    out.pop(sub_id, None)
+    return out
 
 
 class ApimProvisioner:
@@ -205,6 +273,9 @@ class ApimProvisioner:
         OpenAI-schema streaming op policy, and product associations. Shared by
         `ensure_provider_api` (single backend) and `ensure_pooled_provider_api`
         (pool). `set-backend-service` references a pool exactly like a backend."""
+        # The inbound policy references {{KEY_LIMITS_NV}}; APIM rejects a policy
+        # referencing a missing named value, so ensure it exists FIRST.
+        self.ensure_key_limits_nv()
         # API with the provider-native subscription-key header.
         self.client.api.begin_create_or_update(
             self._rg,
@@ -302,6 +373,85 @@ class ApimProvisioner:
         )
         return backend.name or backend_id
 
+    @staticmethod
+    def _build_limit_block() -> str:
+        """Build the inbound rate/quota-limit XML fragment for the shared policy.
+
+        Design (dictated by dev-a01 testing of what llm-token-limit accepts):
+          * tokens-per-minute + token-quota-period accept policy expressions, so
+            they read the calling key's values straight from the KEY_LIMITS_NV map.
+          * token-quota does NOT accept an expression, so quota is a fixed TIER:
+            we read the tier LABEL from the map into tfQTier, then <choose> one
+            branch per tier with the literal amount from TOKEN_QUOTA_AMOUNTS.
+          * a key with no quota tier hits <otherwise> = a TPM-only limit (no quota).
+
+        Branch count = number of tiers (period stays an expression, so it does NOT
+        multiply the branches).
+
+        ⚠️ Named value reference: {{KEY_LIMITS_NV}} is a COMPILE-TIME text
+        substitution. It must be the WHOLE attribute value of one set-variable
+        (`value="{{nv}}"`) — inlining it into `Parse("{{nv}}")` breaks the C#
+        string literal once the value holds real JSON (its quotes/commas leak in).
+        So we capture it into tfRaw first, then every expression parses tfRaw."""
+        nv = KEY_LIMITS_NV
+
+        def _lookup(field: str, default: str, cast_open: str, cast_close: str) -> str:
+            """Expression that parses tfRaw, finds this subscription's entry, and
+            returns entry[field] cast via cast_open/cast_close, else default."""
+            return (
+                "@{ try {"
+                " var m=Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables"
+                "[&quot;tfRaw&quot;]);"
+                " var e=m[context.Subscription.Id] as Newtonsoft.Json.Linq.JObject;"
+                f" return (e!=null&amp;&amp;e[&quot;{field}&quot;]!=null)"
+                f"?{cast_open}e[&quot;{field}&quot;]{cast_close}:{default};"
+                f" }} catch {{ return {default}; }} }}"
+            )
+
+        tpm_expr = _lookup("t", str(_TPM_UNLIMITED), "(int)", "")
+        period_var = _lookup(
+            "p", f"&quot;{_PERIOD_DEFAULT}&quot;", "(string)", ""
+        )
+        qtier_var = _lookup("qt", "&quot;none&quot;", "(string)", "")
+        tpm_attr = (
+            "@(context.Variables.GetValueOrDefault&lt;int&gt;"
+            f"(&quot;tfTpm&quot;, {_TPM_UNLIMITED}))"
+        )
+        period_attr = (
+            "@(context.Variables.GetValueOrDefault&lt;string&gt;"
+            f"(&quot;tfPeriod&quot;, &quot;{_PERIOD_DEFAULT}&quot;))"
+        )
+        # One <when> per quota tier with the literal amount baked in.
+        whens = ""
+        for tier, amount in TOKEN_QUOTA_AMOUNTS.items():
+            whens += (
+                f'\n      <when condition="@((string)context.Variables[&quot;tfQTier&quot;]'
+                f'==&quot;{tier.value}&quot;)">'
+                f'\n        <llm-token-limit counter-key="@(context.Subscription.Id)"'
+                f'\n          tokens-per-minute="{tpm_attr}"'
+                f'\n          token-quota="{amount}" token-quota-period="{period_attr}"'
+                f'\n          estimate-prompt-tokens="false"'
+                f'\n          remaining-tokens-header-name="x-remaining-tokens"'
+                f'\n          remaining-quota-tokens-header-name="x-remaining-quota-tokens"'
+                f'\n          tokens-consumed-header-name="x-consumed-tokens" />'
+                f"\n      </when>"
+            )
+        # tfRaw captures the named value as a plain value (NOT inlined into an
+        # expression string), so its JSON quotes/commas can't break the policy.
+        return f"""<set-variable name="tfRaw" value="{{{{{nv}}}}}" />
+    <set-variable name="tfTpm" value="{tpm_expr}" />
+    <set-variable name="tfPeriod" value="{period_var}" />
+    <set-variable name="tfQTier" value="{qtier_var}" />
+    <choose>{whens}
+      <otherwise>
+        <llm-token-limit counter-key="@(context.Subscription.Id)"
+          tokens-per-minute="{tpm_attr}"
+          estimate-prompt-tokens="false"
+          remaining-tokens-header-name="x-remaining-tokens"
+          tokens-consumed-header-name="x-consumed-tokens" />
+      </otherwise>
+    </choose>"""
+
     def _build_provider_policy(self, backend_id: str, provider: str) -> str:
         """Inbound governance + outbound Cosmos usage write for a provider API.
 
@@ -327,14 +477,12 @@ class ApimProvisioner:
         """
         _ = provider  # API-level policy is provider-agnostic; kept for symmetry
         docs = f"{self._cosmos_endpoint}/dbs/{self._cosmos_db}/colls/{self._cosmos_container}/docs"
+        limit_block = self._build_limit_block()
         return f"""<policies>
   <inbound>
     <base />
     <set-backend-service backend-id="{backend_id}" />
-    <llm-token-limit counter-key="@(context.Subscription.Id)"
-      tokens-per-minute="50000" estimate-prompt-tokens="false"
-      remaining-tokens-header-name="x-remaining-tokens"
-      tokens-consumed-header-name="x-consumed-tokens" />
+    {limit_block}
     <llm-emit-token-metric namespace="tokenfoundry">
       <dimension name="subscription" value="@(context.Subscription.Id)" />
       <dimension name="api" value="@(context.Api.Id)" />
@@ -454,6 +602,98 @@ class ApimProvisioner:
             )
         except ResourceNotFoundError:
             logger.info("subscription %s already gone", subscription_id)
+
+    # --- Per-key token limits (shared named value map) ---
+
+    def ensure_key_limits_nv(self) -> None:
+        """Ensure the KEY_LIMITS_NV named value exists (empty map if new). MUST run
+        before pushing any policy that references {{KEY_LIMITS_NV}} — APIM rejects
+        a policy referencing a non-existent named value ("Cannot find a property").
+        Idempotent: a present named value is left untouched."""
+        try:
+            self.client.named_value.get(self._rg, self._service, KEY_LIMITS_NV)
+            return
+        except ResourceNotFoundError:
+            pass
+        self._write_key_limits({}, None)
+        logger.info("created named value %s (empty)", KEY_LIMITS_NV)
+
+    def _read_key_limits(self) -> tuple[dict, str | None]:
+        """Read the KEY_LIMITS_NV named value -> (parsed map, etag). Missing NV or
+        unparyable value both yield ({}, None) so callers start from an empty map."""
+        try:
+            nv = self.client.named_value.get(self._rg, self._service, KEY_LIMITS_NV)
+        except ResourceNotFoundError:
+            return {}, None
+        try:
+            parsed = json.loads(nv.value) if nv.value else {}
+        except (ValueError, TypeError):
+            logger.warning("named value %s not valid JSON; resetting", KEY_LIMITS_NV)
+            parsed = {}
+        etag = getattr(nv, "e_tag", None)
+        return (parsed if isinstance(parsed, dict) else {}), etag
+
+    def _write_key_limits(self, mapping: dict, etag: str | None) -> None:
+        """Write the map back to the named value, using the etag for optimistic
+        concurrency (if_match). Caller handles retry on precondition failure."""
+        params = NamedValueCreateContract(
+            display_name=KEY_LIMITS_NV,
+            value=json.dumps(mapping, separators=(",", ":")),
+            secret=False,
+        )
+        self.client.named_value.begin_create_or_update(
+            self._rg,
+            self._service,
+            KEY_LIMITS_NV,
+            params,
+            if_match=etag or "*",
+        ).result()
+
+    def upsert_key_limits(
+        self,
+        subscription_id: str,
+        tokens_per_minute: int | None,
+        token_quota_tier: str | None,
+        token_quota_period: str | None,
+    ) -> None:
+        """Set (or clear) a key's entry in the shared limits map. Read-merge-write
+        with a small retry to tolerate concurrent issuance (etag precondition).
+        Raises on over-cap (via _merge_key_limit) or persistent write failure so
+        the caller can roll back the key issuance."""
+        for attempt in range(3):
+            current, etag = self._read_key_limits()
+            merged = _merge_key_limit(
+                current,
+                subscription_id,
+                tokens_per_minute,
+                token_quota_tier,
+                token_quota_period,
+            )
+            try:
+                self._write_key_limits(merged, etag)
+                return
+            except HttpResponseError as exc:
+                # 412 precondition failed -> someone else wrote; re-read and retry.
+                if getattr(exc, "status_code", None) == 412 and attempt < 2:
+                    logger.info("named value %s changed; retrying", KEY_LIMITS_NV)
+                    continue
+                raise
+
+    def remove_key_limits(self, subscription_id: str) -> None:
+        """Remove a key's entry from the shared limits map (best-effort, on key
+        delete). Same retry-on-precondition as upsert; a missing entry is a no-op."""
+        for attempt in range(3):
+            current, etag = self._read_key_limits()
+            if subscription_id not in current:
+                return
+            merged = _remove_key_limit(current, subscription_id)
+            try:
+                self._write_key_limits(merged, etag)
+                return
+            except HttpResponseError as exc:
+                if getattr(exc, "status_code", None) == 412 and attempt < 2:
+                    continue
+                raise
 
     # --- Model backends + aliases ---
 

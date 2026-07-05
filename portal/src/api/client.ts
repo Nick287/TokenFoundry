@@ -41,7 +41,9 @@ export interface VirtualKey {
   project_id: string;
   status: string;
   allowed_route_ids: string[];
-  monthly_budget_usd: number | null;
+  tokens_per_minute: number | null;
+  token_quota_tier: string | null;
+  token_quota_period: string | null;
   created_at: string;
 }
 

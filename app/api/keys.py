@@ -71,15 +71,43 @@ def create_key(
     # 2) store the value in Key Vault; persist only the reference
     kv_ref = kv.set_secret(KeyVaultService.subscription_key_name(key_id), key_value)
 
+    # 3) publish this key's per-key limits into the shared APIM named value map so
+    #    the gateway policy applies them. Do this BEFORE the DB row: if it fails we
+    #    roll back the (uncommitted) issuance — best-effort cleanup of the APIM
+    #    subscription + KV secret — so a key never exists in DB without its limits.
+    quota_tier = (
+        body.token_quota_tier.value if body.token_quota_tier is not None else None
+    )
+    period = (
+        body.token_quota_period.value if body.token_quota_period is not None else None
+    )
+    try:
+        provisioner.upsert_key_limits(
+            key_id, body.tokens_per_minute, quota_tier, period
+        )
+    except Exception as exc:  # noqa: BLE001 — roll back issuance on any limit failure
+        try:
+            provisioner.delete_subscription(key_id)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            kv.delete_secret(KeyVaultService.subscription_key_name(key_id))
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"failed to apply key limits: {exc}",
+        ) from exc
+
     vk = VirtualKey(
         id=key_id,
         project_id=project.id,
         apim_subscription_id=key_id,
         keyvault_ref=kv_ref,
         allowed_route_ids=body.allowed_route_ids,
-        tpm_tier=body.tpm_tier,
-        monthly_budget_usd=body.monthly_budget_usd,
-        budget_action=body.budget_action,
+        tokens_per_minute=body.tokens_per_minute,
+        token_quota_tier=body.token_quota_tier,
+        token_quota_period=body.token_quota_period,
         expires_at=body.expires_at,
         status=KeyStatus.ACTIVE,
     )
@@ -121,9 +149,15 @@ def delete_key(
     if not vk:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="key not found")
     if vk.apim_subscription_id:
+        provisioner = ApimProvisioner()
         try:
-            ApimProvisioner().delete_subscription(vk.apim_subscription_id)
+            provisioner.delete_subscription(vk.apim_subscription_id)
         except Exception:  # noqa: BLE001 — never block deletion on APIM
+            pass
+        # Remove this key's entry from the shared limits map (best-effort).
+        try:
+            provisioner.remove_key_limits(vk.apim_subscription_id)
+        except Exception:  # noqa: BLE001 — stale map entry is harmless
             pass
     try:
         KeyVaultService().delete_secret(KeyVaultService.subscription_key_name(key_id))

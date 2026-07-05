@@ -77,3 +77,46 @@ def test_api_level_policy_has_no_stream_options():
     p = _provisioner()
     for provider in ("openai", "azure"):
         assert "stream_options" not in p._build_provider_policy("be-1", provider)
+
+
+# --- per-key token limits: TPM expression + quota <choose> tiers -------------
+
+
+def test_policy_references_key_limits_named_value():
+    """The policy reads per-key limits from the shared named value, so it must
+    reference {{tf-key-token-limits}} (APIM named value syntax)."""
+    p = _provisioner()
+    xml = p._build_provider_policy("be-1", "openai")
+    assert "{{tf-key-token-limits}}" in xml
+
+
+def test_policy_tpm_is_an_expression_not_hardcoded():
+    """tokens-per-minute must be a policy expression reading the key's value, not
+    the old hard-coded 50000."""
+    p = _provisioner()
+    xml = p._build_provider_policy("be-1", "openai")
+    assert 'tokens-per-minute="@(' in xml
+    assert '"50000"' not in xml
+
+
+def test_policy_quota_uses_choose_with_literal_tiers():
+    """token-quota can't take an expression, so quota is a <choose> with one
+    branch per tier carrying the LITERAL amount from TOKEN_QUOTA_AMOUNTS."""
+    from app.models.enums import TOKEN_QUOTA_AMOUNTS
+
+    p = _provisioner()
+    xml = p._build_provider_policy("be-1", "openai")
+    assert "<choose>" in xml
+    for amount in TOKEN_QUOTA_AMOUNTS.values():
+        assert f'token-quota="{amount}"' in xml
+    # quota must NOT be an expression (APIM rejects that on llm-token-limit).
+    assert 'token-quota="@(' not in xml
+
+
+def test_limit_policy_still_provider_agnostic():
+    """Adding the limit block must keep the API-level policy identical across
+    providers (provider-specific behavior stays in the chat op policy)."""
+    p = _provisioner()
+    base = p._build_provider_policy("be-1", "anthropic")
+    for provider in ("openai", "azure", "google"):
+        assert p._build_provider_policy("be-1", provider) == base

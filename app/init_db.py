@@ -41,6 +41,16 @@ def _ensure_columns() -> None:
         "ALTER TABLE model_routes ADD COLUMN IF NOT EXISTS api_version varchar(64)",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS hub_key_kv_ref varchar(512)",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS admin_token_kv_ref varchar(512)",
+        # Per-key gateway limits (replace the retired tpm_tier / budget columns).
+        # token_quota is a TIER label (varchar) not a number — APIM's token-quota
+        # attribute can't take an expression, so the amount is a policy literal.
+        "ALTER TABLE virtual_keys ADD COLUMN IF NOT EXISTS tokens_per_minute integer",
+        "ALTER TABLE virtual_keys ADD COLUMN IF NOT EXISTS token_quota_tier varchar(16)",
+        "ALTER TABLE virtual_keys ADD COLUMN IF NOT EXISTS token_quota_period varchar(16)",
+        # Retire the dead key-level fields (real $ budgets live in the Budget table).
+        "ALTER TABLE virtual_keys DROP COLUMN IF EXISTS tpm_tier",
+        "ALTER TABLE virtual_keys DROP COLUMN IF EXISTS monthly_budget_usd",
+        "ALTER TABLE virtual_keys DROP COLUMN IF EXISTS budget_action",
     ]
     with engine.begin() as conn:
         for stmt in statements:

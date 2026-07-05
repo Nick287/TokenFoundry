@@ -14,11 +14,18 @@ export function KeysPage() {
   const { t } = useTranslation();
   const toast = useToast();
   const [projectId, setProjectId] = useState("");
-  const [budget, setBudget] = useState("");
+  // Per-key gateway limits. tpm = arbitrary tokens/min; quotaTier = preset amount
+  // (APIM can't take an arbitrary quota via expression); period = reset window.
+  const [tpm, setTpm] = useState("");
+  const [quotaTier, setQuotaTier] = useState("none");
+  const [quotaPeriod, setQuotaPeriod] = useState("Daily");
   const [issued, setIssued] = useState<VirtualKeySecret | null>(null);
   const [copied, setCopied] = useState(false);
   const [adding, setAdding] = useState(false);
   const [removing, setRemoving] = useState<VirtualKey | null>(null);
+
+  const QUOTA_TIERS = ["none", "small", "medium", "large"] as const;
+  const QUOTA_PERIODS = ["Hourly", "Daily", "Weekly", "Monthly", "Yearly"] as const;
 
   const projects = useQuery({
     queryKey: ["projects"],
@@ -31,17 +38,22 @@ export function KeysPage() {
   });
 
   const create = useMutation({
-    mutationFn: () =>
-      api.createKey(principal.token, {
+    mutationFn: () => {
+      const hasQuota = quotaTier !== "none";
+      return api.createKey(principal.token, {
         project_id: projectId,
-        monthly_budget_usd: budget ? Number(budget) : null,
-        budget_action: "block",
-      }),
+        tokens_per_minute: tpm ? Number(tpm) : null,
+        token_quota_tier: hasQuota ? quotaTier : null,
+        token_quota_period: hasQuota ? quotaPeriod : null,
+      });
+    },
     onSuccess: (k) => {
       setIssued(k);
       setCopied(false);
       setProjectId("");
-      setBudget("");
+      setTpm("");
+      setQuotaTier("none");
+      setQuotaPeriod("Daily");
       setAdding(false);
       toast(t("common.created"));
       qc.invalidateQueries({ queryKey: ["keys"] });
@@ -97,10 +109,32 @@ export function KeysPage() {
           ))}
         </select>
         <input
-          placeholder={t("keys.budget")}
-          value={budget}
-          onChange={(e) => setBudget(e.target.value)}
+          type="number"
+          min="1"
+          max="100000000"
+          placeholder={t("keys.tokensPerMinute")}
+          value={tpm}
+          onChange={(e) => setTpm(e.target.value)}
         />
+        <select value={quotaTier} onChange={(e) => setQuotaTier(e.target.value)}>
+          {QUOTA_TIERS.map((tier) => (
+            <option key={tier} value={tier}>
+              {t(`keys.quotaTiers.${tier}`)}
+            </option>
+          ))}
+        </select>
+        {quotaTier !== "none" && (
+          <select
+            value={quotaPeriod}
+            onChange={(e) => setQuotaPeriod(e.target.value)}
+          >
+            {QUOTA_PERIODS.map((period) => (
+              <option key={period} value={period}>
+                {t(`keys.periods.${period}`)}
+              </option>
+            ))}
+          </select>
+        )}
         <button type="submit" disabled={!projectId || create.isPending}>
           {create.isPending ? t("keys.provisioning") : t("keys.issue")}
         </button>
@@ -141,7 +175,7 @@ export function KeysPage() {
               <th>{t("keys.keyId")}</th>
               <th>{t("keys.project")}</th>
               <th>{t("common.status")}</th>
-              <th>{t("keys.budgetCol")}</th>
+              <th>{t("keys.limitsCol")}</th>
               <th>{t("keys.created")}</th>
               <th>{t("common.actions")}</th>
             </tr>
@@ -168,9 +202,23 @@ export function KeysPage() {
                     <span className={`badge badge-${k.status}`}>{k.status}</span>
                   </td>
                   <td>
-                    {k.monthly_budget_usd != null
-                      ? `$${k.monthly_budget_usd.toFixed(2)}`
-                      : t("keys.unlimited")}
+                    {k.tokens_per_minute == null && k.token_quota_tier == null ? (
+                      <span className="cell-zero">{t("keys.unlimited")}</span>
+                    ) : (
+                      <>
+                        {k.tokens_per_minute != null && (
+                          <div>{t("keys.tpmShort", { n: k.tokens_per_minute })}</div>
+                        )}
+                        {k.token_quota_tier != null && (
+                          <div className="hint">
+                            {t(`keys.quotaTiers.${k.token_quota_tier}`)}
+                            {k.token_quota_period
+                              ? ` / ${t(`keys.periods.${k.token_quota_period}`)}`
+                              : ""}
+                          </div>
+                        )}
+                      </>
+                    )}
                   </td>
                   <td>{new Date(k.created_at).toLocaleString()}</td>
                   <td className="row-actions">

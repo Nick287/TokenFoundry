@@ -17,6 +17,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Integer,
     String,
     func,
 )
@@ -32,6 +33,8 @@ from app.models.enums import (
     Provider,
     TenantMode,
     TenantStatus,
+    TokenQuotaPeriod,
+    TokenQuotaTier,
     UserRole,
 )
 
@@ -97,10 +100,20 @@ class VirtualKey(Base, TimestampMixin):
     apim_subscription_id: Mapped[str | None] = mapped_column(String(256))
     keyvault_ref: Mapped[str | None] = mapped_column(String(512))
     allowed_route_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    tpm_tier: Mapped[str | None] = mapped_column(String(64))
-    monthly_budget_usd: Mapped[float | None] = mapped_column(Float)
-    budget_action: Mapped[BudgetAction] = mapped_column(
-        Enum(BudgetAction), default=BudgetAction.ALERT
+    # Per-key gateway rate/quota limits — applied by APIM's llm-token-limit via a
+    # shared named-value map keyed on this key's apim_subscription_id (see
+    # apim_provisioner). All optional: a NULL / NONE means "no limit of that kind".
+    #  * tokens_per_minute: arbitrary int (APIM accepts an expression for it).
+    #  * token_quota_tier:  a preset TIER, not an arbitrary number — APIM's
+    #    token-quota attribute rejects expressions, so the amount is a literal in
+    #    a policy <choose> branch (see enums.TOKEN_QUOTA_AMOUNTS).
+    #  * token_quota_period: the fixed window the quota resets on (UTC-aligned).
+    tokens_per_minute: Mapped[int | None] = mapped_column(Integer)
+    token_quota_tier: Mapped[TokenQuotaTier | None] = mapped_column(
+        Enum(TokenQuotaTier, native_enum=False)
+    )
+    token_quota_period: Mapped[TokenQuotaPeriod | None] = mapped_column(
+        Enum(TokenQuotaPeriod, native_enum=False)
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[KeyStatus] = mapped_column(Enum(KeyStatus), default=KeyStatus.ACTIVE)

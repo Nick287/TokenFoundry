@@ -113,6 +113,169 @@ Client ──> APIM (AI Gateway)
 
 ---
 
+## 4.5 每 key 独立限流（TPM + token-quota，per-subscription 动态取值）
+
+> 2026-07-05 补充：目标是"创建虚拟密钥时可为**每把 key 独立设** TPM / token 配额"。
+> 下面的 SKU 支持与表达式支持均**已核对官方文档**，`tokens-per-minute` 用策略表达式一项
+> 更在 **dev-a01（Developer SKU）实测**确认。
+
+### 4.5.1 结论（可落地）
+
+- **每 key 独立"桶"早已实现**：策略 `counter-key="@(context.Subscription.Id)"` —— 虚拟密钥 ≙ APIM
+  订阅，所以每把 key 各有独立计数器，**互不共享**（key A 打满不影响 B）。
+- **缺的是"每 key 不同的限流数值"**：现状 `tokens-per-minute="50000"` 写死、`token-quota` 未配。
+- **`llm-token-limit` 的三个数值属性都能按 key 动态取值**（见下表），所以"每 key 任意 TPM/配额"
+  **技术可行、无 SKU 障碍**（Developer SKU 就支持）。
+
+### 4.5.2 SKU 支持（APPLIES TO）与策略表达式支持 —— 已核对官方文档
+
+| 策略 | APPLIES TO（服务层级） | 数值属性能否用策略表达式 `@()` |
+| --- | --- | --- |
+| **`llm-token-limit`** | Developer / Basic / **Basic v2** / Standard / **Standard v2** / Premium / **Premium v2** | `counter-key` ✅ · `token-quota` ✅ · `token-quota-period` ✅ · `tokens-per-minute` ✅（**dev-a01 实测**，文档未标但 APIM 接受） |
+| `rate-limit` | **All tiers** | 数值 ❌（product 级，写死） |
+| `rate-limit-by-key` | Developer / Basic / Basic v2 / Standard / Standard v2 / Premium / Premium v2 | `calls` ✅ · `renewal-period` ✅ |
+| `quota` | **All tiers** | 数值 ❌（product 级，写死） |
+| `quota-by-key` | **Developer / Basic / Standard / Premium**（⚠️ 无 v2 / 无 Consumption） | `calls` ✅ · `bandwidth` ✅ · `renewal-period` ✅ |
+| `limit-concurrency` | All tiers | `max-count` ❌ |
+| `ip-filter` | All tiers | address ✅ |
+
+**规律**：`-by-key` 系列（含 `llm-token-limit`）为"每调用方不同限额"而设计，**数值属性支持表达式**；
+product 级的 `rate-limit` / `quota` 数值写死、不支持表达式。这正是我们要"每 key 不同值"该用
+`-by-key` / `llm-token-limit` 而非 product 级策略的原因。
+
+> ⚠️ `quota-by-key` 的 SKU 比其他窄（**无 v2、无 Consumption**）。我们**不用它**——用
+> `llm-token-limit` 的 `token-quota`（SKU 覆盖更全，且和 TPM 同一策略）。此行仅作备选知识。
+
+### 4.5.3 dev-a01 实测记录（2026-07-05，Developer SKU）
+
+问题：`llm-token-limit` 的 `tokens-per-minute` 文档**未标注**支持策略表达式（其余标了的都明写
+"Policy expressions are allowed"），需实测确认能否"每 key 动态取值"。
+
+方法：建隔离临时 API `tpm-expr-test`，用 ARM REST PUT 策略，测完即删（**不碰生产三个
+`llm-*` API**）。
+
+| 测试的 `tokens-per-minute` 值 | 结果 |
+| --- | --- |
+| `@(1000+500)`（简单表达式） | ✅ HTTP 201 接受 |
+| `@{ 解析 JSON 映射 → 按 context.Subscription.Id 取 tpm }`（**贴近真实方案**）| ✅ HTTP 200 接受 |
+
+结论：**APIM 接受 `tokens-per-minute` 用策略表达式**，包括"解析映射 + 读 `context.Subscription` +
+类型转换"的真实形态。策略编译器完整校验通过。→ 方案里唯一的技术不确定点**消除**。
+
+### 4.5.3b ⚠️ 实现期实测修正（2026-07-05，逐属性隔离测试）
+
+上面 4.5.3 只测了 `tokens-per-minute`。**实现时逐属性隔离测试，发现 `llm-token-limit` 三个
+数值属性的表达式支持并不一致**——这颠覆了 §4.5.2 基于文档的判断（文档说 `token-quota`
+"Policy expressions are allowed"，但**实测在 `llm-token-limit` 上不成立**）：
+
+| 属性 | 实测 | 证据（dev-a01 隔离 API PUT policy） |
+| --- | --- | --- |
+| `tokens-per-minute` | ✅ 接受 `@(int)` 表达式 | `@(5000)` → HTTP 200；`@("5000")`(string) → 400 |
+| `token-quota` | ❌ **只接受字面量** | `@(5000)` → **400 "return type System.Int32 is not allowed"**；`5000`(字面量) → 201 |
+| `token-quota-period` | ✅ 接受 `@(string)` 表达式 | `@("Daily")` → 200 |
+
+**结论**：`token-quota` **不能**用"共享策略 + named value 表达式"实现每 key 任意值。
+**可行的替代（已实测 HTTP 201）**：用 `<set-variable>` 从 named value 读该 key 的 quota
+**档位**，再用 `<choose>` 按档走不同的、**写死字面量** `token-quota` 的 `llm-token-limit`
+分支。即 quota 是**固定几档**（非任意值）；`tokens-per-minute` 仍任意值（表达式）。
+
+另注：策略里引用 named value `{{tf-key-token-limits}}` 时，**该 named value 必须先存在**，
+否则 APIM 校验策略即报 "Cannot find a property"。所以 provisioning 时须先确保 named value
+存在（空 `{}` 亦可）再推策略。
+
+### 4.5.4 设计（每 key 动态限流 · 已按实测修正）
+
+- **数据源**：虚拟密钥表已有 `apim_subscription_id`（= 策略里的 `context.Subscription.Id`），
+  作为"key → 限额"的锚点。新增字段：`tokens_per_minute`（任意值）、`token_quota`（**固定档位**）、
+  `token_quota_period`（枚举 Hourly/Daily/Weekly/Monthly/Yearly）。
+- **取值机制**：把 `{subId:{t,quota_tier,p}}` 映射存进 **APIM named value**；一份**共享**的
+  API 级策略：`tokens-per-minute` 用 `@()` 表达式动态取（任意值）；`token-quota` 用 `<choose>`
+  按档位分支（写死字面量）。签发/改 key 时更新 named value，删除 key 时移除该条。
+- **速率 vs 总量（别混）**：`tokens-per-minute` = 每分钟峰值（429，窗口恒为 1 分钟、无周期）；
+  `token-quota` + `token-quota-period` = 周期累计（403，到期重置）。二者可各自独立启用。
+  `token-quota` 与 `token-quota-period` **必须成对**（APIM 要求）。
+- **与美元预算的关系**：key 上旧的 `monthly_budget_usd`/`budget_action` 是**只存不用的死字段**
+  （`budget_enforcer.py` 读的是独立的 `Budget` 表，不读 key 字段），随本改造删除；独立的
+  `Budget` 表 + `budget_enforcer`（美元事后对账）**保留不动**。
+
+策略骨架（示意，`{{tf-key-limits}}` 为 named value）：
+
+```xml
+<inbound>
+  <base />
+  <set-backend-service backend-id="..." />
+  <set-variable name="tfLimits" value="@{
+      var map = Newtonsoft.Json.Linq.JObject.Parse("{{tf-key-limits}}");
+      var sid = context.Subscription?.Id ?? "none";
+      return map[sid] != null ? map[sid].ToString() : "{}";
+  }" />
+  <llm-token-limit
+      counter-key="@(context.Subscription?.Id ?? "anon")"
+      tokens-per-minute="@{ var o=Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables["tfLimits"]); return o["tpm"]!=null ? (int)o["tpm"] : 50000; }"
+      token-quota="@{ var o=Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables["tfLimits"]); return o["quota"]!=null ? (int)o["quota"] : 0; }"
+      token-quota-period="@{ var o=Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables["tfLimits"]); return o["period"]!=null ? (string)o["period"] : "Monthly"; }"
+      estimate-prompt-tokens="false" />
+</inbound>
+```
+
+> 注：`token-quota="0"` 需按"未设置"处理（不下发该属性），否则会把配额锁成 0。实现时对
+> quota/period 缺失的 key 应**省略**这两个属性，而非填 0。
+
+---
+
+## 4.6 SKU 支持矩阵 —— 我们**实际依赖**的 APIM 能力 × 服务层级
+
+> 2026-07-05 补充。上面 §4.5.2 那张表是"限流策略族"的通用对照；这一节是**针对本项目实际用到
+> 的每一个 APIM 能力**逐个核实 SKU 支持——直接作为选生产层级的依据。能力清单从
+> `app/services/apim_provisioner.py` 实际调用提取，SKU 结论对照官方 backends.md /
+> genai-gateway-capabilities / 各策略文档。
+
+### 4.6.1 能力 × SKU 表
+
+| 我们用到的能力 | 代码位置 | SKU 支持 | Developer 可用 | Consumption |
+| --- | --- | --- | --- | --- |
+| `llm-token-limit`（限流；将来 per-key TPM/quota） | `apim_provisioner.py:334` | Dev/Basic/Std/Premium + **全部 v2** | ✅ | —（见下） |
+| `llm-emit-token-metric`（token 计量 → App Insights） | :338 | 同上 | ✅ | — |
+| **负载均衡后端池**（3 个 provider 池，架构核心） | :526,624 | GA，非 Consumption 均支持 | ✅ | ❌ |
+| `sessionAffinity` 会话粘性（prompt-cache 保温） | :627 | 随池（preview ARM API） | ✅ | ❌ |
+| **熔断 Circuit Breaker**（每后端 1 条规则） | :281,478 | **Consumption 明确不支持** | ✅ | ❌ |
+| `authentication-managed-identity`（MI 写 Cosmos） | :342 | 非 Consumption | ✅ | 受限 |
+| `send-one-way-request`（Cosmos 用量即发即忘） | :350 | 全层 | ✅ | ✅ |
+| 后端 header 凭据（注入 hub key 作后端认证） | :280,474 | 全层 | ✅ | ✅ |
+
+### 4.6.2 结论：当前实现锁定"非 Consumption 层"，经典 ↔ v2 可迁移
+
+- ✅ **完全可用（现状 + 生产推荐）**：**Developer / Basic / Standard / Premium**（经典层）——
+  我们用的每一个能力都支持。dev-a01 = Developer，全部实测正常。生产升 Standard/Premium **零改代码**。
+- ⚠️ **Consumption 层被排除**（两处会坏）：
+  1. **熔断不支持**（backends.md 原文："circuit breaker isn't supported in the Consumption
+     tier"）——我们每个后端都配了熔断（处理 Azure OpenAI 的超大 `Retry-After`，见 §5.3）。
+  2. **后端池 + sessionAffinity** 在 Consumption 也受限。
+  → 但 Consumption 本就不适合生产 LLM 网关（无 SLA、冷启动），排除它无损失。
+- 🔶 **迁移路径**：Developer（测）→ Standard / Premium（生产）无缝；若要 v2 层（Basic/Standard/
+  Premium **v2**）用到的策略也都覆盖，同样可行。
+
+### 4.6.3 🔶 已知隐患：Anthropic 原生 API 仅 v2 层
+
+genai-gateway-capabilities 文档明确：**"Anthropic Messages API (currently supported in API
+Management v2 tiers)"**。而 dev-a01 是 **Developer（经典层，非 v2）**。
+
+- **为什么我们的 `llm-anthropic` 池现在能跑**：我们**没有**用 APIM 原生的"Anthropic API 类型"，
+  而是把 Claude 当**普通 HTTP 后端**（经 GitModel hub 转发），套通用 `llm-token-limit` 策略——
+  **绕过了那个 v2 限制**。
+- **代价（取舍，非 bug）**：没吃到 APIM 对 Anthropic 的**原生**支持（原生 token 计数/schema 校验
+  等）。功能正常，计量走 hub 返回值 + `llm-emit-token-metric` 估算。
+- **何时需要处理**：若将来要 APIM 原生解析 Anthropic 请求/精确原生计费，需上 **v2 层**并改用
+  原生 Anthropic API 类型；否则当前"通用后端"方式在所有经典层都通用，无需动。
+
+### 4.6.4 一句话给决策者
+
+> 选 **Standard 或 Premium（经典层）** 上生产：本项目所有 APIM 能力都支持，从 Developer 平滑升级、
+> 零代码改动。**别选 Consumption**（熔断/池受限）。Anthropic 走通用后端，无需 v2；除非要 APIM
+> 原生解析 Anthropic 才需上 v2 层。
+
+---
+
 ## 5. Backends 深入（来自 backends.md 官方文档）
 
 ### 5.1 概念与用途

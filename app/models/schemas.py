@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.enums import (
     AuthMode,
@@ -20,6 +20,8 @@ from app.models.enums import (
     Provider,
     TenantMode,
     TenantStatus,
+    TokenQuotaPeriod,
+    TokenQuotaTier,
     UserRole,
 )
 
@@ -133,10 +135,33 @@ class ProjectUpdate(BaseModel):
 class VirtualKeyCreate(BaseModel):
     project_id: str
     allowed_route_ids: list[str] = Field(default_factory=list)
-    tpm_tier: str | None = None
-    monthly_budget_usd: float | None = None
-    budget_action: BudgetAction = BudgetAction.ALERT
+    # Per-key gateway limits (all optional). tokens_per_minute is a standalone
+    # rate gate (arbitrary int). token_quota_tier + token_quota_period are a
+    # period-total gate: the tier is a preset amount (APIM can't take an
+    # expression for token-quota) and must be provided together with a period.
+    #
+    # tokens_per_minute upper bound: APIM's tokens-per-minute is an int32 and the
+    # value lands in an integer DB column, so cap it well under int32 max
+    # (2,147,483,647). 100M tok/min is already far beyond any real per-key rate.
+    tokens_per_minute: int | None = Field(default=None, gt=0, le=100_000_000)
+    token_quota_tier: TokenQuotaTier | None = None
+    token_quota_period: TokenQuotaPeriod | None = None
     expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _quota_pair(self) -> VirtualKeyCreate:
+        """A quota needs both a tier and a period. NONE tier counts as "no quota",
+        so treat NONE like absent. Reject a one-sided quota config (422)."""
+        has_tier = (
+            self.token_quota_tier is not None
+            and self.token_quota_tier != TokenQuotaTier.NONE
+        )
+        has_period = self.token_quota_period is not None
+        if has_tier != has_period:
+            raise ValueError(
+                "token_quota_tier (non-NONE) and token_quota_period must be set together"
+            )
+        return self
 
 
 class VirtualKeyOut(BaseModel):
@@ -145,9 +170,9 @@ class VirtualKeyOut(BaseModel):
     project_id: str
     apim_subscription_id: str | None
     allowed_route_ids: list[str]
-    tpm_tier: str | None
-    monthly_budget_usd: float | None
-    budget_action: BudgetAction
+    tokens_per_minute: int | None
+    token_quota_tier: TokenQuotaTier | None
+    token_quota_period: TokenQuotaPeriod | None
     expires_at: datetime | None
     status: KeyStatus
     created_at: datetime
