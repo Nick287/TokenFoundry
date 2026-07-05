@@ -359,6 +359,15 @@ Cosmos, how callers and users are authenticated, the RBAC model, and the honest
 list of trade-offs — is documented in
 **[docs/SECURITY.md](docs/SECURITY.md)** ([中文](docs/SECURITY.zh.md)).
 
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** ([中文](docs/DEPLOYMENT.zh.md)) | Standing up an environment: `bootstrap.sh`, Terraform workspace/tfvars setup, the 3-phase flow (deploy → deploy-config → add account), teardown. |
+| **[docs/architecture.md](docs/architecture.md)** ([中文](docs/architecture.zh.md)) | System layers, 方案 A onboarding sequence, the entity model, and where each secret lives (Mermaid diagrams). |
+| **[docs/SECURITY.md](docs/SECURITY.md)** ([中文](docs/SECURITY.zh.md)) | Secret storage, authentication, RBAC, 方案 A secret tiers, trade-offs. |
+| **[docs/APIM-LLM-Gateway.md](docs/APIM-LLM-Gateway.md)** | The APIM LLM-gateway design: pools, session affinity, prompt caching. |
+
 ## Implementation status
 
 - **Working today:** data model, control-plane API + tenant-scope auth, APIM
