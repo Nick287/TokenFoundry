@@ -742,4 +742,27 @@ tr:focus-within .row-actions { opacity: 1; }
 .deploy-config .form-grid label .hint {
   font-weight: 400;
 }
+/* The generic .row-actions has `opacity: .35` (it's a table-row hover-reveal
+   affordance, restored to 1 only on `tr:hover`). DeployConfigSection reuses the
+   .row-actions class OUTSIDE any table row, so nothing ever restores it and both
+   buttons render at 35% opacity — washing out the accent fill below. Force full
+   opacity here (this container is not a hover-reveal). */
+.deploy-config .row-actions {
+  opacity: 1;
+}
+/* Re-push is the gate-unlocking action here, so promote it from the muted
+   .btn-sm secondary look to the same solid-accent "clearly clickable" style as
+   the primary Save button (and the language toggle's active state). Scoped to
+   .deploy-config so the app-wide .btn-sm secondary style is untouched. When
+   disabled (mid-push) the global button:disabled opacity still applies. */
+.deploy-config .row-actions .btn-sm {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.deploy-config .row-actions .btn-sm:hover:not(:disabled) {
+  background: var(--accent-dark);
+  border-color: var(--accent-dark);
+  color: #fff;
+}
 

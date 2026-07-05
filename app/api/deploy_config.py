@@ -89,7 +89,7 @@ def _repo_variables() -> dict[str, str]:
         "HUB_ACR_NAME": s.acr_name,
         "HUB_ACR_RG": s.resource_group,
         "HUB_LOCATION": s.azure_location,
-        "HUB_IMAGE_REF": "gitmodel:latest",
+        "HUB_IMAGE_REF": f"gitmodel:{s.hub_image_tag}",
         "TFSTATE_STORAGE_ACCOUNT": s.tfstate_storage_account,
         "TFSTATE_CONTAINER": s.tfstate_container,
         "HUB_KEYVAULT_NAME": s.keyvault_name,

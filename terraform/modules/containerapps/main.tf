@@ -257,6 +257,14 @@ resource "azurerm_container_app" "app" {
         name  = "TF_KEYVAULT_NAME"
         value = var.keyvault_name
       }
+      env {
+        # Image TAG the hub deploy references. deploy.sh builds gitmodel:<tag>
+        # with this SAME tag (never "latest"), so the Portal's deploy-config
+        # flow must publish gitmodel:<this-tag> as HUB_IMAGE_REF — not a
+        # hard-coded :latest that doesn't exist in ACR.
+        name  = "TF_HUB_IMAGE_TAG"
+        value = var.image_tag
+      }
 
       liveness_probe {
         transport        = "HTTP"

@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     acr_name: str = ""
     azure_location: str = ""
     keyvault_name: str = ""
+    # Image tag deploy.sh built (gitmodel:<tag> / tokenfoundry:<tag>). The Portal
+    # publishes gitmodel:<hub_image_tag> as HUB_IMAGE_REF so the hub deploy pulls a
+    # tag that actually exists in ACR (never a hard-coded :latest).
+    hub_image_tag: str = "latest"
 
     # --- Metadata DB (PostgreSQL Flexible Server) ---
     # Full SQLAlchemy URL, e.g. postgresql+psycopg://user:pass@host:5432/tokenfoundry
