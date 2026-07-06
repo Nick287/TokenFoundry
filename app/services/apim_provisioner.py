@@ -182,6 +182,20 @@ def _remove_key_limit(mapping: dict, sub_id: str) -> dict:
 
 
 class ApimProvisioner:
+    # Capture the request body's `model` into a variable so llm-emit-token-metric
+    # can emit it as a dimension (per-model usage breakdown). Read ONCE with
+    # preserveContent:true so the backend still receives the body; falls back to
+    # "unknown" if the body isn't JSON or has no model. Placed before the metric
+    # in the inbound policy. Verified on dev-a03: the model dimension shows the
+    # real model name (claude-opus-4.8, etc.) in App Insights customMetrics.
+    _MODEL_VAR = (
+        '<set-variable name="tfModel" value="@{ try { var b = '
+        "context.Request.Body.As&lt;Newtonsoft.Json.Linq.JObject&gt;(preserveContent:true); "
+        "return (b != null &amp;&amp; b[&quot;model&quot;] != null) "
+        "? (string)b[&quot;model&quot;] : &quot;unknown&quot;; } "
+        'catch { return &quot;unknown&quot;; } }" />'
+    )
+
     def __init__(self) -> None:
         s = get_settings()
         self._sub_id = s.azure_subscription_id
@@ -483,9 +497,11 @@ class ApimProvisioner:
     <base />
     <set-backend-service backend-id="{backend_id}" />
     {limit_block}
+    {self._MODEL_VAR}
     <llm-emit-token-metric namespace="tokenfoundry">
       <dimension name="subscription" value="@(context.Subscription.Id)" />
       <dimension name="api" value="@(context.Api.Id)" />
+      <dimension name="model" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;tfModel&quot;, &quot;unknown&quot;))" />
     </llm-emit-token-metric>
     <authentication-managed-identity resource="https://cosmos.azure.com"
       output-token-variable-name="cosmosToken" ignore-error="true" />

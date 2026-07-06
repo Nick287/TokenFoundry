@@ -79,6 +79,23 @@ def test_api_level_policy_has_no_stream_options():
         assert "stream_options" not in p._build_provider_policy("be-1", provider)
 
 
+def test_policy_emits_model_dimension():
+    """llm-emit-token-metric must carry a `model` dimension sourced from the
+    request body (captured into tfModel), on top of subscription + api, so usage
+    can be broken down per model. Verified live on dev-a03."""
+    p = _provisioner()
+    for provider in ("openai", "anthropic", "google"):
+        xml = p._build_provider_policy("be-1", provider)
+        # the capture variable + the dimension both present
+        assert 'name="tfModel"' in xml
+        assert '<dimension name="model"' in xml
+        # still has the original two dimensions
+        assert '<dimension name="subscription"' in xml
+        assert '<dimension name="api"' in xml
+        # body read must preserve content so the backend still gets the model
+        assert "preserveContent:true" in xml
+
+
 # --- per-key token limits: TPM expression + quota <choose> tiers -------------
 
 

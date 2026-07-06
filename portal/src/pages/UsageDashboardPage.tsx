@@ -51,6 +51,49 @@ function TrendBars({ data }: { data: UsageTelemetry["by_hour"] }) {
   );
 }
 
+// Total-token time series (mirrors TrendBars but for the token trend from the
+// breakdown endpoint). Same zero-fill/trim treatment so a late spike isn't
+// crushed against empty leading buckets.
+function TokenTrendBars({ data }: { data: Array<{ ts: string; tokens: number }> }) {
+  const first = data.findIndex((d) => d.tokens > 0);
+  const start = first < 0 ? Math.max(0, data.length - 6) : Math.max(0, Math.min(first - 1, data.length - 6));
+  const shown = data.slice(start);
+  const max = Math.max(1, ...shown.map((d) => d.tokens));
+  const fmtHour = (ts: string) =>
+    new Date(ts).toLocaleTimeString([], { hour: "2-digit", hour12: false });
+  const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
+  return (
+    <div className="trend card">
+      <div className="trend-plot">
+        {shown.map((d) => {
+          const pct = d.tokens === 0 ? 2 : Math.max(8, (d.tokens / max) * 85);
+          return (
+            <div
+              className="trend-col"
+              key={d.ts}
+              title={`${new Date(d.ts).toLocaleString()} — ${d.tokens.toLocaleString()}`}
+            >
+              {d.tokens > 0 && <span className="trend-val">{fmt(d.tokens)}</span>}
+              <div
+                className="trend-bar"
+                style={{ height: `${pct}%` }}
+                data-zero={d.tokens === 0 ? "" : undefined}
+              />
+            </div>
+          );
+        })}
+      </div>
+      <div className="trend-axis">
+        {shown.map((d, i) => (
+          <span className="trend-tick" key={d.ts}>
+            {i % 4 === 0 ? fmtHour(d.ts) : ""}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // Admin cross-tenant usage view — pick a tenant from the dropdown.
 // Two data sources, shown separately:
 //   * Cosmos      → usage & cost summary + per-call log (billing source)
@@ -84,6 +127,12 @@ export function UsageDashboardPage() {
   const telemetry = useQuery({
     queryKey: ["admin-usage-telemetry"],
     queryFn: () => api.usageTelemetry(principal.token),
+  });
+
+  const breakdown = useQuery({
+    queryKey: ["admin-usage-breakdown", tenantId],
+    queryFn: () => api.usageBreakdown(principal.token, tenantId),
+    enabled: tenantId.length > 0,
   });
 
   return (
@@ -198,6 +247,76 @@ export function UsageDashboardPage() {
             </>
           ) : (
             <p className="hint">{t("usage.noRecords")}</p>
+          )}
+
+          {/* --- Token breakdown by model (App Insights metering) --- */}
+          <h3>{t("usage.breakdownSection")}</h3>
+          <p className="hint">{t("usage.breakdownHint")}</p>
+          {breakdown.isLoading ? (
+            <p>{t("common.loading")}</p>
+          ) : breakdown.data && breakdown.data.groups.length > 0 ? (
+            <>
+              <div className="stat-row">
+                <div className="stat card">
+                  <span className="stat-label">{t("usage.tokTotal")}</span>
+                  <span className="stat-value">{breakdown.data.totals.total.toLocaleString()}</span>
+                </div>
+                <div className="stat card">
+                  <span className="stat-label">{t("usage.tokPrompt")}</span>
+                  <span className="stat-value">{breakdown.data.totals.prompt.toLocaleString()}</span>
+                </div>
+                <div className="stat card">
+                  <span className="stat-label">{t("usage.tokCached")}</span>
+                  <span className="stat-value">{breakdown.data.totals.cached.toLocaleString()}</span>
+                </div>
+                <div className="stat card">
+                  <span className="stat-label">{t("usage.tokCompletion")}</span>
+                  <span className="stat-value">{breakdown.data.totals.completion.toLocaleString()}</span>
+                </div>
+                <div className="stat card">
+                  <span className="stat-label">{t("usage.tokReasoning")}</span>
+                  <span className="stat-value">{breakdown.data.totals.reasoning.toLocaleString()}</span>
+                </div>
+              </div>
+              <div className="table-scroll">
+                <table className="card">
+                  <thead>
+                    <tr>
+                      <th>{t("usage.colModel")}</th>
+                      <th>{t("usage.colEndpoint")}</th>
+                      <th>{t("usage.tokTotal")}</th>
+                      <th>{t("usage.tokPrompt")}</th>
+                      <th>{t("usage.tokCached")}</th>
+                      <th>{t("usage.tokCompletion")}</th>
+                      <th>{t("usage.tokReasoning")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {breakdown.data.groups.map((g) => (
+                      <tr key={`${g.model ?? g.api}`}>
+                        <td>{g.model || t("usage.modelUnknown")}</td>
+                        <td>{g.api ?? "—"}</td>
+                        <td>{g.total.toLocaleString()}</td>
+                        <td>{g.prompt.toLocaleString()}</td>
+                        <td>{g.cached.toLocaleString()}</td>
+                        <td>{g.completion.toLocaleString()}</td>
+                        <td className={g.reasoning > 0 ? undefined : "cell-zero"}>
+                          {g.reasoning.toLocaleString()}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {breakdown.data.trend.some((d) => d.tokens > 0) && (
+                <>
+                  <h4>{t("usage.tokTrendSection")}</h4>
+                  <TokenTrendBars data={breakdown.data.trend} />
+                </>
+              )}
+            </>
+          ) : (
+            <p className="hint">{t("usage.noBreakdown")}</p>
           )}
         </>
       )}

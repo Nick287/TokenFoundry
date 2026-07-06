@@ -238,6 +238,18 @@ export const zh: TranslationShape = {
     colFailures: "失败数",
     trendSection: "每小时调用数",
     noTelemetry: "暂无遥测（App Insights 未配置或还没有调用）。",
+    breakdownSection: "按模型细分 Token —— 来自 App Insights",
+    breakdownHint:
+      "来自 APIM 的 Token 计量（涵盖流式与非流式），按模型和 Token 类型拆分。",
+    colEndpoint: "端点",
+    modelUnknown: "（未标注）",
+    tokTotal: "总计",
+    tokPrompt: "输入",
+    tokCached: "缓存",
+    tokCompletion: "输出",
+    tokReasoning: "推理",
+    tokTrendSection: "Token 随时间变化",
+    noBreakdown: "该租户暂无 Token 计量（或 App Insights 未配置）。",
   },
   users: {
     title: "账号",

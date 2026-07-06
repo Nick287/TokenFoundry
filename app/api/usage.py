@@ -114,6 +114,33 @@ def _to_record_view(r: dict, key_projects: dict[str, dict] | None = None) -> dic
     }
 
 
+def _usage_breakdown_payload(
+    key_ids: list[str] | None, hours: int, by: str
+) -> dict[str, Any]:
+    """Shared shape for the breakdown endpoints: per-group token split + trend.
+
+    `key_ids` restricts to a tenant's virtual keys; None = platform-wide (admin).
+    `by` selects the grouping dimension: "model" (default) or "api"/"endpoint".
+    Returns {"by": ..., "groups": [...], "trend": [...], "totals": {...}} where
+    each group has total/prompt/cached/completion/reasoning token counts.
+    """
+    ai = AppInsightsUsage()
+    by_model = by not in ("api", "endpoint")
+    groups = ai.token_usage_breakdown(key_ids, hours=hours, by_model=by_model)
+    trend = ai.token_usage_trend(key_ids, hours=hours)
+    totals = {
+        k: sum(int(g.get(k, 0) or 0) for g in groups)
+        for k in ("total", "prompt", "cached", "completion", "reasoning")
+    }
+    return {
+        "by": "model" if by_model else "api",
+        "hours": hours,
+        "groups": groups,
+        "trend": trend,
+        "totals": totals,
+    }
+
+
 def _key_project_map(db: Session, tenant_id: str) -> dict[str, dict]:
     """Map each of a tenant's virtual-key ids -> its owning project (id + name).
 
@@ -193,3 +220,44 @@ def usage_telemetry(
     source from Cosmos usage). Best-effort — returns an empty summary if App
     Insights isn't configured."""
     return AppInsightsUsage().request_telemetry(hours=hours)
+
+
+@router.get("/usage/breakdown")
+def my_usage_breakdown(
+    hours: int = 24,
+    by: str = "model",
+    tenant_id: str = Depends(tenant_scope),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Customer self-service: token breakdown (App Insights) for the CALLER's
+    tenant, grouped by model (default) or api/endpoint, split by token type
+    (total / prompt / cached / completion / reasoning), plus a total-token trend.
+
+    App Insights metering covers BOTH streaming and non-streaming calls, so this
+    reflects true token consumption (the Cosmos call log skips SSE)."""
+    key_ids = _tenant_key_ids(db, tenant_id)
+    return _usage_breakdown_payload(key_ids, hours=hours, by=by)
+
+
+@router.get("/admin/usage/{tenant_id}/breakdown")
+def tenant_usage_breakdown(
+    tenant_id: str,
+    hours: int = 24,
+    by: str = "model",
+    _: Principal = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Platform admin: token breakdown for an explicitly named tenant."""
+    key_ids = _tenant_key_ids(db, tenant_id)
+    return _usage_breakdown_payload(key_ids, hours=hours, by=by)
+
+
+@router.get("/admin/usage-breakdown")
+def platform_usage_breakdown(
+    hours: int = 24,
+    by: str = "model",
+    _: Principal = Depends(require_admin),
+) -> dict[str, Any]:
+    """Platform admin: token breakdown across ALL keys/tenants (no subscription
+    filter). Useful for the platform dashboard's per-model view."""
+    return _usage_breakdown_payload(None, hours=hours, by=by)

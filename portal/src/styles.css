@@ -325,6 +325,37 @@ tbody tr:hover {
   white-space: nowrap;
 }
 
+/* KPI tiles for the token breakdown (Total / Prompt / Cached / Completion /
+   Reasoning). Wraps on narrow screens; each tile reuses the card surface. */
+.stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 0.6rem 0 1rem;
+}
+
+.stat {
+  flex: 1 1 120px;
+  padding: 0.7rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.stat-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.stat-value {
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
 code {
   font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
   font-size: 0.85em;

@@ -158,6 +158,32 @@ export interface UsageTelemetry {
   by_hour: Array<{ ts: string; calls: number }>;
 }
 
+// Per-model (or per-endpoint) token breakdown from App Insights metering.
+// Covers streaming + non-streaming. Each group carries the five token types;
+// `trend` is a zero-filled total-token time series.
+export interface TokenGroup {
+  model?: string;
+  api?: string;
+  total: number;
+  prompt: number;
+  cached: number;
+  completion: number;
+  reasoning: number;
+}
+export interface UsageBreakdown {
+  by: "model" | "api";
+  hours: number;
+  groups: TokenGroup[];
+  trend: Array<{ ts: string; tokens: number }>;
+  totals: {
+    total: number;
+    prompt: number;
+    cached: number;
+    completion: number;
+    reasoning: number;
+  };
+}
+
 async function request<T>(
   path: string,
   token: string,
@@ -291,6 +317,25 @@ export const api = {
     ),
   usageTelemetry: (token: string) =>
     request<UsageTelemetry>("/admin/usage-telemetry", token),
+  usageBreakdown: (
+    token: string,
+    tenantId: string,
+    hours = 24,
+    by: "model" | "api" = "model",
+  ) =>
+    request<UsageBreakdown>(
+      `/admin/usage/${tenantId}/breakdown?hours=${hours}&by=${by}`,
+      token,
+    ),
+  platformUsageBreakdown: (
+    token: string,
+    hours = 24,
+    by: "model" | "api" = "model",
+  ) =>
+    request<UsageBreakdown>(
+      `/admin/usage-breakdown?hours=${hours}&by=${by}`,
+      token,
+    ),
   listUsers: (token: string) => request<User[]>("/users", token),
   createUser: (
     token: string,

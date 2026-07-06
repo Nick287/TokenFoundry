@@ -248,21 +248,105 @@ class AppInsightsUsage:
         table = response.tables[0]
         return [dict(zip(table.columns, row, strict=False)) for row in table.rows]
 
-    def token_usage_by_tenant(self, days: int = 1) -> list[dict]:
-        if self._client is None:
-            return []
-        kql = """
-        customMetrics
-        | where name == 'llm-total-tokens'
-        | extend tenant = tostring(customDimensions['tenant'])
-        | extend route = tostring(customDimensions['route'])
-        | summarize tokens = sum(value) by tenant, route
-        """
-        response = self._client.query_resource(
-            self._resource_id, kql, timespan=timedelta(days=days)
+    # App Insights custom-metric names emitted by APIM's llm-emit-token-metric
+    # (verified live on dev-a03, StandardV2). Mapped to short, provider-neutral
+    # keys the API/portal use. `value`/`valueSum` on customMetrics holds the token
+    # count; we sum valueSum. Dimensions available: subscription (virtual key id),
+    # api (llm-<provider>), model (request body's model, e.g. claude-opus-4.8).
+    _TOKEN_METRICS = {
+        "total": "Total Tokens",
+        "prompt": "Prompt Tokens",
+        "cached": "Prompt Cached Tokens",
+        "completion": "Completion Tokens",
+        "reasoning": "Completion Reasoning Tokens",
+    }
+
+    @staticmethod
+    def _sub_filter(subscription_ids: list[str] | None) -> str:
+        """KQL fragment restricting to a set of virtual-key ids (the `subscription`
+        dimension). Empty/None → no filter (admin, all keys). Ids are our own
+        opaque `vk_...`/GUID strings (no user input), quoted into a dynamic set."""
+        if not subscription_ids:
+            return ""
+        quoted = ", ".join(f'"{s}"' for s in subscription_ids)
+        return (
+            "| extend subscription = tostring(customDimensions['subscription']) "
+            f"| where subscription in ({quoted}) "
         )
-        if response.status != LogsQueryStatus.SUCCESS or not response.tables:
-            logger.warning("KQL usage query returned no data: %s", response.status)
+
+    def _metric_names_kql(self) -> str:
+        """`name in (...)` fragment covering exactly the token metrics we surface."""
+        quoted = ", ".join(f'"{m}"' for m in self._TOKEN_METRICS.values())
+        return f"| where name in ({quoted}) "
+
+    def token_usage_breakdown(
+        self,
+        subscription_ids: list[str] | None = None,
+        hours: int = 24,
+        by_model: bool = True,
+    ) -> list[dict]:
+        """Per-(model, token-type) token totals from App Insights customMetrics.
+
+        Covers BOTH streaming and non-streaming calls (llm-emit-token-metric runs
+        inside the pipeline, independent of the Cosmos write which skips SSE).
+
+        Returns rows shaped: {"model", "api", "total", "prompt", "cached",
+        "completion", "reasoning"} — one row per model (or per api when
+        by_model=False). Restricted to `subscription_ids` when given (a tenant's
+        keys); unrestricted for admin. [] if App Insights isn't configured.
+        """
+        if self._client is None or not self._resource_id:
             return []
-        table = response.tables[0]
-        return [dict(zip(table.columns, row, strict=False)) for row in table.rows]
+        group = "model" if by_model else "api"
+        kql = (
+            "customMetrics "
+            + self._metric_names_kql()
+            + self._sub_filter(subscription_ids)
+            + "| extend model = tostring(customDimensions['model']), "
+            "api = tostring(customDimensions['api']) "
+            f"| summarize tokens = sum(valueSum) by metric = name, {group} "
+            f"| order by {group} asc"
+        )
+        rows = self._run_kql(kql, hours)
+        # Pivot the (metric, group)->tokens long form into one dict per group value.
+        name_to_key = {v: k for k, v in self._TOKEN_METRICS.items()}
+        out: dict[str, dict] = {}
+        for r in rows:
+            g = r.get(group) or "unknown"
+            bucket = out.setdefault(
+                g,
+                {group: g, "total": 0, "prompt": 0, "cached": 0,
+                 "completion": 0, "reasoning": 0},
+            )
+            key = name_to_key.get(r.get("metric", ""))
+            if key:
+                bucket[key] = int(r.get("tokens", 0) or 0)
+        return sorted(out.values(), key=lambda d: d.get("total", 0), reverse=True)
+
+    def token_usage_trend(
+        self,
+        subscription_ids: list[str] | None = None,
+        hours: int = 24,
+        bucket_minutes: int = 60,
+    ) -> list[dict]:
+        """Total-token time series (zero-filled) for the trend chart.
+
+        make-series zero-fills empty buckets so the chart is a continuous timeline
+        rather than isolated spikes. Returns [{"ts", "tokens"}] oldest→newest.
+        """
+        if self._client is None or not self._resource_id:
+            return []
+        step = f"{bucket_minutes}m"
+        kql = (
+            "customMetrics "
+            '| where name == "Total Tokens" '
+            + self._sub_filter(subscription_ids)
+            + "| make-series tokens = sum(valueSum) default = 0 "
+            f"on timestamp from ago({hours}h) to now() step {step} "
+            "| mv-expand timestamp to typeof(datetime), tokens to typeof(long) "
+            "| order by timestamp asc"
+        )
+        return [
+            {"ts": str(r.get("timestamp")), "tokens": int(r.get("tokens", 0) or 0)}
+            for r in self._run_kql(kql, hours)
+        ]

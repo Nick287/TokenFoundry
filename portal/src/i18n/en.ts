@@ -237,6 +237,18 @@ export const en = {
     colFailures: "Failures",
     trendSection: "Calls per hour",
     noTelemetry: "No telemetry (App Insights not configured or no calls yet).",
+    breakdownSection: "Token breakdown by model — from App Insights",
+    breakdownHint:
+      "Token metering from APIM (covers streaming + non-streaming). Split by model and token type.",
+    colEndpoint: "Endpoint",
+    modelUnknown: "(unlabeled)",
+    tokTotal: "Total",
+    tokPrompt: "Prompt",
+    tokCached: "Cached",
+    tokCompletion: "Completion",
+    tokReasoning: "Reasoning",
+    tokTrendSection: "Tokens over time",
+    noBreakdown: "No token metrics yet for this tenant (or App Insights not configured).",
   },
   users: {
     title: "Users",
