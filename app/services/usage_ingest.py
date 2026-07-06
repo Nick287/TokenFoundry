@@ -279,32 +279,45 @@ class AppInsightsUsage:
         quoted = ", ".join(f'"{m}"' for m in self._TOKEN_METRICS.values())
         return f"| where name in ({quoted}) "
 
+    # Dimensions the breakdown can group by → the customDimensions key each maps
+    # to. All three are emitted by llm-emit-token-metric.
+    _GROUP_DIMS = {
+        "model": "model",
+        "api": "api",
+        "subscription": "subscription",
+    }
+
     def token_usage_breakdown(
         self,
         subscription_ids: list[str] | None = None,
         hours: int = 24,
-        by_model: bool = True,
+        group_by: str = "model",
     ) -> list[dict]:
-        """Per-(model, token-type) token totals from App Insights customMetrics.
+        """Per-group, per-token-type token totals from App Insights customMetrics.
 
         Covers BOTH streaming and non-streaming calls (llm-emit-token-metric runs
         inside the pipeline, independent of the Cosmos write which skips SSE).
 
-        Returns rows shaped: {"model", "api", "total", "prompt", "cached",
-        "completion", "reasoning"} — one row per model (or per api when
-        by_model=False). Restricted to `subscription_ids` when given (a tenant's
-        keys); unrestricted for admin. [] if App Insights isn't configured.
+        `group_by` is one of "model" (default), "api" (endpoint), or
+        "subscription" (virtual key). Each returned row is shaped
+        {"<group>", "total", "prompt", "cached", "completion", "reasoning",
+        "calls"} — one row per group value. `calls` is the metered call count
+        (sum of valueCount on the Total Tokens metric). Restricted to
+        `subscription_ids` when given (a tenant's keys); unrestricted for admin.
+        [] if App Insights isn't configured or group_by is unknown.
         """
         if self._client is None or not self._resource_id:
             return []
-        group = "model" if by_model else "api"
+        group = self._GROUP_DIMS.get(group_by)
+        if not group:
+            return []
         kql = (
             "customMetrics "
             + self._metric_names_kql()
             + self._sub_filter(subscription_ids)
-            + "| extend model = tostring(customDimensions['model']), "
-            "api = tostring(customDimensions['api']) "
-            f"| summarize tokens = sum(valueSum) by metric = name, {group} "
+            + f"| extend {group} = tostring(customDimensions['{group}']) "
+            f"| summarize tokens = sum(valueSum), calls = sum(valueCount) "
+            f"by metric = name, {group} "
             f"| order by {group} asc"
         )
         rows = self._run_kql(kql, hours)
@@ -316,11 +329,14 @@ class AppInsightsUsage:
             bucket = out.setdefault(
                 g,
                 {group: g, "total": 0, "prompt": 0, "cached": 0,
-                 "completion": 0, "reasoning": 0},
+                 "completion": 0, "reasoning": 0, "calls": 0},
             )
             key = name_to_key.get(r.get("metric", ""))
             if key:
                 bucket[key] = int(r.get("tokens", 0) or 0)
+            # calls is emitted per metric row; take it from the Total Tokens row.
+            if r.get("metric") == "Total Tokens":
+                bucket["calls"] = int(r.get("calls", 0) or 0)
         return sorted(out.values(), key=lambda d: d.get("total", 0), reverse=True)
 
     def token_usage_trend(
@@ -329,10 +345,16 @@ class AppInsightsUsage:
         hours: int = 24,
         bucket_minutes: int = 60,
     ) -> list[dict]:
-        """Total-token time series (zero-filled) for the trend chart.
+        """Token + call time series (zero-filled) for the dual-line trend chart.
 
-        make-series zero-fills empty buckets so the chart is a continuous timeline
-        rather than isolated spikes. Returns [{"ts", "tokens"}] oldest→newest.
+        BOTH series come from the SAME customMetrics rows so they're perfectly
+        aligned on the same buckets and share the same subscription filter:
+          * tokens = sum(valueSum)   — total tokens per bucket
+          * calls  = sum(valueCount) — number of metered calls per bucket
+            (valueCount is App Insights' measurement count; verified on dev-a03 to
+            equal the metered call count — i.e. calls that produced a usage record)
+        make-series zero-fills empty buckets so the timeline is continuous.
+        Returns [{"ts", "tokens", "calls"}] oldest→newest.
         """
         if self._client is None or not self._resource_id:
             return []
@@ -341,12 +363,18 @@ class AppInsightsUsage:
             "customMetrics "
             '| where name == "Total Tokens" '
             + self._sub_filter(subscription_ids)
-            + "| make-series tokens = sum(valueSum) default = 0 "
+            + "| make-series tokens = sum(valueSum) default = 0, "
+            "calls = sum(valueCount) default = 0 "
             f"on timestamp from ago({hours}h) to now() step {step} "
-            "| mv-expand timestamp to typeof(datetime), tokens to typeof(long) "
+            "| mv-expand timestamp to typeof(datetime), "
+            "tokens to typeof(long), calls to typeof(long) "
             "| order by timestamp asc"
         )
         return [
-            {"ts": str(r.get("timestamp")), "tokens": int(r.get("tokens", 0) or 0)}
+            {
+                "ts": str(r.get("timestamp")),
+                "tokens": int(r.get("tokens", 0) or 0),
+                "calls": int(r.get("calls", 0) or 0),
+            }
             for r in self._run_kql(kql, hours)
         ]

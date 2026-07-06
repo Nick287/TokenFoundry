@@ -356,6 +356,112 @@ tbody tr:hover {
   font-variant-numeric: tabular-nums;
 }
 
+/* Segmented toggle for the breakdown grouping (model / endpoint / key). */
+.seg-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  margin: 0.2rem 0 0.8rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.seg-btn {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 0.35rem 0.85rem;
+  font-size: 0.85rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.seg-btn:hover {
+  color: var(--ink);
+}
+
+.seg-on {
+  background: var(--accent);
+  color: #fff;
+}
+
+.seg-on:hover {
+  color: #fff;
+}
+
+/* Dual-line chart: tokens (accent) + calls (a contrasting hue) on one plot. */
+.dual-chart {
+  padding: 0.9rem 1.1rem 0.7rem;
+}
+
+.dual-legend {
+  display: flex;
+  gap: 1.2rem;
+  font-size: 0.78rem;
+  margin-bottom: 0.4rem;
+}
+
+.dual-plot {
+  width: 100%;
+  height: 150px;
+  overflow: visible;
+}
+
+.dual-line-tokens {
+  stroke: var(--accent);
+  stroke-width: 0.6;
+  vector-effect: non-scaling-stroke;
+}
+
+.dual-line-calls {
+  stroke: #c9770d;
+  stroke-width: 0.6;
+  stroke-dasharray: 2 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.dual-dot-tokens {
+  fill: var(--accent);
+}
+
+.dual-dot-calls {
+  fill: #c9770d;
+}
+
+.dual-key-tokens {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.dual-key-calls {
+  color: #c9770d;
+  font-weight: 600;
+}
+
+.dual-axis {
+  display: flex;
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+}
+
+.dual-tick {
+  flex: 1 1 0;
+  min-width: 0;
+  text-align: center;
+  font-size: 0.65rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.dual-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.68rem;
+  margin-top: 0.35rem;
+}
+
 code {
   font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
   font-size: 0.85em;

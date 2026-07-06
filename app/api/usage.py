@@ -120,20 +120,24 @@ def _usage_breakdown_payload(
     """Shared shape for the breakdown endpoints: per-group token split + trend.
 
     `key_ids` restricts to a tenant's virtual keys; None = platform-wide (admin).
-    `by` selects the grouping dimension: "model" (default) or "api"/"endpoint".
-    Returns {"by": ..., "groups": [...], "trend": [...], "totals": {...}} where
-    each group has total/prompt/cached/completion/reasoning token counts.
+    `by` selects the grouping dimension: "model" (default), "api"/"endpoint", or
+    "subscription" (virtual key). Returns {"by", "hours", "groups", "trend",
+    "totals"} where each group has total/prompt/cached/completion/reasoning token
+    counts + calls, and trend carries per-bucket tokens + calls (dual-line chart).
     """
     ai = AppInsightsUsage()
-    by_model = by not in ("api", "endpoint")
-    groups = ai.token_usage_breakdown(key_ids, hours=hours, by_model=by_model)
+    # Normalize the requested grouping to a canonical dimension name.
+    group_by = {"endpoint": "api"}.get(by, by)
+    if group_by not in ("model", "api", "subscription"):
+        group_by = "model"
+    groups = ai.token_usage_breakdown(key_ids, hours=hours, group_by=group_by)
     trend = ai.token_usage_trend(key_ids, hours=hours)
     totals = {
         k: sum(int(g.get(k, 0) or 0) for g in groups)
-        for k in ("total", "prompt", "cached", "completion", "reasoning")
+        for k in ("total", "prompt", "cached", "completion", "reasoning", "calls")
     }
     return {
-        "by": "model" if by_model else "api",
+        "by": group_by,
         "hours": hours,
         "groups": groups,
         "trend": trend,

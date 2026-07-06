@@ -51,44 +51,63 @@ function TrendBars({ data }: { data: UsageTelemetry["by_hour"] }) {
   );
 }
 
-// Total-token time series (mirrors TrendBars but for the token trend from the
-// breakdown endpoint). Same zero-fill/trim treatment so a late spike isn't
-// crushed against empty leading buckets.
-function TokenTrendBars({ data }: { data: Array<{ ts: string; tokens: number }> }) {
-  const first = data.findIndex((d) => d.tokens > 0);
-  const start = first < 0 ? Math.max(0, data.length - 6) : Math.max(0, Math.min(first - 1, data.length - 6));
+// Dual-line chart: tokens + calls over time, on ONE plot with two y-scales
+// (each series normalized to its own max so both are readable despite very
+// different magnitudes). CSS/SVG only, no chart lib. Both series come from the
+// same customMetrics buckets so they're aligned. Trims leading empty buckets.
+function DualLineChart({
+  data,
+}: {
+  data: Array<{ ts: string; tokens: number; calls: number }>;
+}) {
+  const { t } = useTranslation();
+  const firstTok = data.findIndex((d) => d.tokens > 0 || d.calls > 0);
+  const start =
+    firstTok < 0
+      ? Math.max(0, data.length - 6)
+      : Math.max(0, Math.min(firstTok - 1, data.length - 6));
   const shown = data.slice(start);
-  const max = Math.max(1, ...shown.map((d) => d.tokens));
+  if (shown.length === 0) return null;
+  const maxTok = Math.max(1, ...shown.map((d) => d.tokens));
+  const maxCall = Math.max(1, ...shown.map((d) => d.calls));
+  const W = 100; // viewBox width units
+  const H = 40; // viewBox height units
+  const n = shown.length;
+  const x = (i: number) => (n === 1 ? 0 : (i / (n - 1)) * W);
+  const yTok = (v: number) => H - (v / maxTok) * (H - 4) - 2;
+  const yCall = (v: number) => H - (v / maxCall) * (H - 4) - 2;
+  const line = (accessor: (d: (typeof shown)[number]) => number) =>
+    shown.map((d, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${accessor(d).toFixed(1)}`).join(" ");
   const fmtHour = (ts: string) =>
     new Date(ts).toLocaleTimeString([], { hour: "2-digit", hour12: false });
-  const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
+  const fmtK = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : `${v}`);
   return (
-    <div className="trend card">
-      <div className="trend-plot">
-        {shown.map((d) => {
-          const pct = d.tokens === 0 ? 2 : Math.max(8, (d.tokens / max) * 85);
-          return (
-            <div
-              className="trend-col"
-              key={d.ts}
-              title={`${new Date(d.ts).toLocaleString()} — ${d.tokens.toLocaleString()}`}
-            >
-              {d.tokens > 0 && <span className="trend-val">{fmt(d.tokens)}</span>}
-              <div
-                className="trend-bar"
-                style={{ height: `${pct}%` }}
-                data-zero={d.tokens === 0 ? "" : undefined}
-              />
-            </div>
-          );
-        })}
+    <div className="dual-chart card">
+      <div className="dual-legend">
+        <span className="dual-key dual-key-tokens">■ {t("usage.tokTrendSeries")}</span>
+        <span className="dual-key dual-key-calls">■ {t("usage.callTrendSeries")}</span>
       </div>
-      <div className="trend-axis">
+      <svg className="dual-plot" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        <path className="dual-line-tokens" d={line((d) => yTok(d.tokens))} fill="none" />
+        <path className="dual-line-calls" d={line((d) => yCall(d.calls))} fill="none" />
         {shown.map((d, i) => (
-          <span className="trend-tick" key={d.ts}>
+          <g key={d.ts}>
+            {d.tokens > 0 && <circle className="dual-dot-tokens" cx={x(i)} cy={yTok(d.tokens)} r={0.7} />}
+            {d.calls > 0 && <circle className="dual-dot-calls" cx={x(i)} cy={yCall(d.calls)} r={0.7} />}
+            <title>{`${new Date(d.ts).toLocaleString()}\n${t("usage.tokTrendSeries")}: ${d.tokens.toLocaleString()}\n${t("usage.callTrendSeries")}: ${d.calls.toLocaleString()}`}</title>
+          </g>
+        ))}
+      </svg>
+      <div className="dual-axis">
+        {shown.map((d, i) => (
+          <span className="dual-tick" key={d.ts}>
             {i % 4 === 0 ? fmtHour(d.ts) : ""}
           </span>
         ))}
+      </div>
+      <div className="dual-scale">
+        <span className="dual-key-tokens">{t("usage.tokTrendSeries")} · max {fmtK(maxTok)}</span>
+        <span className="dual-key-calls">{t("usage.callTrendSeries")} · max {maxCall}</span>
       </div>
     </div>
   );
@@ -104,6 +123,7 @@ export function UsageDashboardPage() {
   const [tenantId, setTenantId] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(15);
+  const [groupBy, setGroupBy] = useState<"model" | "api" | "subscription">("model");
   const PAGE_SIZE_OPTIONS = [10, 15, 20];
 
   const tenants = useQuery({
@@ -130,9 +150,10 @@ export function UsageDashboardPage() {
   });
 
   const breakdown = useQuery({
-    queryKey: ["admin-usage-breakdown", tenantId],
-    queryFn: () => api.usageBreakdown(principal.token, tenantId),
+    queryKey: ["admin-usage-breakdown", tenantId, groupBy],
+    queryFn: () => api.usageBreakdown(principal.token, tenantId, 24, groupBy),
     enabled: tenantId.length > 0,
+    placeholderData: keepPreviousData,
   });
 
   return (
@@ -249,9 +270,22 @@ export function UsageDashboardPage() {
             <p className="hint">{t("usage.noRecords")}</p>
           )}
 
-          {/* --- Token breakdown by model (App Insights metering) --- */}
+          {/* --- Token breakdown (App Insights metering): group by model /
+                 endpoint / subscription, split by token type, + dual trend. --- */}
           <h3>{t("usage.breakdownSection")}</h3>
           <p className="hint">{t("usage.breakdownHint")}</p>
+          <div className="seg-toggle">
+            {(["model", "api", "subscription"] as const).map((g) => (
+              <button
+                key={g}
+                type="button"
+                className={groupBy === g ? "seg-btn seg-on" : "seg-btn"}
+                onClick={() => setGroupBy(g)}
+              >
+                {t(`usage.groupBy_${g}`)}
+              </button>
+            ))}
+          </div>
           {breakdown.isLoading ? (
             <p>{t("common.loading")}</p>
           ) : breakdown.data && breakdown.data.groups.length > 0 ? (
@@ -277,41 +311,54 @@ export function UsageDashboardPage() {
                   <span className="stat-label">{t("usage.tokReasoning")}</span>
                   <span className="stat-value">{breakdown.data.totals.reasoning.toLocaleString()}</span>
                 </div>
+                <div className="stat card">
+                  <span className="stat-label">{t("usage.callsLabel")}</span>
+                  <span className="stat-value">{breakdown.data.totals.calls.toLocaleString()}</span>
+                </div>
               </div>
               <div className="table-scroll">
                 <table className="card">
                   <thead>
                     <tr>
-                      <th>{t("usage.colModel")}</th>
-                      <th>{t("usage.colEndpoint")}</th>
+                      <th>{t(`usage.groupBy_${breakdown.data.by}`)}</th>
                       <th>{t("usage.tokTotal")}</th>
                       <th>{t("usage.tokPrompt")}</th>
                       <th>{t("usage.tokCached")}</th>
                       <th>{t("usage.tokCompletion")}</th>
                       <th>{t("usage.tokReasoning")}</th>
+                      <th>{t("usage.callsLabel")}</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {breakdown.data.groups.map((g) => (
-                      <tr key={`${g.model ?? g.api}`}>
-                        <td>{g.model || t("usage.modelUnknown")}</td>
-                        <td>{g.api ?? "—"}</td>
-                        <td>{g.total.toLocaleString()}</td>
-                        <td>{g.prompt.toLocaleString()}</td>
-                        <td>{g.cached.toLocaleString()}</td>
-                        <td>{g.completion.toLocaleString()}</td>
-                        <td className={g.reasoning > 0 ? undefined : "cell-zero"}>
-                          {g.reasoning.toLocaleString()}
-                        </td>
-                      </tr>
-                    ))}
+                    {breakdown.data.groups.map((g) => {
+                      const label = g.model ?? g.api ?? g.subscription;
+                      return (
+                        <tr key={label ?? "unknown"}>
+                          <td>
+                            {breakdown.data!.by === "subscription" ? (
+                              <code className="id-cell">{label || t("usage.modelUnknown")}</code>
+                            ) : (
+                              label || t("usage.modelUnknown")
+                            )}
+                          </td>
+                          <td>{g.total.toLocaleString()}</td>
+                          <td>{g.prompt.toLocaleString()}</td>
+                          <td>{g.cached.toLocaleString()}</td>
+                          <td>{g.completion.toLocaleString()}</td>
+                          <td className={g.reasoning > 0 ? undefined : "cell-zero"}>
+                            {g.reasoning.toLocaleString()}
+                          </td>
+                          <td>{g.calls.toLocaleString()}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
-              {breakdown.data.trend.some((d) => d.tokens > 0) && (
+              {breakdown.data.trend.some((d) => d.tokens > 0 || d.calls > 0) && (
                 <>
                   <h4>{t("usage.tokTrendSection")}</h4>
-                  <TokenTrendBars data={breakdown.data.trend} />
+                  <DualLineChart data={breakdown.data.trend} />
                 </>
               )}
             </>
