@@ -67,11 +67,8 @@ variable "publisher_name" {
   default     = "Token Foundry"
 }
 
-variable "backend_urls" {
-  description = "Example backend endpoints to pool in APIM. Replace/extend at runtime via the provisioner."
-  type        = list(string)
-  default = [
-    "https://example-aoai-1.openai.azure.com/openai",
-    "https://example-aoai-2.openai.azure.com/openai",
-  ]
+variable "apim_sku" {
+  description = "APIM SKU. Default Developer_1 (classic, dev). Set a v2 tier (StandardV2_1 / BasicV2_1) for native Anthropic Messages API token metering (v2-only)."
+  type        = string
+  default     = "Developer_1"
 }

@@ -102,14 +102,7 @@ module "apim" {
   app_insights_connection_string = module.monitor.app_insights_connection_string
   cosmos_account_name            = module.cosmos.account_name
   cosmos_account_id              = module.cosmos.account_id
-}
-
-# --- Model backends: pool + circuit breaker (preview API version, via azapi) ---
-module "apim_backends" {
-  source = "./modules/apim-backends"
-
-  apim_id      = module.apim.apim_id
-  backend_urls = var.backend_urls
+  sku_name                       = var.apim_sku
 }
 
 # --- App secrets in Key Vault (DB connection string, JWT secret, admin pwd) ---

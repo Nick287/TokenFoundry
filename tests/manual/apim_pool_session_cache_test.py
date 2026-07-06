@@ -175,10 +175,20 @@ def decode_backend(cookie_val: str) -> str:
 def build_body(fmt: str, model: str, prefix: str, history: list[dict], turn: int) -> dict:
     user_msg = f"(turn {turn}) Reply with a short sentence."
     if fmt == "messages":
+        # Anthropic prompt caching is EXPLICIT: unlike OpenAI/Google (implicit,
+        # any long-enough prefix auto-caches), Claude only caches content marked
+        # with a cache_control breakpoint. So the system prompt is sent as a
+        # structured block with cache_control=ephemeral — without it,
+        # cache_read_input_tokens stays 0 even for a large identical prefix.
+        # (Copilot's hub now passes /v1/messages through natively, so this is real
+        # Anthropic caching, not the implicit OpenAI cache the old conversion used.)
         return {
             "model": model,
             "max_tokens": 256,
-            "system": prefix,
+            "system": [
+                {"type": "text", "text": prefix,
+                 "cache_control": {"type": "ephemeral"}}
+            ],
             "messages": history + [{"role": "user", "content": user_msg}],
         }
     if fmt == "responses":
@@ -201,11 +211,26 @@ def build_body(fmt: str, model: str, prefix: str, history: list[dict], turn: int
 
 
 def read_usage(fmt: str, data: dict) -> tuple[int, int]:
-    """Return (prompt_tokens, cached_tokens) normalized across formats."""
+    """Return (total_prompt_tokens, cached_tokens) normalized across formats.
+
+    `prompt` is normalized to the TOTAL input tokens (cache included) so the
+    HIT% = cached/prompt formula is comparable across providers.
+
+    ⚠️ Anthropic vs OpenAI/Google differ in what the base field counts:
+      * OpenAI/Google: prompt_tokens INCLUDES cached tokens (cached is a subset),
+        so prompt is used as-is.
+      * Anthropic: input_tokens EXCLUDES cache. Cache-read tokens live in
+        cache_read_input_tokens and first-write tokens in
+        cache_creation_input_tokens. So total input = input_tokens +
+        cache_read_input_tokens + cache_creation_input_tokens. Without this,
+        cached/input_tokens overshoots 100% (e.g. 2061/60 = 3435%).
+    """
     u = data.get("usage", {}) or {}
     if fmt == "messages":
-        prompt = u.get("input_tokens", 0) or 0
+        base = u.get("input_tokens", 0) or 0
         cached = u.get("cache_read_input_tokens", 0) or 0
+        creation = u.get("cache_creation_input_tokens", 0) or 0
+        prompt = base + cached + creation
     elif fmt == "responses":
         prompt = u.get("input_tokens", 0) or 0
         cached = (u.get("input_tokens_details") or {}).get("cached_tokens", 0) or 0

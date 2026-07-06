@@ -2,6 +2,16 @@
 # Developer SKU for MVP; system-assigned identity used to reach AI backends and
 # to be granted Cosmos data-plane write on the usage container.
 
+terraform {
+  required_providers {
+    # azapi is used to patch the diagnostic `metrics` flag that azurerm doesn't
+    # expose (required for llm-emit-token-metric to emit custom token metrics).
+    azapi = {
+      source = "Azure/azapi"
+    }
+  }
+}
+
 variable "name_prefix" { type = string }
 variable "location" { type = string }
 variable "tags" { type = map(string) }
@@ -17,6 +27,14 @@ variable "app_insights_connection_string" {
 # Cosmos DB — APIM writes usage records directly (outbound policy, MI auth).
 variable "cosmos_account_name" { type = string }
 variable "cosmos_account_id" { type = string }
+# APIM SKU. Default Developer_1 (classic, MVP/dev). Set to a v2 tier
+# (e.g. "StandardV2_1", "BasicV2_1") for native Anthropic Messages API token
+# metering — llm-emit-token-metric only understands the Anthropic response
+# schema on v2 tiers (see docs/APIM-LLM-Gateway.md §4.6).
+variable "sku_name" {
+  type    = string
+  default = "Developer_1"
+}
 
 resource "azurerm_api_management" "apim" {
   name                = substr("${var.name_prefix}-apim-${var.suffix}", 0, 50)
@@ -25,8 +43,9 @@ resource "azurerm_api_management" "apim" {
   tags                = var.tags
   publisher_email     = var.publisher_email
   publisher_name      = var.publisher_name
-  # azurerm packs <tier>_<capacity>: Developer SKU, capacity 1.
-  sku_name = "Developer_1"
+  # azurerm packs <tier>_<capacity>: Developer SKU capacity 1 by default; a v2
+  # tier (StandardV2_1 / BasicV2_1) is passed in for native Anthropic metering.
+  sku_name = var.sku_name
 
   identity {
     type = "SystemAssigned"
@@ -54,12 +73,17 @@ resource "azurerm_api_management_logger" "appinsights" {
 
 # Service-level diagnostic: this is what actually emits per-request telemetry
 # (requests + backend dependencies) to the logger above. Without a diagnostic,
-# APIM sends the custom token metric but NOT request/latency logs.
+# APIM sends NEITHER request/latency logs NOR the custom token metrics.
 #
 # sampling_percentage 100 -> every request logged (right for MVP/debugging).
 # Lower it (5-20) at scale to cut Log Analytics ingestion cost; latency
 # percentiles stay accurate, you just lose the ability to find one specific
-# request's trace. Has NO effect on token billing (separate custom-metric path).
+# request's trace.
+#
+# metrics = true is REQUIRED for llm-emit-token-metric to actually emit token
+# custom metrics to App Insights (customMetrics table). Without it the diagnostic
+# defaults metrics=null and every token metric is silently dropped — verified on
+# dev-a02 (requests logged, customMetrics empty) before this was added.
 resource "azurerm_api_management_diagnostic" "appinsights" {
   # Must be this exact identifier to bind to App Insights.
   identifier               = "applicationinsights"
@@ -71,6 +95,28 @@ resource "azurerm_api_management_diagnostic" "appinsights" {
   always_log_errors         = true
   verbosity                 = "information"
   http_correlation_protocol = "W3C"
+}
+
+# azurerm_api_management_diagnostic does NOT expose the `metrics` flag, but
+# llm-emit-token-metric REQUIRES it (verified on dev-a02: requests logged but
+# customMetrics empty until metrics=true was PATCHed in). Patch it via azapi,
+# preserving the settings azurerm wrote above.
+resource "azapi_update_resource" "diagnostic_metrics" {
+  type        = "Microsoft.ApiManagement/service/diagnostics@2022-08-01"
+  resource_id = azurerm_api_management_diagnostic.appinsights.id
+  body = {
+    properties = {
+      loggerId                = azurerm_api_management_logger.appinsights.id
+      metrics                 = true
+      alwaysLog               = "allErrors"
+      verbosity               = "information"
+      httpCorrelationProtocol = "W3C"
+      sampling = {
+        samplingType = "fixed"
+        percentage   = 100
+      }
+    }
+  }
 }
 
 # Grant APIM's system identity Cosmos DB data-plane write access. The outbound
