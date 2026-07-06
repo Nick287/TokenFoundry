@@ -96,6 +96,43 @@ def test_policy_emits_model_dimension():
         assert "preserveContent:true" in xml
 
 
+def test_policy_emits_usage_trace_alongside_cosmos():
+    """The outbound policy emits a per-call `trace` (log-class telemetry, not
+    pre-aggregated) carrying requestId/model/subscription/api + usage — IN
+    ADDITION to the Cosmos write, not replacing it. Verified on dev-a03: 5
+    non-stream calls -> 5 traces with full usage, itemCount=1 (no sampling)."""
+    p = _provisioner()
+    for provider in ("openai", "anthropic", "google"):
+        xml = p._build_provider_policy("be-1", provider)
+        # trace present with our source + per-call fields
+        assert '<trace source="tokenfoundry-usage"' in xml
+        assert 'name="requestId"' in xml
+        assert 'name="usage"' in xml
+        # Cosmos write is STILL there (trace augments, does not replace it)
+        assert "send-one-way-request" in xml
+        # trace fires before the Cosmos write in outbound
+        assert xml.index("tokenfoundry-usage") < xml.index("send-one-way-request")
+
+
+def test_breaker_rules_cover_5xx_and_upstream_429():
+    """Azure allows exactly ONE circuit-breaker rule per backend, but its
+    failureCondition can list multiple status ranges. The single rule trips on a
+    SINGLE upstream 429 (out of TPM -> failover) OR a single 5xx (unhealthy),
+    with a short 60s trip. Our own per-key llm-token-limit 429 is rejected in
+    inbound and never reaches the backend, so it can't trip this."""
+    rules = ApimProvisioner._breaker_rules()
+    # Azure hard limit: exactly one rule.
+    assert len(rules) == 1
+    rule = rules[0]
+    ranges = {(r.min, r.max) for r in rule.failure_condition.status_code_ranges}
+    # covers both upstream 429 and 5xx in the one rule
+    assert (429, 429) in ranges
+    assert (500, 599) in ranges
+    # a single strike trips it, for a short 60s eject (transient limiter)
+    assert rule.failure_condition.count == 1
+    assert rule.trip_duration.total_seconds() <= 300
+
+
 # --- per-key token limits: TPM expression + quota <choose> tiers -------------
 
 

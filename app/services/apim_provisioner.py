@@ -196,6 +196,35 @@ class ApimProvisioner:
         'catch { return &quot;unknown&quot;; } }" />'
     )
 
+    # Per-call usage log as an App Insights `trace` (LOG-class telemetry: not
+    # pre-aggregated, so every call is retained — unlike llm-emit-token-metric,
+    # which pre-aggregates and drops rows). Emitted in OUTBOUND alongside — NOT
+    # replacing — the Cosmos write, so both the durable billing store (Cosmos,
+    # permanent) and the queryable per-call log (traces, ~30d) are populated.
+    #
+    # severity=information matches the diagnostic verbosity. requestId/model/
+    # subscription/api come from context and always populate. `usage` reads the
+    # response body best-effort: on a NON-STREAM response it's the full usage JSON
+    # (input/output/cache tokens); on an SSE stream the body isn't a JObject so it
+    # degrades to "BODY_READ_FAILED" (same limitation as the Cosmos write — SSE
+    # token accounting rides on llm-emit-token-metric instead). Verified on
+    # dev-a03: 5 non-stream calls => 5 traces with full usage; itemCount=1 (no
+    # sampling). No reflection in the expression (APIM rejects it).
+    _USAGE_TRACE = (
+        '<trace source="tokenfoundry-usage" severity="information">'
+        '<message>@("llm-usage " + context.Api.Id + " " + context.RequestId)</message>'
+        '<metadata name="requestId" value="@(context.RequestId.ToString())" />'
+        '<metadata name="api" value="@(context.Api.Id)" />'
+        '<metadata name="subscription" value="@(context.Subscription?.Id ?? &quot;none&quot;)" />'
+        '<metadata name="model" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;tfModel&quot;, &quot;unknown&quot;))" />'
+        '<metadata name="usage" value="@{ try { var b = '
+        "context.Response.Body.As&lt;Newtonsoft.Json.Linq.JObject&gt;(preserveContent:true); "
+        "var u = b[&quot;usage&quot;] as Newtonsoft.Json.Linq.JObject; "
+        "return u != null ? u.ToString(Newtonsoft.Json.Formatting.None) : &quot;NO_USAGE_KEY&quot;; } "
+        'catch { return &quot;BODY_READ_FAILED&quot;; } }" />'
+        "</trace>"
+    )
+
     def __init__(self) -> None:
         s = get_settings()
         self._sub_id = s.azure_subscription_id
@@ -357,26 +386,53 @@ class ApimProvisioner:
             except (ResourceNotFoundError, HttpResponseError) as exc:
                 logger.warning("link %s to product %s skipped: %s", cfg["api_id"], product_id, exc)
 
+    @staticmethod
+    def _breaker_rules() -> list[CircuitBreakerRule]:
+        """The single circuit-breaker rule shared by every backend (single + pool
+        members).
+
+        Azure APIM allows exactly ONE circuit-breaker rule per backend, and one
+        rule has a single count/interval/tripDuration — but its failureCondition
+        CAN list multiple status-code ranges. So both trip triggers ride one rule:
+
+          * UPSTREAM 429 — the hub/Copilot behind this backend is out of TPM.
+          * 5xx — the backend is genuinely unhealthy.
+
+        A SINGLE such response trips the backend for 60s, ejecting that one hub
+        from the pool so requests fail over to another account's hub (sacrificing
+        that hub's warm prompt cache for availability). 60s because 429 is
+        transient (a provider TPM window refreshes in ~a minute); the same fast
+        trip suits 5xx too (a failing backend should be shed quickly, not hammered
+        for an hour). Retry-After is honored.
+
+        This does NOT catch our OWN per-key llm-token-limit 429: that limit runs
+        in INBOUND and rejects before the request reaches the backend, so the
+        circuit breaker (which only sees backend responses) never counts it. Only
+        a real upstream 429 — returned BY the hub backend — trips this.
+        """
+        return [
+            CircuitBreakerRule(
+                name="trip-on-429-or-5xx",
+                failure_condition=CircuitBreakerFailureCondition(
+                    count=1,
+                    interval=timedelta(minutes=1),
+                    status_code_ranges=[
+                        FailureStatusCodeRange(min=429, max=429),
+                        FailureStatusCodeRange(min=500, max=599),
+                    ],
+                ),
+                trip_duration=timedelta(seconds=60),
+                accept_retry_after=True,
+            ),
+        ]
+
     def _ensure_provider_backend(
         self, backend_id: str, url: str, auth_header: str, secret: str, bearer: bool
     ) -> str:
         """Create/update the shared backend for a provider (real key + breaker)."""
         header_val = f"Bearer {secret}" if bearer else secret
         creds = BackendCredentialsContract(header={auth_header: [header_val]})
-        circuit_breaker = BackendCircuitBreaker(
-            rules=[
-                CircuitBreakerRule(
-                    name="trip-on-5xx",
-                    failure_condition=CircuitBreakerFailureCondition(
-                        count=3,
-                        interval=timedelta(hours=1),
-                        status_code_ranges=[FailureStatusCodeRange(min=500, max=599)],
-                    ),
-                    trip_duration=timedelta(hours=1),
-                    accept_retry_after=True,
-                )
-            ]
-        )
+        circuit_breaker = BackendCircuitBreaker(rules=self._breaker_rules())
         backend = self.client.backend.create_or_update(
             self._rg,
             self._service,
@@ -509,6 +565,7 @@ class ApimProvisioner:
   <backend><base /></backend>
   <outbound>
     <base />
+    {self._USAGE_TRACE}
     <choose>
       <when condition="@(context.Response.StatusCode == 200 &amp;&amp; context.Variables.ContainsKey(&quot;cosmosToken&quot;) &amp;&amp; !context.Response.Headers.GetValueOrDefault(&quot;Content-Type&quot;,&quot;&quot;).Contains(&quot;text/event-stream&quot;))">
         <send-one-way-request mode="new">
@@ -728,23 +785,10 @@ class ApimProvisioner:
         if header_auth:
             name, value = header_auth
             creds = BackendCredentialsContract(header={name: [value]})
-        # Circuit breaker: trip after 3 server errors (5xx) within an hour and
-        # stop forwarding for an hour, honoring Retry-After. Protects the gateway
-        # from a failing provider backend (resiliency for the LLM hub).
-        circuit_breaker = BackendCircuitBreaker(
-            rules=[
-                CircuitBreakerRule(
-                    name="trip-on-5xx",
-                    failure_condition=CircuitBreakerFailureCondition(
-                        count=3,
-                        interval=timedelta(hours=1),
-                        status_code_ranges=[FailureStatusCodeRange(min=500, max=599)],
-                    ),
-                    trip_duration=timedelta(hours=1),
-                    accept_retry_after=True,
-                )
-            ]
-        )
+        # Circuit breaker: same rules as pooled backends — trip on sustained 5xx
+        # (unhealthy) and on sustained UPSTREAM 429 (out of TPM → brief eject so
+        # traffic fails over). See _breaker_rules for the rationale.
+        circuit_breaker = BackendCircuitBreaker(rules=self._breaker_rules())
         contract = BackendContract(
             url=backend_url,
             protocol="http",
