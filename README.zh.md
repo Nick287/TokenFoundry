@@ -333,6 +333,16 @@ URL 和一个虚拟密钥;所需变量见脚本头部。
 调用方和用户怎么鉴权,RBAC 模型,以及诚实的取舍清单 —— 都记在
 **[docs/SECURITY.zh.md](docs/SECURITY.zh.md)**([English](docs/SECURITY.md))。
 
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| **[docs/DEPLOYMENT.zh.md](docs/DEPLOYMENT.zh.md)**([English](docs/DEPLOYMENT.md)) | 搭起一个环境:`bootstrap.sh`、Terraform workspace/tfvars 设置、三阶段流程(部署 → 部署配置 → 加账号)、销毁。 |
+| **[docs/architecture.zh.md](docs/architecture.zh.md)**([English](docs/architecture.md)) | 系统分层、方案 A 接入时序、实体模型、各密钥存放位置(Mermaid 图)。 |
+| **[docs/SECURITY.zh.md](docs/SECURITY.zh.md)**([English](docs/SECURITY.md)) | 密钥存储、鉴权、RBAC、方案 A 密钥分层、取舍。 |
+| **[docs/APIM-LLM-Gateway.md](docs/APIM-LLM-Gateway.md)** | APIM LLM 网关设计:池、会话粘性、prompt 缓存、每 key 限额、SKU 支持。 |
+| **[docs/PRICING.zh.md](docs/PRICING.zh.md)**([English](docs/PRICING.md)) | 分档价格与选型:APIM SKU 价格 + 吞吐量、整套环境月度估算、何时升级。 |
+
 ## 实现状态
 
 - **当前可用:** 数据模型、控制平面 API + 租户作用域鉴权、APIM 开通服务、

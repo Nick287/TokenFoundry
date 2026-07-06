@@ -231,6 +231,51 @@ def _parse_sse_usage(text: str, *, responses_shape: bool) -> dict[str, Any] | No
     return usage
 
 
+def _parse_anthropic_sse_usage(text: str) -> dict[str, Any]:
+    """Collect the final usage from a native Anthropic SSE stream.
+
+    Anthropic reports input_tokens on `message_start` and the final output_tokens
+    on `message_delta`, so we merge across events. Unlike the old OpenAI->Anthropic
+    conversion, this reads Copilot's NATIVE Anthropic usage — input_tokens is a
+    real value, not 0/estimate. Returns {input_tokens, output_tokens,
+    cache_read_input_tokens} (zeros if absent)."""
+    merged: dict[str, int] = {}
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        # message_start carries usage under .message.usage; message_delta under .usage
+        u = (obj.get("message") or {}).get("usage") or obj.get("usage")
+        if isinstance(u, dict):
+            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
+                v = u.get(k)
+                if isinstance(v, int) and v:
+                    merged[k] = v
+    return {
+        "input_tokens": merged.get("input_tokens", 0),
+        "output_tokens": merged.get("output_tokens", 0),
+        "cache_read_input_tokens": merged.get("cache_read_input_tokens", 0),
+    }
+
+
+def _anthropic_has_image(req: dict[str, Any]) -> bool:
+    """True if an Anthropic-shaped request carries an image content block."""
+    for msg in req.get("messages") or []:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image":
+                    return True
+    return False
+
+
 # =========================================================================== #
 # OpenAI-compatible endpoints
 # =========================================================================== #
@@ -407,6 +452,15 @@ async def v1_images_edits(request: Request) -> Any:
 # =========================================================================== #
 @app.post("/v1/messages")
 async def v1_messages(request: Request) -> Any:
+    """Anthropic Messages API — passed THROUGH to Copilot's native /v1/messages.
+
+    Copilot exposes a native Anthropic endpoint, so we forward the request as-is
+    (no OpenAI<->Anthropic conversion). This is why usage is exact: Copilot's
+    native response reports input_tokens on message_start and cache/thinking
+    tokens directly, which the old conversion path dropped (streaming input_tokens
+    used to be 0). Pass-through also means tool_use, image blocks, and the full
+    Anthropic SSE event shape are handled by Copilot, not re-implemented here.
+    """
     client_key = _check_client_auth(request)
     req = await request.json()
     model = req.get("model")
@@ -415,66 +469,48 @@ async def v1_messages(request: Request) -> Any:
     if not cc.is_authenticated():
         raise HTTPException(status_code=503, detail="Hub not logged in to Copilot")
 
-    openai_payload = aa.anthropic_to_openai(req)
+    # Native Anthropic requests carry `image` content blocks (not OpenAI image_url).
     vision_headers = (
-        {"Copilot-Vision-Request": "true"}
-        if aa.has_image_content(openai_payload)
-        else None
+        {"Copilot-Vision-Request": "true"} if _anthropic_has_image(req) else None
     )
+    # Copilot's native endpoint expects the Anthropic version header.
+    headers = {"anthropic-version": "2023-06-01", **(vision_headers or {})}
 
     if not stream:
-        openai_payload.pop("stream", None)
+        req.pop("stream", None)
         try:
-            status, data = await cc.post_json(
-                "/chat/completions", openai_payload, vision_headers
-            )
+            status, data = await cc.post_json("/v1/messages", req, headers)
         except cc.NotAuthenticatedError as e:
-            raise HTTPException(status_code=503, detail=str(e))
+            raise HTTPException(status_code=503, detail=str(e)) from e
         if status != 200:
             _record(client_key=client_key, model=model, served=None,
                     endpoint="messages", usage3=(0, 0, 0), streamed=False,
                     estimated=False, status=status)
-            return JSONResponse(
-                {"type": "error", "error": {"type": "api_error",
-                 "message": json.dumps(data)}},
-                status_code=status,
-            )
-        anth = aa.openai_to_anthropic_response(data, model)
-        u = anth["usage"]
+            return JSONResponse(data, status_code=status)
+        u = data.get("usage") or {}
+        i = int(u.get("input_tokens", 0) or 0)
+        o = int(u.get("output_tokens", 0) or 0)
         _record(client_key=client_key, model=model, served=data.get("model"),
-                endpoint="messages",
-                usage3=(u["input_tokens"], u["output_tokens"],
-                        u["input_tokens"] + u["output_tokens"]),
+                endpoint="messages", usage3=(i, o, i + o),
                 streamed=False, estimated=False,
-                cached=u.get("cache_read_input_tokens", 0))
-        return JSONResponse(anth)
+                cached=int(u.get("cache_read_input_tokens", 0) or 0))
+        return JSONResponse(data)
 
-    # Streaming: translate OpenAI SSE -> Anthropic SSE.
-    openai_payload["stream"] = True
-    openai_payload.setdefault("stream_options", {"include_usage": True})
-    est_input = aa.estimate_prompt_tokens(openai_payload)
-
+    # Streaming: forward Copilot's native Anthropic SSE unchanged; sniff usage
+    # off the stream (input_tokens is real, on message_start) for accounting.
     async def gen() -> AsyncIterator[bytes]:
-        final_usage: dict[str, Any] | None = None
+        collected: list[str] = []
         try:
-            source = cc.stream("/chat/completions", openai_payload, vision_headers)
-            async for sse_bytes, usage in aa.stream_openai_to_anthropic(source, model):
-                if usage is not None:
-                    final_usage = usage
-                yield sse_bytes
+            async for chunk in cc.stream("/v1/messages", req, headers):
+                collected.append(chunk.decode("utf-8", "replace"))
+                yield chunk
         finally:
-            i = (final_usage or {}).get("input_tokens", 0)
-            o = (final_usage or {}).get("output_tokens", 0)
-            cached = (final_usage or {}).get("cache_read_input_tokens", 0)
-            # Copilot's streaming SSE usually omits prompt_tokens — fall back
-            # to a local estimate so input usage isn't silently lost.
-            input_estimated = not i
-            if input_estimated:
-                i = est_input
+            u = _parse_anthropic_sse_usage("".join(collected))
+            i, o = u["input_tokens"], u["output_tokens"]
             _record(client_key=client_key, model=model, served=None,
                     endpoint="messages", usage3=(i, o, i + o),
-                    streamed=True, estimated=final_usage is None or input_estimated,
-                    cached=cached)
+                    streamed=True, estimated=not i,
+                    cached=u["cache_read_input_tokens"])
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

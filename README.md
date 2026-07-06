@@ -379,6 +379,7 @@ list of trade-offs — is documented in
 | **[docs/architecture.md](docs/architecture.md)** ([中文](docs/architecture.zh.md)) | System layers, 方案 A onboarding sequence, the entity model, and where each secret lives (Mermaid diagrams). |
 | **[docs/SECURITY.md](docs/SECURITY.md)** ([中文](docs/SECURITY.zh.md)) | Secret storage, authentication, RBAC, 方案 A secret tiers, trade-offs. |
 | **[docs/APIM-LLM-Gateway.md](docs/APIM-LLM-Gateway.md)** | The APIM LLM-gateway design: pools, session affinity, prompt caching. |
+| **[docs/PRICING.md](docs/PRICING.md)** ([中文](docs/PRICING.zh.md)) | Cost & sizing by tier: APIM SKU prices + throughput, whole-env monthly estimates, when to upgrade. |
 
 ## Implementation status
 

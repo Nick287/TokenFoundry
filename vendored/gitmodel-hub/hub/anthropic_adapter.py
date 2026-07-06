@@ -1,8 +1,16 @@
 """Anthropic Messages API <-> OpenAI Chat Completions translation.
 
-Claude Code (and other Anthropic-native clients) speak the ``/v1/messages``
-shape. Claude models on Copilot are only reachable through
-``/chat/completions``, so we translate in both directions, including:
+⚠️ NOTE (2026-07): Copilot DOES expose a native Anthropic ``/v1/messages``
+endpoint, so ``server.py`` now PASSES ``/v1/messages`` THROUGH natively instead
+of converting. The bidirectional converters below (``anthropic_to_openai``,
+``openai_to_anthropic_response``, ``stream_openai_to_anthropic``) are therefore
+no longer on the request path — kept as a fallback in case the native endpoint
+regresses. Native pass-through is exact (streaming input_tokens is a real value,
+plus cache/thinking tokens) whereas the OpenAI conversion dropped streaming
+input_tokens. ``has_image_content`` and ``estimate_prompt_tokens`` are STILL used
+by the OpenAI passthrough path.
+
+The converters translate the ``/v1/messages`` shape to/from ``/chat/completions``:
 
 * system prompt, multimodal (image) content,
 * tool definitions, ``tool_use`` / ``tool_result`` round-trips,
