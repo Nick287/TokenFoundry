@@ -129,9 +129,11 @@ building one. Concretely:
   responses** without buffering the stream. The control plane never parses a
   provider payload to meter it.
 - **Resilience is configuration, not a library.** Per-backend **circuit
-  breakers** (trip on repeated 5xx, honor `Retry-After`) and **load-balanced
-  backend pools** are declared on the backend object — no Polly/Hystrix glue in
-  the request path.
+  breakers** (trip on a single upstream `429` or `5xx` for 60s, honor
+  `Retry-After`) and **load-balanced backend pools** are declared on the backend
+  object — no Polly/Hystrix glue in the request path. A hub that runs out of TPM
+  (`429`) is briefly ejected so requests **fail over to another account's hub**;
+  our own per-key limit `429` is rejected in inbound and never trips the breaker.
 - **Scale is a SKU change, not a re-architecture.** APIM scales horizontally by
   adding **units** (each a dedicated slice of throughput), supports **autoscale**
   on a schedule or load, and a single instance can span **multiple regions** for
