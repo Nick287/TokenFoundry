@@ -64,10 +64,22 @@ def _parse_usage_tokens(usage_json: str | None) -> tuple[int, int, int, int, int
     )
     creation = _i(u.get("cache_creation_input_tokens", 0))
     reasoning = _i(
-        (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        # Google puts thinking tokens at the TOP level as reasoning_tokens (with
+        # completion_tokens=0 — the whole output is reasoning). OpenAI nests it in
+        # completion_tokens_details.reasoning_tokens (a SUBSET of completion).
+        u.get("reasoning_tokens")
+        or (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
         or (u.get("output_tokens_details") or {}).get("reasoning_tokens")
         or 0
     )
+    # Google reports the visible output under reasoning_tokens with
+    # completion_tokens=0, so its "output" is really the reasoning. Fold it into
+    # completion when completion is 0 but reasoning is present, so downstream
+    # total (= prompt + completion) matches the provider's total_tokens and the
+    # output column isn't misleadingly empty. For OpenAI, reasoning is already
+    # inside completion, so we DON'T add it again.
+    if completion == 0 and reasoning > 0:
+        completion = reasoning
     return (prompt, completion, cached, creation, reasoning)
 
 

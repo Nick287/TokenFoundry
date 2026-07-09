@@ -30,10 +30,28 @@ def test_openai_chat_usage_shape():
     )
     prompt, completion, cached, creation, reasoning = _parse_usage_tokens(u)
     assert prompt == 100
-    assert completion == 50
+    assert completion == 50  # reasoning is a SUBSET of completion, not added
     assert cached == 30
     assert creation == 0
     assert reasoning == 12
+
+
+def test_google_top_level_reasoning_tokens():
+    """Google (gemini) reports thinking tokens at the TOP level as
+    reasoning_tokens, with completion_tokens=0 — the whole output is reasoning.
+    So reasoning must be picked up AND folded into completion (else the output
+    column is 0 and total = prompt only, mismatching the provider total)."""
+    u = (
+        '{"completion_tokens":0,"prompt_tokens":17,'
+        '"prompt_tokens_details":{"cached_tokens":0},'
+        '"total_tokens":63,"reasoning_tokens":46}'
+    )
+    prompt, completion, cached, creation, reasoning = _parse_usage_tokens(u)
+    assert prompt == 17
+    assert reasoning == 46
+    # folded into completion so prompt+completion == provider total_tokens (63)
+    assert completion == 46
+    assert prompt + completion == 63
 
 
 def test_streaming_body_read_failed_is_zeros():
