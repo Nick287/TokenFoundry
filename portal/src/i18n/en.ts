@@ -251,6 +251,7 @@ export const en = {
     tokCached: "Cached",
     tokCompletion: "Completion",
     tokReasoning: "Reasoning",
+    tokCacheCreation: "Cache write",
     callsLabel: "Calls",
     tokTrendSection: "Tokens & calls over time",
     tokTrendSeries: "Tokens",

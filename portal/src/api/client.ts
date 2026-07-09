@@ -172,6 +172,12 @@ export interface TokenGroup {
   cached: number;
   completion: number;
   reasoning: number;
+  cache_creation: number;
+  // Emitted for multimodal / speculative-decoding; 0 for plain-text calls.
+  accepted_prediction?: number;
+  rejected_prediction?: number;
+  prompt_audio?: number;
+  completion_audio?: number;
   calls: number;
 }
 export interface UsageBreakdown {
@@ -185,6 +191,11 @@ export interface UsageBreakdown {
     cached: number;
     completion: number;
     reasoning: number;
+    cache_creation: number;
+    accepted_prediction?: number;
+    rejected_prediction?: number;
+    prompt_audio?: number;
+    completion_audio?: number;
     calls: number;
   };
 }

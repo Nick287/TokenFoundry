@@ -252,6 +252,7 @@ export const zh: TranslationShape = {
     tokCached: "缓存",
     tokCompletion: "输出",
     tokReasoning: "推理",
+    tokCacheCreation: "缓存写入",
     callsLabel: "调用数",
     tokTrendSection: "Token 与调用数随时间变化",
     tokTrendSeries: "Token",

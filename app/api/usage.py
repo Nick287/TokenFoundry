@@ -134,7 +134,7 @@ def _usage_breakdown_payload(
     trend = ai.token_usage_trend(key_ids, hours=hours)
     totals = {
         k: sum(int(g.get(k, 0) or 0) for g in groups)
-        for k in ("total", "prompt", "cached", "completion", "reasoning", "calls")
+        for k in (*AppInsightsUsage._TOKEN_KEYS, "calls")
     }
     return {
         "by": group_by,

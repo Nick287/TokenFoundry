@@ -25,29 +25,37 @@ from app.models.schemas import UsageRecord
 logger = logging.getLogger(__name__)
 
 
-def _parse_usage_tokens(usage_json: str | None) -> tuple[int, int, int, int, int]:
-    """Parse a raw provider `usage` JSON string (from the usage trace) into
-    (prompt, completion, cached, creation, reasoning) token counts.
+def _parse_usage_tokens(usage_json: str | None) -> dict[str, int]:
+    """Parse a raw provider `usage` JSON string (from the usage trace) into a
+    dict of token counts keyed like _TOKEN_KEYS (minus `total`, which the caller
+    derives): prompt, completion, cached, reasoning, cache_creation,
+    accepted_prediction, rejected_prediction, prompt_audio, completion_audio.
 
-    Provider-agnostic — handles the field names all providers use:
+    Provider-agnostic — handles every provider's field names:
       * Anthropic: input_tokens / output_tokens / cache_read_input_tokens /
         cache_creation_input_tokens
       * OpenAI/Google chat: prompt_tokens / completion_tokens /
-        prompt_tokens_details.cached_tokens / completion_tokens_details.
-        reasoning_tokens
-    Non-JSON / "BODY_READ_FAILED" (streaming) → all zeros. `prompt` here is the
-    NON-cached input for OpenAI-style (prompt_tokens already includes cached) vs
-    Anthropic's input_tokens (excludes cache); we return the base input and the
-    cache separately so the caller can present them without double counting.
+        prompt_tokens_details.{cached_tokens,audio_tokens} /
+        completion_tokens_details.{reasoning_tokens,accepted_prediction_tokens,
+        rejected_prediction_tokens,audio_tokens}
+      * Google: top-level reasoning_tokens (whole output is reasoning)
+    Non-JSON / "BODY_READ_FAILED" (streaming) → all zeros. `cached` is the
+    cache-READ tokens (a subset of input); `cache_creation` is the cache-WRITE
+    tokens (anthropic-only, billed higher).
     """
+    zero = {
+        "prompt": 0, "completion": 0, "cached": 0, "reasoning": 0,
+        "cache_creation": 0, "accepted_prediction": 0,
+        "rejected_prediction": 0, "prompt_audio": 0, "completion_audio": 0,
+    }
     if not usage_json or usage_json in ("BODY_READ_FAILED", "NO_USAGE_KEY"):
-        return (0, 0, 0, 0, 0)
+        return dict(zero)
     try:
         u = json.loads(usage_json)
     except (ValueError, TypeError):
-        return (0, 0, 0, 0, 0)
+        return dict(zero)
     if not isinstance(u, dict):
-        return (0, 0, 0, 0, 0)
+        return dict(zero)
 
     def _i(v: object) -> int:
         try:
@@ -55,32 +63,36 @@ def _parse_usage_tokens(usage_json: str | None) -> tuple[int, int, int, int, int
         except (ValueError, TypeError):
             return 0
 
-    prompt = _i(u.get("input_tokens", u.get("prompt_tokens", 0)))
-    completion = _i(u.get("output_tokens", u.get("completion_tokens", 0)))
-    cached = _i(
-        u.get("cache_read_input_tokens")
-        or (u.get("prompt_tokens_details") or {}).get("cached_tokens")
-        or 0
-    )
-    creation = _i(u.get("cache_creation_input_tokens", 0))
-    reasoning = _i(
+    pd = u.get("prompt_tokens_details") or {}
+    cd = u.get("completion_tokens_details") or {}
+    od = u.get("output_tokens_details") or {}
+
+    out = dict(zero)
+    out["prompt"] = _i(u.get("input_tokens", u.get("prompt_tokens", 0)))
+    out["completion"] = _i(u.get("output_tokens", u.get("completion_tokens", 0)))
+    out["cached"] = _i(u.get("cache_read_input_tokens") or pd.get("cached_tokens") or 0)
+    out["cache_creation"] = _i(u.get("cache_creation_input_tokens", 0))
+    out["reasoning"] = _i(
         # Google puts thinking tokens at the TOP level as reasoning_tokens (with
         # completion_tokens=0 — the whole output is reasoning). OpenAI nests it in
         # completion_tokens_details.reasoning_tokens (a SUBSET of completion).
         u.get("reasoning_tokens")
-        or (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
-        or (u.get("output_tokens_details") or {}).get("reasoning_tokens")
+        or cd.get("reasoning_tokens")
+        or od.get("reasoning_tokens")
         or 0
     )
+    out["accepted_prediction"] = _i(cd.get("accepted_prediction_tokens", 0))
+    out["rejected_prediction"] = _i(cd.get("rejected_prediction_tokens", 0))
+    out["prompt_audio"] = _i(pd.get("audio_tokens", 0))
+    out["completion_audio"] = _i(cd.get("audio_tokens", 0))
     # Google reports the visible output under reasoning_tokens with
     # completion_tokens=0, so its "output" is really the reasoning. Fold it into
-    # completion when completion is 0 but reasoning is present, so downstream
-    # total (= prompt + completion) matches the provider's total_tokens and the
-    # output column isn't misleadingly empty. For OpenAI, reasoning is already
-    # inside completion, so we DON'T add it again.
-    if completion == 0 and reasoning > 0:
-        completion = reasoning
-    return (prompt, completion, cached, creation, reasoning)
+    # completion when completion is 0 but reasoning is present, so total
+    # (= prompt + completion) matches the provider's total_tokens. For OpenAI,
+    # reasoning is already inside completion, so we DON'T add it again.
+    if out["completion"] == 0 and out["reasoning"] > 0:
+        out["completion"] = out["reasoning"]
+    return out
 
 
 class UsageStore:
@@ -308,17 +320,34 @@ class AppInsightsUsage:
         return [dict(zip(table.columns, row, strict=False)) for row in table.rows]
 
     # App Insights custom-metric names emitted by APIM's llm-emit-token-metric
-    # (verified live on dev-a03, StandardV2). Mapped to short, provider-neutral
-    # keys the API/portal use. `value`/`valueSum` on customMetrics holds the token
-    # count; we sum valueSum. Dimensions available: subscription (virtual key id),
-    # api (llm-<provider>), model (request body's model, e.g. claude-opus-4.8).
+    # (verified live on dev-a03, StandardV2 — exactly these 9 names). Mapped to
+    # short, provider-neutral keys. `valueSum` holds the token count. Dimensions:
+    # subscription (virtual key id), api (llm-<provider>), model.
+    # The last four (prediction/audio) are 0 for plain-text calls but emitted for
+    # multimodal / speculative-decoding scenarios, so we surface them too.
+    # NOTE: cache_creation (anthropic's cache-WRITE tokens) is NOT a customMetric —
+    # APIM only emits "Prompt Cached Tokens" (the read). It exists only in the raw
+    # usage JSON, so the traces/backend path fills it; the customMetrics path
+    # leaves it 0. That's why it's in _TOKEN_KEYS but not _TOKEN_METRICS.
     _TOKEN_METRICS = {
         "total": "Total Tokens",
         "prompt": "Prompt Tokens",
         "cached": "Prompt Cached Tokens",
         "completion": "Completion Tokens",
         "reasoning": "Completion Reasoning Tokens",
+        "accepted_prediction": "Completion Accepted Prediction Tokens",
+        "rejected_prediction": "Completion Rejected Prediction Tokens",
+        "prompt_audio": "Prompt Audio Tokens",
+        "completion_audio": "Completion Audio Tokens",
     }
+    # Every per-token-type numeric key a breakdown row carries (order = frontend
+    # column order). Includes cache_creation, which only the traces path fills.
+    # `calls` is added separately.
+    _TOKEN_KEYS = (
+        "total", "prompt", "cached", "completion", "reasoning",
+        "cache_creation", "accepted_prediction", "rejected_prediction",
+        "prompt_audio", "completion_audio",
+    )
 
     @staticmethod
     def _sub_filter(subscription_ids: list[str] | None) -> str:
@@ -393,8 +422,7 @@ class AppInsightsUsage:
             g = r.get(group) or "unknown"
             bucket = out.setdefault(
                 g,
-                {group: g, "total": 0, "prompt": 0, "cached": 0,
-                 "completion": 0, "reasoning": 0, "calls": 0},
+                {group: g, "calls": 0, **{k: 0 for k in self._TOKEN_KEYS}},
             )
             key = name_to_key.get(r.get("metric", ""))
             if key:
@@ -444,16 +472,14 @@ class AppInsightsUsage:
             hub = r.get("hub") or "unknown"
             bucket = out.setdefault(
                 hub,
-                {"backend": hub, "total": 0, "prompt": 0, "cached": 0,
-                 "completion": 0, "reasoning": 0, "calls": 0},
+                {"backend": hub, "calls": 0, **{k: 0 for k in self._TOKEN_KEYS}},
             )
             bucket["calls"] += 1
-            prompt, comp, cached, creation, reason = _parse_usage_tokens(r.get("usage"))
-            bucket["prompt"] += prompt
-            bucket["cached"] += cached
-            bucket["completion"] += comp
-            bucket["reasoning"] += reason
-            bucket["total"] += prompt + comp  # total = input + output (cache is subset)
+            tok = _parse_usage_tokens(r.get("usage"))
+            for k, v in tok.items():
+                bucket[k] += v
+            # total = input + output (cache is a subset of input, not additive)
+            bucket["total"] += tok["prompt"] + tok["completion"]
         return sorted(out.values(), key=lambda d: d.get("total", 0), reverse=True)
 
     def token_usage_trend(

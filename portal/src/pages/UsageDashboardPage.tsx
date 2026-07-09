@@ -312,6 +312,10 @@ export function UsageDashboardPage() {
                   <span className="stat-value">{breakdown.data.totals.reasoning.toLocaleString()}</span>
                 </div>
                 <div className="stat card">
+                  <span className="stat-label">{t("usage.tokCacheCreation")}</span>
+                  <span className="stat-value">{breakdown.data.totals.cache_creation.toLocaleString()}</span>
+                </div>
+                <div className="stat card">
                   <span className="stat-label">{t("usage.callsLabel")}</span>
                   <span className="stat-value">{breakdown.data.totals.calls.toLocaleString()}</span>
                 </div>
@@ -326,6 +330,7 @@ export function UsageDashboardPage() {
                       <th>{t("usage.tokCached")}</th>
                       <th>{t("usage.tokCompletion")}</th>
                       <th>{t("usage.tokReasoning")}</th>
+                      <th>{t("usage.tokCacheCreation")}</th>
                       <th>{t("usage.callsLabel")}</th>
                     </tr>
                   </thead>
@@ -347,6 +352,9 @@ export function UsageDashboardPage() {
                           <td>{g.completion.toLocaleString()}</td>
                           <td className={g.reasoning > 0 ? undefined : "cell-zero"}>
                             {g.reasoning.toLocaleString()}
+                          </td>
+                          <td className={g.cache_creation > 0 ? undefined : "cell-zero"}>
+                            {g.cache_creation.toLocaleString()}
                           </td>
                           <td>{g.calls.toLocaleString()}</td>
                         </tr>
