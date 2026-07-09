@@ -20,11 +20,14 @@ def test_anthropic_usage_shape():
     assert t["cached"] == 5
     assert t["cache_creation"] == 7  # anthropic cache-WRITE, billed higher
     assert t["reasoning"] == 0
+    # Anthropic has no total_tokens; input EXCLUDES the caches, so the true total
+    # is input + output + cache_read + cache_creation = 13+20+5+7.
+    assert t["total"] == 45
 
 
 def test_openai_chat_usage_shape():
     u = (
-        '{"prompt_tokens":100,"completion_tokens":50,'
+        '{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,'
         '"prompt_tokens_details":{"cached_tokens":30,"audio_tokens":4},'
         '"completion_tokens_details":{"reasoning_tokens":12,'
         '"accepted_prediction_tokens":8,"rejected_prediction_tokens":3,'
@@ -40,6 +43,9 @@ def test_openai_chat_usage_shape():
     assert t["prompt_audio"] == 4
     assert t["completion_audio"] == 6
     assert t["cache_creation"] == 0  # openai has no cache-write field
+    # OpenAI gives an authoritative total_tokens (prompt already INCLUDES cached),
+    # so we use it verbatim — must NOT re-add cache to avoid double counting.
+    assert t["total"] == 150
 
 
 def test_google_top_level_reasoning_tokens():
@@ -57,6 +63,20 @@ def test_google_top_level_reasoning_tokens():
     assert t["reasoning"] == 46
     assert t["completion"] == 46  # folded so prompt+completion == 63
     assert t["prompt"] + t["completion"] == 63
+    assert t["total"] == 63  # uses the authoritative upstream total_tokens
+
+
+def test_anthropic_total_includes_cache_creation():
+    """Regression for the dev-a05 finding: cache_creation was recorded but the
+    backend `total` dropped it (total = prompt+completion only). The billable
+    cache-write tokens MUST land in total."""
+    u = (
+        '{"input_tokens":121,"output_tokens":20,'
+        '"cache_read_input_tokens":1990,"cache_creation_input_tokens":500}'
+    )
+    t = _parse_usage_tokens(u)
+    assert t["cache_creation"] == 500
+    assert t["total"] == 121 + 20 + 1990 + 500  # 2631 — cache tokens included
 
 
 def test_streaming_body_read_failed_is_zeros():

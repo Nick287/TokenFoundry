@@ -44,6 +44,7 @@ def _parse_usage_tokens(usage_json: str | None) -> dict[str, int]:
     tokens (anthropic-only, billed higher).
     """
     zero = {
+        "total": 0,
         "prompt": 0, "completion": 0, "cached": 0, "reasoning": 0,
         "cache_creation": 0, "accepted_prediction": 0,
         "rejected_prediction": 0, "prompt_audio": 0, "completion_audio": 0,
@@ -92,6 +93,23 @@ def _parse_usage_tokens(usage_json: str | None) -> dict[str, int]:
     # reasoning is already inside completion, so we DON'T add it again.
     if out["completion"] == 0 and out["reasoning"] > 0:
         out["completion"] = out["reasoning"]
+
+    # `total` — the ONE number that must match the provider's own accounting.
+    # Providers differ in what `prompt` includes, so a naive prompt+completion is
+    # wrong for anthropic:
+    #   * OpenAI/Google give an authoritative `total_tokens` (prompt already
+    #     INCLUDES cached, so we must NOT re-add cache_* or we'd double count).
+    #   * Anthropic has no total_tokens and its `input_tokens` EXCLUDES the cache
+    #     reads/writes, so the true total is input + output + cache_read +
+    #     cache_creation. (This is what makes cache_creation billable input show
+    #     up in the total instead of being dropped.)
+    upstream_total = _i(u.get("total_tokens", 0))
+    if upstream_total > 0:
+        out["total"] = upstream_total
+    else:
+        out["total"] = (
+            out["prompt"] + out["completion"] + out["cached"] + out["cache_creation"]
+        )
     return out
 
 
@@ -476,10 +494,11 @@ class AppInsightsUsage:
             )
             bucket["calls"] += 1
             tok = _parse_usage_tokens(r.get("usage"))
+            # tok includes the correctly-computed per-provider `total` (see
+            # _parse_usage_tokens), so accumulating every key is enough — no
+            # separate total math here.
             for k, v in tok.items():
                 bucket[k] += v
-            # total = input + output (cache is a subset of input, not additive)
-            bucket["total"] += tok["prompt"] + tok["completion"]
         return sorted(out.values(), key=lambda d: d.get("total", 0), reverse=True)
 
     def token_usage_trend(
