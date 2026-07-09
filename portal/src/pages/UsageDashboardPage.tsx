@@ -123,7 +123,7 @@ export function UsageDashboardPage() {
   const [tenantId, setTenantId] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(15);
-  const [groupBy, setGroupBy] = useState<"model" | "api" | "subscription">("model");
+  const [groupBy, setGroupBy] = useState<"model" | "api" | "subscription" | "backend">("model");
   const PAGE_SIZE_OPTIONS = [10, 15, 20];
 
   const tenants = useQuery({
@@ -275,7 +275,7 @@ export function UsageDashboardPage() {
           <h3>{t("usage.breakdownSection")}</h3>
           <p className="hint">{t("usage.breakdownHint")}</p>
           <div className="seg-toggle">
-            {(["model", "api", "subscription"] as const).map((g) => (
+            {(["model", "api", "subscription", "backend"] as const).map((g) => (
               <button
                 key={g}
                 type="button"
@@ -331,11 +331,11 @@ export function UsageDashboardPage() {
                   </thead>
                   <tbody>
                     {breakdown.data.groups.map((g) => {
-                      const label = g.model ?? g.api ?? g.subscription;
+                      const label = g.model ?? g.api ?? g.subscription ?? g.backend;
                       return (
                         <tr key={label ?? "unknown"}>
                           <td>
-                            {breakdown.data!.by === "subscription" ? (
+                            {breakdown.data!.by === "subscription" || breakdown.data!.by === "backend" ? (
                               <code className="id-cell">{label || t("usage.modelUnknown")}</code>
                             ) : (
                               label || t("usage.modelUnknown")

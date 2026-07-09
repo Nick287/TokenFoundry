@@ -244,6 +244,7 @@ export const en = {
     groupBy_model: "Model",
     groupBy_api: "Endpoint",
     groupBy_subscription: "Key (token)",
+    groupBy_backend: "Hub (backend)",
     modelUnknown: "(unlabeled)",
     tokTotal: "Total",
     tokPrompt: "Prompt",

@@ -11,6 +11,7 @@ delegated to app.services.billing.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import timedelta
 
@@ -22,6 +23,52 @@ from app.config import get_settings
 from app.models.schemas import UsageRecord
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_usage_tokens(usage_json: str | None) -> tuple[int, int, int, int, int]:
+    """Parse a raw provider `usage` JSON string (from the usage trace) into
+    (prompt, completion, cached, creation, reasoning) token counts.
+
+    Provider-agnostic — handles the field names all providers use:
+      * Anthropic: input_tokens / output_tokens / cache_read_input_tokens /
+        cache_creation_input_tokens
+      * OpenAI/Google chat: prompt_tokens / completion_tokens /
+        prompt_tokens_details.cached_tokens / completion_tokens_details.
+        reasoning_tokens
+    Non-JSON / "BODY_READ_FAILED" (streaming) → all zeros. `prompt` here is the
+    NON-cached input for OpenAI-style (prompt_tokens already includes cached) vs
+    Anthropic's input_tokens (excludes cache); we return the base input and the
+    cache separately so the caller can present them without double counting.
+    """
+    if not usage_json or usage_json in ("BODY_READ_FAILED", "NO_USAGE_KEY"):
+        return (0, 0, 0, 0, 0)
+    try:
+        u = json.loads(usage_json)
+    except (ValueError, TypeError):
+        return (0, 0, 0, 0, 0)
+    if not isinstance(u, dict):
+        return (0, 0, 0, 0, 0)
+
+    def _i(v: object) -> int:
+        try:
+            return int(v)  # type: ignore[call-overload]
+        except (ValueError, TypeError):
+            return 0
+
+    prompt = _i(u.get("input_tokens", u.get("prompt_tokens", 0)))
+    completion = _i(u.get("output_tokens", u.get("completion_tokens", 0)))
+    cached = _i(
+        u.get("cache_read_input_tokens")
+        or (u.get("prompt_tokens_details") or {}).get("cached_tokens")
+        or 0
+    )
+    creation = _i(u.get("cache_creation_input_tokens", 0))
+    reasoning = _i(
+        (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        or (u.get("output_tokens_details") or {}).get("reasoning_tokens")
+        or 0
+    )
+    return (prompt, completion, cached, creation, reasoning)
 
 
 class UsageStore:
@@ -308,6 +355,12 @@ class AppInsightsUsage:
         """
         if self._client is None or not self._resource_id:
             return []
+        # "backend" (the real per-account hub) is NOT a customMetrics dimension —
+        # llm-emit-token-metric can't see the pool member. It lives only in our
+        # usage `trace` (decoded from the session-affinity cookie). So route it to
+        # the traces-based path; all other dims come from customMetrics.
+        if group_by == "backend":
+            return self._backend_breakdown(subscription_ids, hours)
         group = self._GROUP_DIMS.get(group_by)
         if not group:
             return []
@@ -337,6 +390,58 @@ class AppInsightsUsage:
             # calls is emitted per metric row; take it from the Total Tokens row.
             if r.get("metric") == "Total Tokens":
                 bucket["calls"] = int(r.get("calls", 0) or 0)
+        return sorted(out.values(), key=lambda d: d.get("total", 0), reverse=True)
+
+    def _backend_breakdown(
+        self, subscription_ids: list[str] | None, hours: int
+    ) -> list[dict]:
+        """Per-hub token breakdown from the usage `trace` (App Insights `traces`).
+
+        The real hub is only knowable from our trace (decoded session-affinity
+        cookie), not from customMetrics. Each trace row carries the raw provider
+        `usage` JSON, which we parse into the five token types. Grouped by hub.
+
+        Caveat vs the customMetrics path: streaming (SSE) calls can't read the
+        response body, so their trace usage is "BODY_READ_FAILED" and contributes
+        0 tokens here (but still counts as a call). Non-streaming calls are exact.
+        Rows shaped {"backend", total/prompt/cached/completion/reasoning, calls}.
+        """
+        # Restrict to a tenant's keys via the `subscription` trace dimension.
+        sub_filter = ""
+        if subscription_ids is not None:
+            if not subscription_ids:
+                return []
+            quoted = ", ".join(f'"{s}"' for s in subscription_ids)
+            sub_filter = (
+                "| where tostring(customDimensions['subscription']) "
+                f"in ({quoted}) "
+            )
+        # Pull one row per call with hub + the raw usage JSON string; parse in
+        # Python (the usage shape varies by provider). Cap rows defensively.
+        kql = (
+            'traces | where message startswith "llm-usage " '
+            + sub_filter
+            + "| extend hub = tostring(customDimensions['hub']), "
+            "usage = tostring(customDimensions['usage']) "
+            "| project hub, usage "
+            "| take 100000"
+        )
+        rows = self._run_kql(kql, hours)
+        out: dict[str, dict] = {}
+        for r in rows:
+            hub = r.get("hub") or "unknown"
+            bucket = out.setdefault(
+                hub,
+                {"backend": hub, "total": 0, "prompt": 0, "cached": 0,
+                 "completion": 0, "reasoning": 0, "calls": 0},
+            )
+            bucket["calls"] += 1
+            prompt, comp, cached, creation, reason = _parse_usage_tokens(r.get("usage"))
+            bucket["prompt"] += prompt
+            bucket["cached"] += cached
+            bucket["completion"] += comp
+            bucket["reasoning"] += reason
+            bucket["total"] += prompt + comp  # total = input + output (cache is subset)
         return sorted(out.values(), key=lambda d: d.get("total", 0), reverse=True)
 
     def token_usage_trend(

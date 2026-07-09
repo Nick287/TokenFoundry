@@ -166,6 +166,7 @@ export interface TokenGroup {
   model?: string;
   api?: string;
   subscription?: string;
+  backend?: string;
   total: number;
   prompt: number;
   cached: number;
@@ -174,7 +175,7 @@ export interface TokenGroup {
   calls: number;
 }
 export interface UsageBreakdown {
-  by: "model" | "api" | "subscription";
+  by: "model" | "api" | "subscription" | "backend";
   hours: number;
   groups: TokenGroup[];
   trend: Array<{ ts: string; tokens: number; calls: number }>;
@@ -325,7 +326,7 @@ export const api = {
     token: string,
     tenantId: string,
     hours = 24,
-    by: "model" | "api" | "subscription" = "model",
+    by: "model" | "api" | "subscription" | "backend" = "model",
   ) =>
     request<UsageBreakdown>(
       `/admin/usage/${tenantId}/breakdown?hours=${hours}&by=${by}`,
@@ -334,7 +335,7 @@ export const api = {
   platformUsageBreakdown: (
     token: string,
     hours = 24,
-    by: "model" | "api" | "subscription" = "model",
+    by: "model" | "api" | "subscription" | "backend" = "model",
   ) =>
     request<UsageBreakdown>(
       `/admin/usage-breakdown?hours=${hours}&by=${by}`,

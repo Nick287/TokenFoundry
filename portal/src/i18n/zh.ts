@@ -245,6 +245,7 @@ export const zh: TranslationShape = {
     groupBy_model: "模型",
     groupBy_api: "端点",
     groupBy_subscription: "密钥（token）",
+    groupBy_backend: "Hub（后端）",
     modelUnknown: "（未标注）",
     tokTotal: "总计",
     tokPrompt: "输入",

@@ -210,6 +210,36 @@ class ApimProvisioner:
     # token accounting rides on llm-emit-token-metric instead). Verified on
     # dev-a03: 5 non-stream calls => 5 traces with full usage; itemCount=1 (no
     # sampling). No reflection in the expression (APIM rejects it).
+    #
+    # `hub` = the REAL pool member (per-account hub) this call was routed to. This
+    # is the ONLY way to attribute usage to a specific hub: context.Backend.Id is
+    # the POOL id (verified on dev-a03), and llm-emit-token-metric's customMetrics
+    # carry no operation_Id to join against dependencies. But session affinity
+    # encodes the selected backend name as base64 in the SessionId cookie, so we
+    # decode it: prefer the response Set-Cookie (fresh/non-sticky calls emit it),
+    # fall back to the request Cookie (a sticky call reuses its pinned SessionId
+    # and APIM does NOT re-emit Set-Cookie — verified on dev-a03). "unknown" if
+    # neither is present or decode fails.
+    _HUB_EXPR = (
+        "@{ "
+        "try "
+        "{ "
+        "string raw = &quot;&quot;; "
+        "var sc = context.Response.Headers.GetValueOrDefault(&quot;Set-Cookie&quot;,&quot;&quot;); "
+        "var src = sc.Contains(&quot;SessionId=&quot;) ? sc "
+        ": context.Request.Headers.GetValueOrDefault(&quot;Cookie&quot;,&quot;&quot;); "
+        "var i = src.IndexOf(&quot;SessionId=&quot;); "
+        "if (i &lt; 0) { return &quot;unknown&quot;; } "
+        "raw = src.Substring(i + 10); "
+        "var semi = raw.IndexOf(';'); "
+        "if (semi &gt;= 0) { raw = raw.Substring(0, semi); } "
+        "raw = System.Uri.UnescapeDataString(raw); "
+        "while (raw.Length % 4 != 0) { raw = raw + &quot;=&quot;; } "
+        "return System.Text.Encoding.UTF8.GetString(System.Convert.FromBase64String(raw)); "
+        "} "
+        "catch { return &quot;unknown&quot;; } "
+        "}"
+    )
     _USAGE_TRACE = (
         '<trace source="tokenfoundry-usage" severity="information">'
         '<message>@("llm-usage " + context.Api.Id + " " + context.RequestId)</message>'
@@ -217,6 +247,7 @@ class ApimProvisioner:
         '<metadata name="api" value="@(context.Api.Id)" />'
         '<metadata name="subscription" value="@(context.Subscription?.Id ?? &quot;none&quot;)" />'
         '<metadata name="model" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;tfModel&quot;, &quot;unknown&quot;))" />'
+        f'<metadata name="hub" value="{_HUB_EXPR}" />'
         '<metadata name="usage" value="@{ try { var b = '
         "context.Response.Body.As&lt;Newtonsoft.Json.Linq.JObject&gt;(preserveContent:true); "
         "var u = b[&quot;usage&quot;] as Newtonsoft.Json.Linq.JObject; "

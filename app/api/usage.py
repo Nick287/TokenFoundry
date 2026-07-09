@@ -127,8 +127,8 @@ def _usage_breakdown_payload(
     """
     ai = AppInsightsUsage()
     # Normalize the requested grouping to a canonical dimension name.
-    group_by = {"endpoint": "api"}.get(by, by)
-    if group_by not in ("model", "api", "subscription"):
+    group_by = {"endpoint": "api", "hub": "backend"}.get(by, by)
+    if group_by not in ("model", "api", "subscription", "backend"):
         group_by = "model"
     groups = ai.token_usage_breakdown(key_ids, hours=hours, group_by=group_by)
     trend = ai.token_usage_trend(key_ids, hours=hours)
