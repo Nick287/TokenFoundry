@@ -111,6 +111,48 @@ Client ──> APIM (AI Gateway)
 - `llm-token-limit` 在 `stream: true` 时 **prompt 和 completion token 全部为估算值**（非精确），图片输入按最多 **1200 token/张** 高估。
 - 要精确计量：用非流式，或客户端带 `stream_options.include_usage`。
 
+### ⚠️⚠️ dev-a05 实测（2026-07-10）：openai 流式 token=0 的真相与修复
+
+**结论先行**：官方 LlmLog（`ApiManagementGatewayLlmLog`）**能**精确记录 openai 流式
+token —— 前提是后端每个 SSE chunk 带 `"object":"chat.completion.chunk"` 字段。GitHub
+Copilot hub 原本**不带**，导致 completion=0。在 hub 侧给流式 chunk 注入该字段后，LlmLog
+立即精确记录（实测探针 15/36/43 全对）。计费**完全走 APIM 的 LlmLog**。
+
+**修复后 provider × stream 准确性矩阵**（✅=精确记入 LlmLog）
+
+| provider | 非流式 | 流式 |
+| --- | --- | --- |
+| openai | ✅ | ✅（objfix 注入 `object` 后修好） |
+| anthropic | ✅ | ✅（本就精确） |
+| google/gemini | ✅ | ⚠️ 仍偏 0（gemini 多 chunk 带 usage，APIM 取到中间 completion=0 那个；待单独处理） |
+
+**根因定位过程（关键是对照实验，其余都是弯路）**：
+
+1. 先误判"SSE usage chunk 位置不对"（usage 挤在 `choices` 非空 chunk）→ 改 hub 拆成
+   标准 `choices:[]` chunk → LlmLog 仍 0。**证伪**。
+2. 再误判"手搓 passthrough API 导致 APIM 不认识"→ 新建 StandardV2 APIM + 官方 OpenAPI
+   spec 正规导入 → openai 流式仍 0。**证伪**（排除 tier / 导入方式）。
+3. **对照实验定位**（真 Azure OpenAI）：把真 AOAI（gpt-5.4-mini）挂到**同一个 a05 APIM**
+   后面打流式 → LlmLog **精确记录**（9/21/30）。同一 APIM、同样诊断，AOAI 记得对、hub
+   记不上 → 差异只在**后端响应本身**。
+4. 逐 chunk diff：AOAI 每个 chunk 带 `"object":"chat.completion.chunk"`；hub **0 个** chunk
+   带 `object` → APIM 靠该字段识别 OpenAI 流式 chunk 并解析其 `usage`，缺字段=不解析。
+   （旁证：hub 的**非流式** JSON 带 `"object":"chat.completion"`，所以非流式一直记得对。）
+
+**修复**：`vendored/gitmodel-hub/hub/server.py` 的 `_standardize_openai_usage_line` 给每个
+openai 流式 chunk 注入 `"object":"chat.completion.chunk"`（并顺带把 usage 规整到标准
+`choices:[]` chunk）；gen() 行缓冲后逐 event 改写下发。镜像 tag `gitmodel:objfix`。
+
+**旁支（未采用，留档）**：
+
+- `emit-token-metric` → `customMetrics` 被订阅 feature `Microsoft.Insights/EnableCustomMetricsV2`
+  卡死（注册 8h+ 仍 Pending，unregister/register 与 re-register provider 均无效，疑似订阅侧
+  异常，需 support ticket）。**修复不依赖它**。
+- 自研 `traces` 对流式 `BODY_READ_FAILED`；hub `/api/usage` 虽精确但计费不采用（计费走 APIM）。
+
+**回归测试**：`tests/manual/verify_token_vs_diagnostic.py` —— 一条命令打 openai/anthropic ×
+流式/非流式 4 组，用响应 id 比对上游权威 usage vs LlmLog，输出 PASS/FAIL 报表。
+
 ---
 
 ## 4.5 每 key 独立限流（TPM + token-quota，per-subscription 动态取值）

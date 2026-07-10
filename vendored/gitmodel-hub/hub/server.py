@@ -207,6 +207,67 @@ def _record(
     )
 
 
+def _standardize_openai_usage_line(line: str) -> str:
+    """Rewrite a single OpenAI-stream SSE `data:` line to the OpenAI spec shape.
+
+    The GitHub Copilot backend's OpenAI streaming chunks deviate from the spec
+    in two ways that break APIM's LLM logging / emit-token-metric token capture:
+
+      1. **No `object` field.** OpenAI streaming chunks carry
+         `"object":"chat.completion.chunk"`; Copilot omits it entirely. APIM
+         keys off this field to recognize a chunk as an OpenAI completion chunk
+         and parse its `usage` — so without it, APIM records completion=0 for
+         EVERY streaming call. (Verified on dev-a05: a real Azure OpenAI backend
+         behind the SAME APIM logs streaming completion tokens exactly, because
+         its chunks include `object`; the Copilot hub's do not.)
+      2. **`usage` glued onto the `finish_reason` chunk** (choices non-empty),
+         whereas the spec puts `usage` in a separate trailing `choices: []`
+         chunk.
+
+    This normalizes BOTH: it stamps `object: "chat.completion.chunk"` on the
+    chunk, and — when `usage` rides a non-empty-choices chunk — splits it into a
+    spec-compliant finish chunk + a separate `choices: []` usage chunk (both
+    stamped with `object`). Chunks that are already fine just get the `object`
+    stamp. Pure/string-only so it is unit-testable without a backend.
+    """
+    _OBJ = "chat.completion.chunk"
+    if not line.startswith("data:"):
+        return line
+    payload = line[len("data:"):].strip()
+    if not payload or payload == "[DONE]":
+        return line
+    try:
+        obj = json.loads(payload)
+    except json.JSONDecodeError:
+        return line
+    if not isinstance(obj, dict):
+        return line
+    usage = obj.get("usage")
+    choices = obj.get("choices")
+    # Case A: usage on a non-empty-choices chunk (the non-standard Copilot
+    # layout) — split into finish chunk + separate usage chunk, both stamped.
+    if usage and isinstance(choices, list) and len(choices) > 0:
+        finish_chunk = {k: v for k, v in obj.items() if k != "usage"}
+        finish_chunk["object"] = _OBJ
+        usage_chunk = {
+            k: obj[k] for k in ("id", "created", "model", "system_fingerprint")
+            if k in obj
+        }
+        usage_chunk["object"] = _OBJ
+        usage_chunk["choices"] = []
+        usage_chunk["usage"] = usage
+        return (
+            "data: " + json.dumps(finish_chunk, separators=(",", ":")) + "\n\n"
+            + "data: " + json.dumps(usage_chunk, separators=(",", ":"))
+        )
+    # Case B: any other chunk — just ensure the `object` field is present (this
+    # is what APIM needs to parse the stream). Untouched if already correct.
+    if obj.get("object") == _OBJ:
+        return line
+    obj["object"] = _OBJ
+    return "data: " + json.dumps(obj, separators=(",", ":"))
+
+
 def _parse_sse_usage(text: str, *, responses_shape: bool) -> dict[str, Any] | None:
     usage: dict[str, Any] | None = None
     for line in text.split("\n"):
@@ -357,11 +418,33 @@ async def _passthrough(
 
     async def gen() -> AsyncIterator[bytes]:
         collected: list[str] = []
+        # SSE events are line-delimited but cc.stream yields raw BYTE chunks that
+        # may split a line mid-way; buffer text and only rewrite COMPLETE events
+        # (terminated by a blank line) so _standardize_openai_usage_line always
+        # sees a whole `data:` line. The tail (partial event) is held over.
+        buf = ""
+
+        def _emit(event_text: str) -> bytes:
+            # event_text is one SSE event ("data: {...}"), possibly needing the
+            # usage split. Rejoin the (possibly two) data lines it produces.
+            out_lines = [
+                _standardize_openai_usage_line(ln) if ln.startswith("data:") else ln
+                for ln in event_text.split("\n")
+            ]
+            return ("\n".join(out_lines)).encode("utf-8")
+
         try:
             async for chunk in cc.stream(path, body, vision_headers):
-                collected.append(chunk.decode("utf-8", "replace"))
-                yield chunk
+                text = chunk.decode("utf-8", "replace")
+                collected.append(text)
+                buf += text
+                # Flush every complete event (delimited by "\n\n").
+                while "\n\n" in buf:
+                    event, buf = buf.split("\n\n", 1)
+                    yield _emit(event) + b"\n\n"
         finally:
+            if buf:
+                yield _emit(buf)
             usage = _parse_sse_usage("".join(collected), responses_shape=responses_shape)
             i, o, t, cached = _norm_usage(usage, responses_shape=responses_shape)
             # Backend often omits prompt_tokens on streams — estimate input.
