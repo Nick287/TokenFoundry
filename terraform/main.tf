@@ -103,6 +103,7 @@ module "apim" {
   cosmos_account_name            = module.cosmos.account_name
   cosmos_account_id              = module.cosmos.account_id
   sku_name                       = var.apim_sku
+  log_analytics_workspace_id     = module.monitor.log_analytics_id
 }
 
 # --- App secrets in Key Vault (DB connection string, JWT secret, admin pwd) ---
@@ -145,6 +146,7 @@ module "containerapps" {
   suffix                     = local.suffix
   subscription_id            = data.azurerm_client_config.current.subscription_id
   log_analytics_workspace_id = module.monitor.log_analytics_id
+  log_analytics_customer_id  = module.monitor.log_analytics_customer_id
   image_tag                  = var.image_tag
   key_vault_uri              = module.keyvault.vault_uri
   keyvault_name              = module.keyvault.vault_name

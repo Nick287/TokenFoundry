@@ -417,6 +417,14 @@ class ApimProvisioner:
             except (ResourceNotFoundError, HttpResponseError) as exc:
                 logger.warning("link %s to product %s skipped: %s", cfg["api_id"], product_id, exc)
 
+        # Turn on API-level LLM logging so token + prompts/completions for THIS
+        # dynamically-created API land in ApiManagementGatewayLlmLog (the billing
+        # source of truth). This is the real switch — the APIM-level diagnostic
+        # setting (terraform) only routes the category to the workspace; without
+        # this per-API diagnostic no token rows are recorded (verified a05
+        # 2026-07-10). Best-effort: a diagnostic failure must not abort a deploy.
+        self._ensure_api_llm_diagnostic(cfg["api_id"])
+
     @staticmethod
     def _breaker_rules() -> list[CircuitBreakerRule]:
         """The single circuit-breaker rule shared by every backend (single + pool
@@ -524,6 +532,18 @@ class ApimProvisioner:
         )
         # One <when> per quota tier with the literal amount baked in.
         whens = ""
+        # FIRST branch (highest priority): a key with NO per-minute limit set
+        # (tfTpm == the unlimited sentinel) skips llm-token-limit entirely.
+        # llm-token-limit throws "Attempted to divide by zero" when handed the
+        # 1e9 sentinel as tokens-per-minute, which 500s every call for any key
+        # issued without a tokens_per_minute — "unlimited" must mean "no limit
+        # policy applied", not "a 1e9 limit". Empty branch = pass through.
+        whens += (
+            f'\n      <when condition="@(context.Variables.GetValueOrDefault'
+            f'&lt;int&gt;(&quot;tfTpm&quot;, {_TPM_UNLIMITED})=={_TPM_UNLIMITED})">'
+            f"\n        <!-- unlimited key: no llm-token-limit applied -->"
+            f"\n      </when>"
+        )
         for tier, amount in TOKEN_QUOTA_AMOUNTS.items():
             whens += (
                 f'\n      <when condition="@((string)context.Variables[&quot;tfQTier&quot;]'
@@ -862,9 +882,65 @@ class ApimProvisioner:
     # session pinned to one hub so prompt caching stays warm.
 
     _POOL_API_VERSION = "2023-09-01-preview"
+    # largeLanguageModel diagnostic is a preview field not in the SDK's
+    # DiagnosticContract, so it's set via raw ARM REST below.
+    _API_DIAG_API_VERSION = "2024-06-01-preview"
 
     def _arm_token(self) -> str:
         return DefaultAzureCredential().get_token("https://management.azure.com/.default").token
+
+    def _ensure_api_llm_diagnostic(self, api_id: str) -> None:
+        """Enable API-level `largeLanguageModel` logging on this API's
+        applicationinsights diagnostic, so token counts + prompts/completions
+        for LLM calls land in the dedicated ApiManagementGatewayLlmLog table.
+
+        Uses raw ARM REST (the SDK DiagnosticContract lacks the preview
+        largeLanguageModel field). Idempotent plain PUT. loggerId hardcodes the
+        'appinsights' logger (matches the terraform/bicep logger name). The
+        diagnostic id 'applicationinsights' matches the existing service-level
+        diagnostic name — API scope and service scope are distinct, so same name
+        does not conflict. Best-effort: a failure here must not abort a deploy."""
+        base = (
+            f"https://management.azure.com/subscriptions/{self._sub_id}"
+            f"/resourceGroups/{self._rg}/providers/Microsoft.ApiManagement"
+            f"/service/{self._service}"
+        )
+        logger_id = f"{base}/loggers/appinsights"
+        url = (
+            f"{base}/apis/{api_id}/diagnostics/applicationinsights"
+            f"?api-version={self._API_DIAG_API_VERSION}"
+        )
+        body = {
+            "properties": {
+                "loggerId": logger_id,
+                # metrics=True is CRITICAL and easy to miss: an API-level diagnostic
+                # OVERRIDES the service-level one for this API. The service diagnostic
+                # sets metrics=true (so llm-emit-token-metric writes token counts —
+                # incl. the Prompt Cached Tokens dimension — to App Insights
+                # customMetrics). If this API-level diagnostic omits metrics, it
+                # overrides that to metrics=off and SILENTLY KILLS customMetrics for
+                # this API — while LlmLog keeps working, so it looks fine until you
+                # notice the customMetrics token breakdown (and cached) went empty.
+                # Root-caused on dev-a05 (2026-07-10): adding largeLanguageModel here
+                # without metrics stopped customMetrics the moment it was applied.
+                # Setting both lets emit-token-metric (customMetrics/cached) AND the
+                # LlmLog table coexist on the same API.
+                "metrics": True,
+                "largeLanguageModel": {
+                    "logs": "enabled",
+                    "requests": {"messages": "all", "maxSizeInBytes": 32768},
+                    "responses": {"messages": "all", "maxSizeInBytes": 32768},
+                },
+            }
+        }
+        try:
+            headers = {"Authorization": f"Bearer {self._arm_token()}"}
+            with httpx.Client(timeout=30.0) as hc:
+                r = hc.put(url, headers=headers, json=body)
+                r.raise_for_status()
+            logger.info("LLM diagnostic enabled on API %s", api_id)
+        except (httpx.HTTPError, HttpResponseError) as exc:
+            logger.warning("LLM diagnostic on API %s skipped: %s", api_id, exc)
 
     def _backend_base(self) -> str:
         return (

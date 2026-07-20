@@ -193,6 +193,10 @@ export const zh: TranslationShape = {
     spMissing:
       "Key Vault 中还没有服务主体凭据 — 先运行 create-deployer-sp.sh，再点重新推送。",
     gateHint: "请先完成上方的部署配置，才能添加账号。",
+    resync: "重新同步模型",
+    resyncing: "同步中…",
+    resyncHint: "重新读取该 hub 的模型目录：新增新模型、清理已下架的（仅平台路由）。",
+    resyncedOk: "模型已同步（新增 {{count}} 个）。",
     status: {
       pending: "等待授权",
       deploying: "部署中",

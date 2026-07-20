@@ -70,6 +70,16 @@ export function GitHubAccountsPage() {
     },
   });
 
+  const resync = useMutation({
+    mutationFn: (id: string) => api.resyncGithubCatalog(principal.token, id),
+    onSuccess: (r) => {
+      const added = r.routes_after - r.routes_before;
+      toast(t("github.resyncedOk", { count: added }));
+      qc.invalidateQueries({ queryKey: ["model-routes"] });
+    },
+    onError: (e) => toast(String(e), "error"),
+  });
+
   return (
     <section>
       <h2>{t("github.title")}</h2>
@@ -138,6 +148,21 @@ export function GitHubAccountsPage() {
                     )}
                   </td>
                   <td className="row-actions">
+                    <button
+                      type="button"
+                      className="btn-sm"
+                      onClick={() => resync.mutate(a.id)}
+                      disabled={
+                        !a.container_app_fqdn ||
+                        a.status !== "ready" ||
+                        (resync.isPending && resync.variables === a.id)
+                      }
+                      title={t("github.resyncHint")}
+                    >
+                      {resync.isPending && resync.variables === a.id
+                        ? t("github.resyncing")
+                        : t("github.resync")}
+                    </button>
                     <button
                       type="button"
                       className="btn-sm btn-danger"

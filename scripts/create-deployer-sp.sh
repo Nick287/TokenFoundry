@@ -61,7 +61,8 @@
 # Options:
 #   -g <rg>            (required) resource group of the target environment (to
 #                      resolve its Key Vault + tfstate storage account).
-#   -n <name>          SP display name (default: tokenfoundry-hub-deployer-sp).
+#   -n <name>          SP display name (default: tokenfoundry-hub-deployer-sp-<env>,
+#                      derived from the RG so each environment gets its own SP).
 #   --reset-password   reset the SP's client secret even if the SP already exists
 #                      (prints a fresh ARM_CLIENT_SECRET).
 #   --no-uaa           do NOT grant User Access Administrator (see NOTE above).
@@ -82,7 +83,7 @@ usage() { sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # --- args ---
 RG=""
-SP_NAME="tokenfoundry-hub-deployer-sp"
+SP_NAME=""   # default derived from the RG below (per-environment, see note)
 RESET_PW=false
 GRANT_UAA=true
 while [[ $# -gt 0 ]]; do
@@ -101,6 +102,17 @@ command -v az >/dev/null || die "az CLI not found"
 az account show >/dev/null 2>&1 || die "Not logged in to Azure. Run: az login"
 [[ -n "$RG" ]] || die "resource group is required: -g <rg>"
 az group show -n "$RG" >/dev/null 2>&1 || die "resource group '$RG' not found (or no access)"
+
+# Default the SP name to a PER-ENVIRONMENT one derived from the RG's env suffix
+# (e.g. tokenfoundry-rg-dev-a10 -> tokenfoundry-hub-deployer-sp-dev-a10). A single
+# shared SP name across environments is a footgun: the SECOND environment finds
+# the SP already exists, skips secret generation (without --reset-password), and
+# writes an EMPTY client-secret to its Key Vault — breaking that env's deploy
+# config (sp_creds_present=false). One SP per env avoids the collision entirely.
+if [[ -z "$SP_NAME" ]]; then
+  ENV_SUFFIX="${RG#tokenfoundry-rg-}"   # dev-a10  (falls back to full RG if no match)
+  SP_NAME="tokenfoundry-hub-deployer-sp-${ENV_SUFFIX}"
+fi
 
 SUB_ID="$(az account show --query id -o tsv)"
 SUB_SCOPE="/subscriptions/${SUB_ID}"
@@ -136,8 +148,20 @@ else
   ok "SP '$SP_NAME' already exists (appId=$APP_ID)"
   # Ensure the SP object exists for this app (app can exist without an SP).
   az ad sp show --id "$APP_ID" >/dev/null 2>&1 || az ad sp create --id "$APP_ID" --output none
+  # Self-heal: if THIS env's Key Vault has no usable client-secret (empty or
+  # missing), we MUST mint one now even without --reset-password. Otherwise the
+  # secret block below keeps the empty value and the env's deploy config never
+  # goes Ready. This is the exact failure hit on dev-a10 (a reused SP left the
+  # KV client-secret empty). The stored secret is per-vault, so a fresh env
+  # always needs its own.
+  KV_SECRET_EXISTING="$(az keyvault secret show --vault-name "$KV_NAME" \
+    --name deployer-sp-client-secret --query value -o tsv 2>/dev/null || true)"
+  if [[ "$RESET_PW" != true && -z "$KV_SECRET_EXISTING" ]]; then
+    warn "no usable deployer-sp-client-secret in $KV_NAME — forcing a reset so this env can deploy"
+    RESET_PW=true
+  fi
   if [[ "$RESET_PW" == true ]]; then
-    log "Resetting client secret (--reset-password)"
+    log "Resetting client secret"
     CLIENT_SECRET="$(az ad app credential reset --id "$APP_ID" \
       --display-name "hub-deployer" --years 1 --query password -o tsv)"
     ok "client secret reset"

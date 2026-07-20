@@ -398,6 +398,16 @@ export const api = {
     ),
   deleteGithubAccount: (token: string, id: string) =>
     requestNoContent(`/github-accounts/${id}`, token, { method: "DELETE" }),
+  // Re-run hub model-catalog registration for an already-deployed account
+  // (recovers from a catalog registration that failed at deploy time because
+  // the hub wasn't serving yet). Two-way sync: adds new models, prunes retired
+  // platform routes. Returns route counts.
+  resyncGithubCatalog: (token: string, id: string) =>
+    request<{ account_id: string; routes_before: number; routes_after: number }>(
+      `/github-accounts/${id}/resync-catalog`,
+      token,
+      { method: "POST" },
+    ),
   // --- Deploy config (GitHub PATs + SP push; gates add-account) ---
   getDeployStatus: (token: string) =>
     request<DeployConfigStatus>("/deploy-config/status", token),

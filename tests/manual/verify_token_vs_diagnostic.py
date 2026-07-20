@@ -222,7 +222,12 @@ def _first_id(raw: bytes, *, prefix: str) -> str:
 
 
 def query_diagnostic(customer_id: str, rid: str) -> dict | None:
-    """Return the LlmLog row for a response id, or None if not ingested yet."""
+    """Return the LlmLog row for a response id, or None if not ingested yet.
+
+    Uses `az rest` against the Log Analytics query API rather than
+    `az monitor log-analytics query`, because some az CLI builds fail to load the
+    `monitor` command module. The query API needs the api.loganalytics.io scope.
+    """
     kql = (
         "ApiManagementGatewayLlmLog "
         "| where TimeGenerated > ago(1h) "
@@ -231,29 +236,37 @@ def query_diagnostic(customer_id: str, rid: str) -> dict | None:
         "ModelName, IsStreamCompletion "
         "| take 1"
     )
+    url = f"https://api.loganalytics.io/v1/workspaces/{customer_id}/query"
+    body = json.dumps({"query": kql})
     try:
         out = subprocess.run(
             [
-                "az", "monitor", "log-analytics", "query",
-                "-w", customer_id,
-                "--analytics-query", kql,
+                "az", "rest", "--method", "post",
+                "--url", url,
+                "--resource", "https://api.loganalytics.io",
+                "--headers", "Content-Type=application/json",
+                "--body", body,
                 "-o", "json",
             ],
             capture_output=True, text=True, timeout=90,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        print(f"    (az query failed: {e})")
+        print(f"    (az rest query failed: {e})")
         return None
     if out.returncode != 0:
-        print(f"    (az query error: {out.stderr.strip()[:200]})")
+        print(f"    (az rest query error: {out.stderr.strip()[:200]})")
         return None
     try:
-        rows = json.loads(out.stdout)
+        payload = json.loads(out.stdout)
     except json.JSONDecodeError:
         return None
-    if not rows:
+    # Log Analytics query API returns {tables:[{columns:[{name}],rows:[[...]]}]}
+    tables = payload.get("tables") or []
+    if not tables or not tables[0].get("rows"):
         return None
-    r = rows[0]
+    cols = [c["name"] for c in tables[0]["columns"]]
+    row = tables[0]["rows"][0]
+    r = dict(zip(cols, row))
     return {
         "prompt": int(r.get("PromptTokens", 0) or 0),
         "completion": int(r.get("CompletionTokens", 0) or 0),

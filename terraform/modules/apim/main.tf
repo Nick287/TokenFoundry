@@ -35,6 +35,10 @@ variable "sku_name" {
   type    = string
   default = "Developer_1"
 }
+# Log Analytics workspace that receives the APIM gateway LLM logs (below). This is
+# the billing source of truth: token usage lands in the dedicated table
+# ApiManagementGatewayLlmLog. Wired from module.monitor.log_analytics_id.
+variable "log_analytics_workspace_id" { type = string }
 
 resource "azurerm_api_management" "apim" {
   name                = substr("${var.name_prefix}-apim-${var.suffix}", 0, 50)
@@ -119,6 +123,37 @@ resource "azapi_update_resource" "diagnostic_metrics" {
   }
 }
 
+# APIM-level diagnostic SETTING (Azure Monitor) — routes the gateway LLM log
+# categories to the Log Analytics workspace. This is one HALF of the LLM token
+# billing pipeline:
+#   * this setting routes the GatewayLlmLogs category to the workspace's
+#     dedicated table (ApiManagementGatewayLlmLog), and
+#   * a per-API `largeLanguageModel` diagnostic (set in code by
+#     apim_provisioner._ensure_api_llm_diagnostic) is what actually turns token
+#     capture ON for each dynamically-created LLM API.
+# BOTH are required — verified on dev-a05 (2026-07-10): with only this setting and
+# no API-level diagnostic, streaming OpenAI token rows never reach the table.
+#
+# logAnalyticsDestinationType = "Dedicated" gives the typed ApiManagementGatewayLlmLog
+# table (vs the generic AzureDiagnostics catch-all).
+#
+# NOTE: the GatewayLlmLogs category REQUIRES an APIM v2 tier (a05 = StandardV2). On
+# the default Developer_1 SKU this category does not exist and apply will fail —
+# billing/prod environments must set sku_name to a v2 tier.
+resource "azurerm_monitor_diagnostic_setting" "apim_llm_logs" {
+  name                           = "apim-gateway-llm-logs"
+  target_resource_id             = azurerm_api_management.apim.id
+  log_analytics_workspace_id     = var.log_analytics_workspace_id
+  log_analytics_destination_type = "Dedicated"
+
+  enabled_log {
+    category = "GatewayLlmLogs"
+  }
+  enabled_log {
+    category = "GatewayLogs"
+  }
+}
+
 # Grant APIM's system identity Cosmos DB data-plane write access. The outbound
 # policy uses this identity to write a usage record per LLM call directly to the
 # `usage` container via the Cosmos REST API. The account sets
@@ -131,4 +166,20 @@ resource "azurerm_cosmosdb_sql_role_assignment" "apim_cosmos_writer" {
   role_definition_id  = "${var.cosmos_account_id}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002"
   principal_id        = azurerm_api_management.apim.identity[0].principal_id
   scope               = var.cosmos_account_id
+}
+
+# Let APIM's managed identity PUBLISH custom metrics to Application Insights.
+# llm-emit-token-metric writes per-call token counts (incl. the Prompt Cached
+# Tokens dimension) to the customMetrics table — but only if APIM's identity has
+# "Monitoring Metrics Publisher" on the App Insights component. This is the real
+# enabler for the customMetrics token breakdown (incl. cached), NOT the stuck
+# subscription feature Microsoft.Insights/EnableCustomMetricsV2 (which was an
+# early dead-end — see docs/APIM-LLM-Gateway.md §4). Without this role the
+# customMetrics table stays empty (verified: dev-a05 with the role has data incl.
+# cached; a fresh env without it is empty).
+resource "azurerm_role_assignment" "apim_metrics_publisher" {
+  scope                = var.app_insights_id
+  role_definition_name = "Monitoring Metrics Publisher"
+  principal_id         = azurerm_api_management.apim.identity[0].principal_id
+  principal_type       = "ServicePrincipal"
 }

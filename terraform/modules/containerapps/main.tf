@@ -14,6 +14,12 @@ variable "subscription_id" { type = string }
 # and resolves the shared key itself — no customerId + sharedKey plumbing.
 variable "log_analytics_workspace_id" { type = string }
 
+# Workspace customerId (GUID) — the control plane queries the dedicated
+# ApiManagementGatewayLlmLog table via query_workspace(customerId) for token
+# metering. Distinct from log_analytics_workspace_id above (that's the ARM
+# resource id, consumed by the CAE).
+variable "log_analytics_customer_id" { type = string }
+
 variable "image_tag" { type = string }
 variable "key_vault_uri" { type = string }
 variable "vault_id" { type = string }
@@ -182,6 +188,10 @@ resource "azurerm_container_app" "app" {
         value = var.app_insights_id
       }
       env {
+        name  = "TF_LOG_ANALYTICS_WORKSPACE_ID"
+        value = var.log_analytics_customer_id
+      }
+      env {
         name  = "TF_RESOURCE_GROUP"
         value = var.resource_group_name
       }
@@ -311,6 +321,19 @@ resource "azurerm_role_assignment" "kv_secrets_officer" {
 resource "azurerm_role_assignment" "monitoring_reader" {
   scope                = var.app_insights_id
   role_definition_name = "Monitoring Reader"
+  principal_id         = azurerm_container_app.app.identity[0].principal_id
+  principal_type       = "ServicePrincipal"
+}
+
+# Log Analytics Reader on the WORKSPACE. Monitoring Reader above is scoped to the
+# App Insights component, which lets query_resource(app_insights_id) read the
+# requests/customMetrics tables — but the token-metering breakdown queries the
+# dedicated ApiManagementGatewayLlmLog table via query_workspace(customerId),
+# which runs at WORKSPACE scope and the component-scoped role does NOT cover.
+# Without this the breakdown queries 403 and the Token 细分 groups render empty.
+resource "azurerm_role_assignment" "app_law_reader" {
+  scope                = var.log_analytics_workspace_id
+  role_definition_name = "Log Analytics Reader"
   principal_id         = azurerm_container_app.app.identity[0].principal_id
   principal_type       = "ServicePrincipal"
 }

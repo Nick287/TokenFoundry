@@ -68,6 +68,11 @@ class Settings(BaseSettings):
 
     # --- Observability (Application Insights via azure-monitor-query) ---
     app_insights_resource_id: str = ""
+    # Log Analytics workspace customerId (GUID). The token-metering breakdown
+    # queries the dedicated ApiManagementGatewayLlmLog table via
+    # query_workspace(customerId) — query_resource against the App Insights
+    # component can't see that table. Injected as TF_LOG_ANALYTICS_WORKSPACE_ID.
+    log_analytics_workspace_id: str = ""
 
     # --- AuthN: dual identity sources ---
     # Platform admins -> Microsoft Entra ID; customers -> Entra External ID (CIAM)

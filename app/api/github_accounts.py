@@ -79,7 +79,9 @@ def _fetch_hub_models(fqdn: str, admin_token: str) -> list[str]:
     ]
 
 
-def _register_hub_catalog(db: Session, fqdn: str, admin_token: str) -> None:
+def _register_hub_catalog(
+    db: Session, fqdn: str, admin_token: str, *, prune: bool = False
+) -> None:
     """Discover the hub's chat models and register the not-yet-known ones as
     platform-pooled model routes, wiring each provider's client-facing APIM API
     to its LOAD-BALANCED POOL (`llm-<provider>-pool`) so requests fan out across
@@ -89,7 +91,15 @@ def _register_hub_catalog(db: Session, fqdn: str, admin_token: str) -> None:
     Idempotent: routes already present (by name) are skipped and
     ensure_pooled_provider_api is a no-op update, so running this on every
     account deploy is safe — the first account seeds the catalog, later accounts
-    only add pool members."""
+    only add pool members.
+
+    prune=True additionally DELETES platform-pooled (owner_scope=PLATFORM) routes
+    whose model id is no longer in the hub's catalog — a true two-way sync that
+    drops retired models. Off by default because the deploy path is multi-account
+    (another account's hub may still serve a model this one dropped); only the
+    manual resync action, which the operator invokes deliberately, prunes. TENANT
+    (BYO) routes are never touched.
+    """
     model_ids = _fetch_hub_models(fqdn, admin_token)
     by_provider: dict[str, list[str]] = {}
     for mid in model_ids:
@@ -100,7 +110,8 @@ def _register_hub_catalog(db: Session, fqdn: str, admin_token: str) -> None:
         logger.warning("hub catalog empty/unmappable; no model routes registered")
         return
 
-    existing = {r.name for r in db.query(ModelRoute).all()}
+    all_routes = db.query(ModelRoute).all()
+    existing = {r.name for r in all_routes}
     provisioner = ApimProvisioner()
     created = 0
     for provider, models in by_provider.items():
@@ -123,10 +134,22 @@ def _register_hub_catalog(db: Session, fqdn: str, admin_token: str) -> None:
             )
             existing.add(mid)
             created += 1
+
+    removed = 0
+    if prune:
+        hub_model_ids = {mid for models in by_provider.values() for mid in models}
+        for r in all_routes:
+            # Only prune platform-pooled routes the hub no longer offers. Never
+            # touch TENANT/BYO routes or anything the operator added manually.
+            if r.owner_scope == OwnerScope.PLATFORM and r.name not in hub_model_ids:
+                db.delete(r)
+                removed += 1
+
     db.commit()
     logger.info(
-        "hub catalog: registered %d new model routes across %d providers (%s)",
+        "hub catalog: +%d new / -%d pruned model routes across %d providers (%s)",
         created,
+        removed,
         len(by_provider),
         ", ".join(sorted(by_provider)),
     )
@@ -248,6 +271,51 @@ def delete_account(
     db.commit()
     background.add_task(_teardown_account, account_id)
     return {"account_id": account_id, "status": DeployStatus.DELETING.value}
+
+
+@router.post("/github-accounts/{account_id}/resync-catalog")
+def resync_catalog(
+    account_id: str,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> dict[str, object]:
+    """Re-run hub model-catalog registration for an already-deployed account.
+
+    Catalog registration during deploy is best-effort and can fail if the hub
+    isn't serving yet when `_deploy_account` reaches it (a slow hub cold-start
+    leaves the account READY but with zero model routes). This admin action
+    retries it against the now-live hub. Idempotent — known models are skipped.
+    Runs synchronously (a catalog fetch + a few APIM PUTs, a handful of seconds).
+    """
+    acct = db.get(GitHubAccount, account_id)
+    if not acct:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="account not found")
+    if not acct.container_app_fqdn:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="account has no hub endpoint yet (not deployed / still deploying)",
+        )
+    if not acct.admin_token_kv_ref:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="account has no admin token reference (redeploy required)",
+        )
+    admin_token = KeyVaultService().get_secret(acct.admin_token_kv_ref)
+    if not admin_token:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="hub admin token not found in Key Vault",
+        )
+    before = db.query(ModelRoute).count()
+    try:
+        _register_hub_catalog(db, acct.container_app_fqdn, admin_token, prune=True)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"hub catalog fetch failed: {exc}",
+        ) from exc
+    after = db.query(ModelRoute).count()
+    return {"account_id": account_id, "routes_before": before, "routes_after": after}
 
 
 # --------------------------------------------------------------------------- #

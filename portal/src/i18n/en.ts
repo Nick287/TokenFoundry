@@ -192,6 +192,11 @@ export const en = {
     spMissing:
       "Service Principal creds not in Key Vault yet — run create-deployer-sp.sh, then Re-push.",
     gateHint: "Complete the deploy configuration above to enable adding accounts.",
+    resync: "Resync models",
+    resyncing: "Resyncing…",
+    resyncHint:
+      "Re-read this hub's model catalog: add new models, drop retired ones (platform routes only).",
+    resyncedOk: "Models resynced ({{count}} added).",
     status: {
       pending: "Awaiting authorization",
       deploying: "Deploying",
