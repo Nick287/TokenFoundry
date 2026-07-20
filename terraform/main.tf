@@ -164,6 +164,8 @@ module "containerapps" {
   jwt_secret_uri             = module.appsecrets.jwt_secret_uri
   admin_password_secret_uri  = module.appsecrets.admin_password_secret_uri
   admin_username             = "admin"
+  github_repo_owner          = var.github_repo_owner
+  github_repo_name           = var.github_repo_name
 
   # 方案 A: control plane reads hub outputs from remote state (no terraform here).
   tfstate_storage_account    = module.deployer.tfstate_storage_account_name

@@ -72,3 +72,19 @@ variable "apim_sku" {
   type        = string
   default     = "Developer_1"
 }
+
+# --- GitHub repo hosting deploy-hub.yml (方案 A hub deploys) ---
+# The control plane pushes the deployer SP creds into THIS repo's Actions
+# secrets and triggers its deploy-hub.yml. Override in terraform.tfvars to
+# point a different fork/org at the same control plane.
+variable "github_repo_owner" {
+  description = "Owner (user/org) of the repo hosting deploy-hub.yml."
+  type        = string
+  default     = "Nick287"
+}
+
+variable "github_repo_name" {
+  description = "Name of the repo hosting deploy-hub.yml."
+  type        = string
+  default     = "TokenFoundry"
+}

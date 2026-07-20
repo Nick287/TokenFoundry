@@ -75,13 +75,24 @@ Then set the environment's values in `terraform/terraform.tfvars`:
 name_prefix         = "tokenfoundry"
 environment_name    = "dev"
 resource_group_name = "tokenfoundry-rg-dev-a01"   # ← the only per-env name you pick
-location            = "centralus"
+location            = "centralus"                # pick a region with capacity (see warning above)
 pg_admin_login      = "tfadmin"
 
 pg_admin_password = "<pg password>"     # sensitive — keep out of git
 jwt_secret        = "<jwt signing secret>"
 admin_password    = "<seed admin password>"
+
+# APIM SKU. MUST be a v2 tier for token metering — token counting for the
+# Anthropic Messages API and the GatewayLlmLogs diagnostic log category both
+# require v2. The default (Developer_1) does NOT work for this project.
+apim_sku = "StandardV2_1"
 ```
+
+> ⚠️ **`apim_sku = "StandardV2_1"` is required, not optional.** On the default
+> `Developer_1` SKU the `GatewayLlmLogs` log category doesn't exist (the
+> `azurerm_monitor_diagnostic_setting.apim_llm_logs` apply fails) and Anthropic
+> token metering doesn't work. Bonus: v2 APIM provisions in ~1–2 min vs the classic
+> tier's 30–45 min.
 
 **Resource names are derived, not hand-picked.** Every resource (Key Vault, APIM,
 ACR, Container App, …) gets a suffix computed from the RG id:
@@ -98,6 +109,19 @@ Key Vault / APIM残留), and you never edit per-resource names by hand.
 > commit it. For a throwaway test env you may reuse an old env's passwords; for a
 > real env generate fresh ones.
 
+> ⚠️ **Region capacity is the #1 cause of deploy failures.** Different Azure
+> regions hit different limits and they change over time. Observed on this project:
+> - **`centralus`** — Container App env fails `ManagedEnvironmentCapacityHeavyUsageError` (AKS heavy usage).
+> - **`norwayeast`** — Cosmos fails `ServiceUnavailable` (no zonal-redundant Cosmos quota).
+> - **`eastus2`** — PostgreSQL fails `LocationIsOfferRestricted` (subscription can't provision Postgres there).
+> - **`westus3`** — main env OK, but later out of AKS capacity for a per-account **hub** deploy.
+> - **`southeastasia`** (Singapore) — the fallback that worked.
+>
+> The failing resource is usually the **Container App environment** (AKS-backed),
+> then **Cosmos**, then **Postgres**. A failure on one of these is almost always
+> capacity/quota, not a code bug — delete the RG, switch `location`, re-run. No
+> single region is always available; be ready to try 2–3.
+
 ### 1b. Run bootstrap
 
 ```bash
@@ -111,7 +135,8 @@ az login && az account set --subscription <id>
    Key Vault, ACR, APIM, Cosmos, PostgreSQL, Container App control plane, tfstate
    storage). In parallel it builds two images with `az acr build`: the control-
    plane app (`tokenfoundry:<tag>`) and the pre-built GitModel hub
-   (`gitmodel:<tag>`). APIM is the long pole (~30–45 min on the Developer SKU).
+   (`gitmodel:<tag>`). On a v2 SKU (StandardV2_1) APIM provisions in ~1–2 min; the
+   longer poles are then Postgres/Cosmos/Container App (a few minutes each).
    Ends with a `/healthz` smoke test.
 2. **`create-deployer-sp.sh`** — creates the 方案 A deployment Service Principal,
    grants its role bundle, and writes its creds into Key Vault as `deployer-sp-*`
@@ -162,6 +187,28 @@ authorizes an account's Copilot subscription; the control plane then:
 
 See [方案 A architecture](architecture.md) for the full trigger/poll/state-read
 chain.
+
+> ⚠️ **The hub deploys to its own region, set independently of the main env.**
+> `deploy-hub.yml` reads the region from the GitHub repo variable `HUB_LOCATION`,
+> which the Portal's Phase-2 "Save & configure" sets from the main env's
+> `TF_AZURE_LOCATION`. So a hub follows the main env's region **only if you
+> (re-)run Phase 2 after deploying**. If Phase 2 was done against an old region,
+> the hub still deploys there and can hit `ManagedEnvironmentCapacityHeavyUsageError`
+> even though the main env deployed fine elsewhere. Always complete Phase 2 for the
+> current environment before adding accounts.
+
+> **If the model list is empty after the account goes `ready`:** the hub was still
+> cold-starting when the control plane tried to read its `/api/models`, so catalog
+> registration silently no-op'd. Click **Resync models** on the account row
+> (Portal → GitHub Accounts) to re-run registration against the now-live hub. It's
+> a two-way sync: adds new models, prunes retired platform routes.
+
+> **Token metering / customMetrics note:** each LLM API gets an API-level App
+> Insights diagnostic that MUST set `metrics=true` alongside `largeLanguageModel`
+> (done in `apim_provisioner._ensure_api_llm_diagnostic`). Omitting `metrics`
+> silently disables `emit-token-metric` (the Portal's Token breakdown + cached go
+> empty) because an API-level diagnostic overrides the service-level one. See
+> [customMetrics-diagnostic-troubleshooting.md](customMetrics-diagnostic-troubleshooting.md).
 
 ## Tearing down an environment
 
