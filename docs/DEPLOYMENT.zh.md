@@ -80,6 +80,13 @@ admin_password    = "<种子 admin 密码>"
 # APIM SKU。token 计量必须用 v2 tier —— Anthropic Messages API 的 token 计数、
 # 以及 GatewayLlmLogs 诊断日志类别都需要 v2。默认的 Developer_1 不适用本项目。
 apim_sku = "StandardV2_1"
+
+# 承载 deploy-hub.yml 的 GitHub 仓库（方案 A 的 hub 部署）。可选 —— 默认
+# Nick287/TokenFoundry。设置它可让控制面指向另一个 fork/组织：控制面会把部署 SP 凭据
+# 推进「这个仓库」的 Actions secrets 并触发它的 deploy-hub.yml。阶段 2 粘贴的 PAT
+# 必须属于对该仓库有管理权限的账号。
+# github_repo_owner = "your-org"
+# github_repo_name  = "your-repo"
 ```
 
 > ⚠️ **`apim_sku = "StandardV2_1"` 是必需的，不是可选。** 默认 `Developer_1` SKU 下

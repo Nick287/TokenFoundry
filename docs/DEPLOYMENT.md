@@ -86,6 +86,14 @@ admin_password    = "<seed admin password>"
 # Anthropic Messages API and the GatewayLlmLogs diagnostic log category both
 # require v2. The default (Developer_1) does NOT work for this project.
 apim_sku = "StandardV2_1"
+
+# GitHub repo hosting deploy-hub.yml (方案 A hub deploys). Optional — defaults to
+# Nick287/TokenFoundry. Set these to point the control plane at a different
+# fork/org: it pushes the deployer SP creds into THIS repo's Actions secrets and
+# triggers its deploy-hub.yml. The PATs you paste in Phase 2 must belong to an
+# account with admin rights on this repo.
+# github_repo_owner = "your-org"
+# github_repo_name  = "your-repo"
 ```
 
 > ⚠️ **`apim_sku = "StandardV2_1"` is required, not optional.** On the default
