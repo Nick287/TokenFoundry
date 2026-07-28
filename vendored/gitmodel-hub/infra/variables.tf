@@ -112,11 +112,20 @@ variable "login_lock_seconds" {
 variable "cpu" {
   type        = number
   description = "vCPU per replica."
-  default     = 0.5
+  # 1 vCPU: the hub is pinned to ONE replica (see main.tf locals.replicas — the
+  # in-memory session table can't be shared), so throughput scales only
+  # vertically. Ramp load tests on a12 (2026-07-20):
+  #   0.5 vCPU -> hard queueing at 4 concurrent (p95 ~38s, ZERO upstream 429s)
+  #   1.0 vCPU -> 8.9 RPS / ~40k TPM peak, ceiling is upstream 429s
+  #   2.0 vCPU -> no better than 1 vCPU (run-to-run variance dominates)
+  # So >=1 vCPU removes the container bottleneck; past that the Copilot account
+  # quota is the limit. Valid Container Apps pairs: 0.25/0.5Gi, 0.5/1Gi, 1/2Gi,
+  # 1.5/3Gi, 2/4Gi (2/4Gi is the Consumption-tier max).
+  default = 1
 }
 
 variable "memory" {
   type        = string
-  description = "Memory per replica (must pair with cpu, e.g. 1.0Gi for 0.5 vCPU)."
-  default     = "1.0Gi"
+  description = "Memory per replica (must pair with cpu, e.g. 2.0Gi for 1 vCPU)."
+  default     = "2.0Gi"
 }
