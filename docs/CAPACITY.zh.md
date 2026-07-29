@@ -1,37 +1,58 @@
 # 单个 GitHub 账号（Copilot 订阅）的吞吐容量
 
-> 2026-07-20 在 dev-a12（新加坡，单 hub，1 vCPU）上实测；2026-07-29 补充 2/3 账号扩容验证（§2.6/§2.7）。
-> 一句话：**单账号 ≈41.6K TPM / ≈5 RPS，24 并发是硬边界；超过就撞 Copilot 429，
-> 触发 60 秒熔断后实际吞吐反而暴跌。加账号可线性扩容（3 账号 = 3.8×）。**
+> 2026-07-20 在 dev-a12（新加坡，单 hub，1 vCPU）上实测；2026-07-29 补充 2/3 账号扩容
+> 验证（§2.6/§2.7）与**缓存对照实验**（§2.8）。
+> 一句话：**约束是「并发数 ≈ 24 × 账号数」，不是 TPM。**本文早期把 TPM 当容量上限，
+> §2.8 的对照实验证伪了这一点——TPM 是 prompt 大小算出来的结果，同样 3 个账号，
+> 小 prompt 测出 159k TPM，大 prompt 测出 **330 万** TPM，两者都零 429。
 
 ---
 
 ## 1. 容量基线
 
+### 1.1 真正的约束：并发数
+
+| 账号数 | **安全并发** | 崩塌点 |
+| --- | --- | --- |
+| 1 | **24** | 32–48 |
+| 2 | **48** | 72 |
+| 3 | **72** | 96 |
+
+**规划公式：可持续并发 ≈ 24 × 账号数。** 这是唯一不随 prompt 大小、`max_tokens`、
+模型、缓存命中率变化的指标——容量规划请只用它（依据见 §2.8）。
+
+超了不是"慢一点"，是**吞吐崩塌**（见 §3.3）：撞 429 → 触发 60 秒熔断 → 大量 503。
+
+### 1.2 TPM / RPS 是观测结果，不是配额
+
+同样 3 个账号、同样零 429，换个 prompt 大小 TPM 差 20 倍：
+
+| 场景 | 并发 | 每请求 prompt | RPS | billed TPM |
+| --- | --- | --- | --- | --- |
+| 小 prompt（§2.7） | 72 | ~10 tok | 17.83 | 158,961 |
+| 大 prompt（§2.8） | 48 | ~3000 tok | 17.23 | **3,215,976** |
+
+因为 `TPM = RPS × 每请求 token 数 × 60`。RPS 几乎一样，**唯一变量是每个请求扛多少
+token**。所以：
+
+- ❌ 「我们有 159k TPM 预算，业务要 200k，得加账号」——错，159k 只在 10-token prompt 下成立
+- ✅ 「安全并发 72，业务峰值 60 并发，够用」——对，与 prompt 无关
+
+估算自己场景的 TPM：`安全并发 / 平均请求耗时 × 每请求平均 token × 60`。
+
+### 1.3 延迟与模型差异
+
 | 指标 | 值 | 条件 |
 | --- | --- | --- |
-| **最大稳定 TPM** | **≈ 40–43k tokens/min** | 24 并发，`max_tokens=1200`，零 429；四个模型都落在这个区间 |
-| **最大 RPS** | **≈ 2.7–4.6 req/s** | 取决于模型延迟：gpt-4o-mini ≈4.6，Opus ≈2.7–3.0 |
-| **并发硬边界** | **24** | 48 并发所有模型都撞 429 |
 | 单请求延迟 | gpt-4o-mini p50 ≈3.8s；Opus p50 ≈5.8–7.5s | 其中约 3.5s 是与模型无关的固定开销 |
+| RPS（小 prompt，单账号） | ≈ 2.7–4.6 req/s | gpt-4o-mini ≈4.6，Opus ≈2.7–3.0 |
 
-**安全运行区**：≤24 并发。超了不是"慢一点"，是**吞吐崩塌**（见 §3.3）。
-TPM 天花板与模型无关（配额是账号级），但**同样的 TPM，不同模型的 RPS 差近一倍**。
-
-> **多账号线性扩容（已实测到 3 账号）**：
->
-> | 账号数 | 安全并发 | 稳定 TPM | 稳定 RPS |
-> | --- | --- | --- | --- |
-> | 1 | 24 | 41,602 | 4.63 |
-> | 2 | 48 | 88,057 | 9.82 |
-> | 3 | **72** | **158,961** | **17.83** |
->
-> 规律：**可持续并发 ≈ 24 × 账号数**，TPM/RPS 同步线性。详见 §2.6 / §2.7。
+同样的 TPM，**不同模型的 RPS 差近一倍**（Opus 延迟高但单次产出多，TPM 追平）。
 
 > **RPS 是吞吐量，不是并发能力。** 24 并发只跑出 2–5 RPS，是因为单请求本身要 4–10 秒
 > （LLM 逐 token 生成 + 跨地域网络），不是并发没用上。算法见 §2.5。
 >
-> 另外 §1 的"24 并发安全"指**短时突发**；长时间满载（一次 192 请求）仍会累积触发 429，
+> "24 并发安全"指**短时突发**；长时间满载（一次 192 请求）仍会累积触发 429，
 > 生产规划要留余量。
 
 ---
@@ -68,7 +89,8 @@ session 表不能跨副本），所以只能垂直扩，而 Consumption 层上�
 | gpt-4o-mini | **41,602** | 4.63 | 3.82s | 5.61s | 最快且均衡 |
 | claude-opus-4.8 | **40,463** | 3.04 | 5.76s | 8.05s | 居中 |
 
-**四个模型的 TPM 都落在 40k 附近** —— 再次说明瓶颈是**账号级配额**，与模型无关。
+**四个模型的 TPM 都落在 40k 附近** —— 瓶颈是**账号级的并发限制**，与模型无关
+（注意：40k 是"24 并发 × 小 prompt"这组参数的观测值，不是 TPM 配额，见 §2.8）。
 差异只体现在「怎么用掉这些 token」：Opus 延迟高、RPS 低，但单次生成的 token 多，
 TPM 反而追平甚至略超 gpt-4o-mini。
 
@@ -200,6 +222,110 @@ per-level = 并发 × 3）：
 > 96 并发的失败模式与之前一致：33×429 触发熔断 → 141×503。峰值 TPM（122.9k）虽然
 > 看着不低，但 60% 的请求失败，**不是可用工作点**。
 
+### 2.8 缓存对照实验：证伪「TPM 配额」
+
+**背景**：§2.1–§2.7 全部用 `load_test_ramp.py`，它的 prompt 只有 ~10 token：
+
+```python
+PROMPT = "Write a short paragraph about the ocean."   # ~10 token
+```
+
+而各家的**缓存门槛**是 openai ~1280 / anthropic ~1991 / google ~2200 token
+（§2.9 实测）。所以那些测试**每一发都是冷启动，cached 恒为 0**，且 prompt 比真实业务
+小两个数量级。为了搞清楚「缓存 token 算不算 TPM 配额」，用
+`tests/manual/load_test_cache_tpm.py` 做了受控对照。
+
+**三个测试相**（关键是 BIGCOLD 这个控制组）：
+
+| 相 | prompt 大小 | 每轮内容 | 缓存命中 |
+| --- | --- | --- | --- |
+| COLD | ~10 tok | 每次同一句短 prompt | 0%（够不到门槛） |
+| **BIGCOLD** | ~3000 tok | 每轮换**全新随机 nonce** 前缀 | **0%**（内容每次不同，必然 miss） |
+| WARM | ~3000 tok | 同一前缀 + `SessionId` 钉住同一 hub | 59%（第 2 轮起命中） |
+
+> **为什么必须有 BIGCOLD**：COLD→WARM 同时变了两件事（prompt 变大 + 缓存命中），
+> 混淆变量，无法归因。BIGCOLD→WARM 则**只有命中率一个变量**（token 量相同），
+> 任何差异都只能来自缓存。
+>
+> 实现要点：nonce 编织进**每一个** filler 片段而非仅开头，否则后半段字节相同，
+> 会被前缀缓存蹭中；WARM 带 cookie 钉住 backend（3 个 hub 缓存各自独立，
+> 不钉住轮询到别的 hub 就冷了）。
+
+**实测（3 账号 · 48 并发 × 6 轮 · gpt-4o-mini）：**
+
+| 相 | ok | 429 | 503 | RPS | TPM(billed) | TPM(new) | 命中 | p95 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BIGCOLD | 288 | **0** | 0 | 17.23 | **3,215,976** | 3,215,976 | 0% | 3.25s |
+| WARM | 288 | **0** | 0 | 17.39 | 3,303,349 | 1,344,024 | 59.4% | 3.31s |
+
+> TPM(billed) = 所有 prompt token 全额计；TPM(new) = 剔除缓存命中的部分，即真正计算的量。
+
+**三条结论：**
+
+1. **不存在 TPM 配额。** BIGCOLD 用 **321 万纯新算 token/分钟**、零命中，仍然
+   **零 429**。任何形式的 token/分钟闸门在这里都早该触发了。
+   → §1 早期写的"最大稳定 TPM ≈40–43k"**是错的**，那只是小 prompt 场景的观测值。
+2. **「缓存 token 算不算 TPM」是伪问题。** BIGCOLD vs WARM 命中率差 59 个百分点，
+   429 都是 0、billed TPM 只差 3%——**看不出任何配额差异，因为没有闸门在拦**。
+3. **约束确实是并发。** 同为 3000-token prompt：48 并发零错误（本表），
+   **72 并发就 12×429 + 331×503**（下方补充实验）。变量是并发，不是 token。
+
+**小并发时缓存的收益（12 并发 × 6 轮）：**
+
+| 指标 | COLD | WARM | 变化 |
+| --- | --- | --- | --- |
+| p95 延迟 | 3.78s | 3.39s | **-10%** |
+| RPS | 4.13 | 5.65 | **+37%** |
+| 缓存命中 | 0% | 64.2% | —— |
+
+> 但在 48 并发下这个延迟收益消失（p95 3.25→3.31s，+2%）——**并发压力会淹没缓存的
+> 延迟优势**。缓存的稳定收益是**省钱**（命中部分走缓存折扣价），不是提吞吐。
+
+> ⚠️ **崩塌时的 TPM 数字不可信**：72 并发 + 大 prompt 那次报出 154 万 TPM，但只有
+> 89 个请求成功、331 个 503。TPM = 成功token/wall-clock，而 503 返回极快会把分母压小，
+> 于是 TPM 虚高。**看 TPM 前先确认错误数为 0。**
+
+**复现：**
+
+```bash
+# 受控对照：只有缓存命中率不同
+python tests/manual/load_test_cache_tpm.py --conc 48 --turns 6 --phases bigcold,warm
+# 三相全跑
+python tests/manual/load_test_cache_tpm.py --conc 12 --turns 6
+```
+
+### 2.9 三家的缓存行为差异（3 hub 池）
+
+用 `apim_pool_session_cache_test.py` 在 3 账号池上跑同一段递增多轮对话，
+分别测「无 cookie（轮询）」和「带 cookie（会话亲和）」：
+
+| Provider | 门槛 | 轮询命中 | 亲和命中 | 缓存归属 |
+| --- | --- | --- | --- | --- |
+| openai `gpt-5.4-mini` | ~1280 tok | 3/6 | **5/6** | **严格 per-hub** |
+| anthropic `claude-opus-4.8` | ~1991 tok | **5/6** | 5/6 | **跨 hub 共享** |
+| google `gemini-2.5-pro` | ~2200 tok | 3/6 | 4/6 | per-hub（有抖动） |
+
+三点发现：
+
+1. **openai 是标准的 per-hub 缓存**——轮询每换一个 backend 就 `cached=0`
+   （`0% → 80% → 0% → 78% → 0% → 77%`），pin 住后 5/6 命中。
+   **账号越多，无亲和性的损耗越大**：N 个 hub 轮询时只有约 `1/N` 的轮次能落回已预热的
+   那个（2 hub 时冷 1/2，3 hub 时冷 2/3）。
+2. **anthropic 的缓存跨 hub 共享**（意外）——轮询切到**完全不同的两个 hub**，
+   `cached=1991` 照样命中。说明 Copilot 的 Claude 缓存是在**上游按 prompt 内容**做的，
+   与哪个账号的 hub 无关，所以 anthropic 走亲和几乎无额外收益（5/6 vs 5/6）。
+   > 这纠正了脚本注释里"两个 hub 相互独立"的旧结论——那是在 openai 上验证的。
+3. **google 门槛最高且不稳定**——需要 ≥2200 token 才engage，且即使 pin 住，
+   仍可能中途被驱逐掉回 `cached=0`（亲和只有 4/6）。
+
+**实用结论**：session affinity 对 **openai 收益最大**、google 次之、anthropic 无所谓，
+但保留它没有坏处（见 docs/APIM-LLM-Gateway.md §4）。
+
+```bash
+python tests/manual/apim_pool_session_cache_test.py              # 三家都测
+python tests/manual/apim_pool_session_cache_test.py --provider openai
+```
+
 ---
 
 ## 3. 三个反直觉的发现
@@ -208,6 +334,11 @@ per-level = 并发 × 3）：
 
 把 `max_tokens` 从 60 降到 10（TPM 只剩 8.5K，远低于 40K），**48 并发照样撞 429**。
 如果限的是 TPM，这时该畅通无阻。→ Copilot 限的是并发请求数。
+
+**§2.8 的对照实验从反方向给出决定性证据**：把 prompt 放大 300 倍
+（10 → 3000 token），48 并发下跑到 **321 万 billed TPM 仍然零 429**；
+而同样的大 prompt 换到 72 并发就立刻 12×429 + 331×503。
+**token 量再大都不触发，并发一超就崩** —— 两个方向的实验指向同一个结论。
 
 ### 3.2 `max_tokens` 是上限，不是目标
 
@@ -248,7 +379,7 @@ count=1（一次就跳闸）· statusCodeRanges=[429, 500–599] · tripDuration
 
 | 码 | 来源 | 含义 |
 | --- | --- | --- |
-| 429 | Copilot 上游（经 hub 透传） | 账号配额打满 ← **真正的天花板** |
+| 429 | Copilot 上游（经 hub 透传） | **并发超限** ← 真正的天花板（不是 token 超限，见 §2.8）|
 | 503 | **APIM 自己生成** | 熔断已开、池中无可用后端 |
 | 429 | 我们的 `llm-token-limit` policy | 该 key 的 TPM 用完（inbound 拦截，**不触发熔断**）|
 
@@ -262,48 +393,68 @@ hub（见 docs/APIM-LLM-Gateway.md §5.3），单 hub 时退化成"全挂 60 秒
 
 ## 5. 怎么复现这些测试
 
-脚本：`tests/manual/load_test_ramp.py`（纯 stdlib，递增并发压测）。
+三个脚本（都是纯 stdlib，配置从仓库根 `.env` 读）：
+
+| 脚本 | 用途 | 对应章节 |
+| --- | --- | --- |
+| `load_test_ramp.py` | 递增并发压测，找并发天花板 | §2.1–§2.7 |
+| `load_test_cache_tpm.py` | 缓存受控对照（cold/bigcold/warm） | §2.8 |
+| `apim_pool_session_cache_test.py` | 会话亲和 vs 轮询的缓存命中 | §2.9 |
 
 ```bash
 # 默认档（探路）：1,2,4,8,16 并发，每级 12 请求
 python tests/manual/load_test_ramp.py
 
-# 找 TPM 上限（本文的最优点）
-python tests/manual/load_test_ramp.py --levels 24 --per-level 72 \
+# 找并发甜点区（3 账号 = 72）
+python tests/manual/load_test_ramp.py --levels 72 --per-level 216 \
   --max-tokens 1200 --timeout 180
 
-# 找并发天花板（会撞 429，cooldown 要跨过 60s 熔断）
-python tests/manual/load_test_ramp.py --levels 24,48 --per-level 48 --cooldown 70
+# 找并发天花板（会撞 429，级间要跨过 60s 熔断）
+python tests/manual/load_test_ramp.py --levels 48,72,96 --per-level 144 --cooldown 120
 
 # 换 provider（anthropic 原生 Messages API）
 TF_PATH=/llm-anthropic/v1/messages TF_AUTH_HEADER=x-api-key \
 TF_MODEL=claude-opus-5 python tests/manual/load_test_ramp.py \
   --levels 24 --per-level 72 --max-tokens 1200 --timeout 180
+
+# 缓存是否影响配额（只有命中率不同的受控对照）
+python tests/manual/load_test_cache_tpm.py --conc 48 --turns 6 --phases bigcold,warm
+
+# 会话亲和的缓存收益
+python tests/manual/apim_pool_session_cache_test.py --provider openai
 ```
 
-配置从仓库根 `.env` 读（`TF_GATEWAY_URL` / `TF_VIRTUAL_KEY`），也可命令行覆盖。
 默认参数是脚本顶部的常量（`LEVELS` / `PER_LEVEL` / `MAX_TOKENS` / `TIMEOUT` /
 `COOLDOWN` / `STOP_ERROR_RATE`），每个都有注释说明取值理由。
 
-**两个测试纪律：**
+**四个测试纪律：**
 
 1. **用无限额的 virtual key**（不设 `tokens_per_minute`），否则先撞我们自己的
-   `llm-token-limit`，测到的是自家策略而非 Copilot 配额。
+   `llm-token-limit`，测到的是自家策略而非 Copilot 的限制。
 2. **`--per-level` 至少是并发数的 2–3 倍，慢模型取上限**。样本太小会严重低估慢模型：
    Opus 4.8 在 per-level=48 时只测出 17.8k TPM，提到 72 后是 40.5k（见 §2.4）。
+3. **级间冷却 ≥120 秒，或每级单独跑**。上一级触发的熔断会污染下一级——
+   曾出现整整 144 个请求全 503，纯粹是前一级的熔断残留（见 §2.6）。
+4. **看 TPM 前先确认错误数为 0**。崩塌时 503 返回极快会压小 wall-clock，
+   把 TPM 算得虚高（72 并发那次报出 154 万 TPM，实际只有 89/432 成功）。
 
 ---
 
 ## 6. 结论与建议
 
-- **单个 GitHub 账号 ≈ 40–43k TPM / 24 并发**，这是 Copilot 订阅的配额，
-  改硬件、调 `max_tokens`、加并发都突破不了。
-- **TPM 上限与模型无关，RPS 与模型强相关**：gpt-4o-mini ≈4.6 RPS，Opus ≈2.7–3.0 RPS
-  （Opus 延迟高但单次产出多，TPM 追平）。选模型时按「要吞吐还是要响应速度」权衡。
-- **hub 用 1 vCPU / 2Gi 即可**（0.5 会排队，2 无额外收益）。
+- **容量约束是「并发数」，不是 TPM。** 规划公式：**可持续并发 ≈ 24 × 账号数**。
+  这是唯一不随 prompt 大小、`max_tokens`、模型、缓存命中率变化的指标。
+  > §2.8 证伪了本文早期的"≈45k TPM/账号"说法：0% 命中、纯新算 token 跑到
+  > **321 万 TPM 仍零 429**。TPM 是 `RPS × 每请求token × 60` 的**计算结果**，
+  > 随 prompt 大小浮动 20 倍以上，不能当配额用。
 - **扩容唯一有效路径：加 GitHub 账号 —— 已实测线性到 3 账号**：
-  1→2→3 账号 = 24→48→**72** 并发、41.6k→88k→**159k** TPM、4.6→9.8→**17.8** RPS
-  （相对单账号 3.8–3.9×，略微超线性）。多 hub 既分摊负载，又让熔断有地方 failover，
-  三账号在甜点区 **429/503 双零**且 p95 更低。见 §2.6 / §2.7。
-- 生产容量规划公式：**可持续并发 ≈ 24 × 账号数，TPM ≈ 45k × 账号数**，并留出余量避免触发熔断。
+  1→2→3 账号 = 24→48→**72** 并发、4.6→9.8→**17.8** RPS（相对单账号 3.8–3.9×）。
+  多 hub 既分摊负载，又让熔断有地方 failover，三账号在甜点区 **429/503 双零**
+  且 p95 更低。见 §2.6 / §2.7。
+- **RPS 与模型强相关**：gpt-4o-mini ≈4.6 RPS，Opus ≈2.7–3.0 RPS（单账号小 prompt 下）。
+  Opus 延迟高但单次产出多。选模型时按「要吞吐还是要响应速度」权衡。
+- **hub 用 1 vCPU / 2Gi 即可**（0.5 会排队，2 无额外收益）。
+- **缓存的收益是省钱和降延迟，不是提吞吐上限**：小并发时 p95 -10% / RPS +37%，
+  但 48 并发下延迟收益被并发压力淹没（+2%）。**session affinity 对 openai 最重要**
+  （per-hub 缓存），anthropic 跨 hub 共享所以无所谓（§2.9）。
 - 压测时 `--per-level` 要够大（≥并发数×3，慢模型更甚），否则会严重低估（见 §2.4）。
