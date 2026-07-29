@@ -1,7 +1,7 @@
 # 单个 GitHub 账号（Copilot 订阅）的吞吐容量
 
 > 2026-07-20 在 dev-a12（新加坡，单 hub，1 vCPU）上实测；2026-07-29 补充 2/3 账号扩容
-> 验证（§2.6/§2.7）与**缓存对照实验**（§2.8）。
+> 验证（§2.6/§2.7）、**缓存对照实验**（§2.8）与 **session affinity 代价量化**（§2.10）。
 > 一句话：**约束是「并发数 ≈ 24 × 账号数」，不是 TPM。**本文早期把 TPM 当容量上限，
 > §2.8 的对照实验证伪了这一点——TPM 是 prompt 大小算出来的结果，同样 3 个账号，
 > 小 prompt 测出 159k TPM，大 prompt 测出 **330 万** TPM，两者都零 429。
@@ -258,6 +258,17 @@ PROMPT = "Write a short paragraph about the ocean."   # ~10 token
 | BIGCOLD | 288 | **0** | 0 | 17.23 | **3,215,976** | 3,215,976 | 0% | 3.25s |
 | WARM | 288 | **0** | 0 | 17.39 | 3,303,349 | 1,344,024 | 59.4% | 3.31s |
 
+**同样的对照在 claude-opus-4.8 上复现（48 并发 × 6 轮）：**
+
+| 相 | ok | 429 | 503 | TPM(billed) | 命中 |
+| --- | --- | --- | --- | --- | --- |
+| BIGCOLD | 288 | **0** | 0 | **2,254,053** | 0% |
+| WARM | 288 | **0** | 0 | 780,349 | 82.0% |
+
+> 换一家 provider、换一个慢得多的模型，结论不变：**225 万纯新算 token/分钟、
+> 零命中，依然零 429**。（注意这组 WARM 的 RPS 偏低是 session affinity 的排队问题，
+> 与配额无关——见 §2.10。）
+>
 > TPM(billed) = 所有 prompt token 全额计；TPM(new) = 剔除缓存命中的部分，即真正计算的量。
 
 **三条结论：**
@@ -318,12 +329,70 @@ python tests/manual/load_test_cache_tpm.py --conc 12 --turns 6
 3. **google 门槛最高且不稳定**——需要 ≥2200 token 才engage，且即使 pin 住，
    仍可能中途被驱逐掉回 `cached=0`（亲和只有 4/6）。
 
-**实用结论**：session affinity 对 **openai 收益最大**、google 次之、anthropic 无所谓，
-但保留它没有坏处（见 docs/APIM-LLM-Gateway.md §4）。
+**实用结论**：session affinity 对 **openai 收益最大**、google 次之、
+**anthropic 零收益且有实测风险**——详见 §2.10。
 
 ```bash
 python tests/manual/apim_pool_session_cache_test.py              # 三家都测
 python tests/manual/apim_pool_session_cache_test.py --provider openai
+```
+
+### 2.10 ⚠️ anthropic 的 session affinity 是负资产（应关闭）
+
+§2.9 已经发现 anthropic 缓存跨 hub 共享、走亲和"无额外收益"。这一节用
+`load_test_cache_tpm.py` 新增的 **WARMNOAFF** 相做了严格量化——同样复用前缀
+（缓存条件完全不变），唯一区别是**带不带 `SessionId` cookie**：
+
+**claude-opus-4.8（3 账号 · 48 并发 × 6 轮）：**
+
+| 相 | ok | 失败 | RPS | TPM(billed) | 命中 | p50 | p95 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| WARM（带 cookie） | 162 | **126 断连** | 0.53 | 133,679 | 69.2% | 9.70s | **27.16s** |
+| **WARMNOAFF（无 cookie）** | **288** | **0** | **7.78** | **1,954,266** | **82.0%** | 2.98s | **7.54s** |
+
+**claude-opus-5（同参数）：**
+
+| 相 | ok | 失败 | RPS | 命中 | warmhit | p95 |
+| --- | --- | --- | --- | --- | --- | --- |
+| WARM | 288 | 0 | 9.11 | **82.0%** | 240/240 | 6.07s |
+| WARMNOAFF | 288 | 0 | 8.46 | **82.0%** | 240/240 | 5.97s |
+
+**两个模型合起来的结论：**
+
+| 模型 | 命中率 warm→noaff | RPS 变化 | 说明 |
+| --- | --- | --- | --- |
+| opus-4.8 | 69.2% → **82.0%** | **+1366%** | 亲和造成热点 hub 排队，126 个连接被掐断 |
+| opus-5 | 82.0% → **82.0%** | -7%（噪声） | 亲和无任何收益 |
+
+1. **缓存收益恒为零。** opus-5 那组命中率 **82.0% vs 82.0%、240/240 vs 240/240**
+   —— 钉与不钉**完全一致**。这是"Copilot 的 Claude 缓存在上游按 prompt 内容做、
+   与 hub 无关"最直接的证据。
+2. **代价是随机的，但可能是灾难性的。** opus-4.8 那次 48 个 worker 被钉死在各自
+   hub 上，热点 hub 排队到 **126 个 RemoteDisconnected**、p95 飙到 27 秒；
+   去掉 cookie 后**零失败**、p95 回落到 7.5 秒。opus-5 那次只是恰好分布均匀没暴雷。
+3. → **对 anthropic 而言 affinity 是纯粹的负期望值配置**：收益恒 0，代价在
+   分布不均时放大 14 倍。
+
+> **待办（未实施）**：给 `llm-anthropic-pool` 关闭 `sessionAffinity`，openai/google
+> 保留。改动点在 `apim_provisioner._pool_add_service()`，目前对三个池无差别写入：
+>
+> ```python
+> pool.setdefault("sessionAffinity",
+>                 {"sessionId": {"source": "Cookie", "name": "SessionId"}})
+> ```
+>
+> 注意 `setdefault` 只在字段缺失时写入、**不会清除已有配置**，所以存量环境还需要
+> 一次显式移除的迁移，不能只改新建路径。
+
+**复现：**
+
+```bash
+# 带 cookie vs 不带 cookie，缓存条件相同
+python tests/manual/load_test_cache_tpm.py --provider anthropic \
+  --conc 48 --turns 6 --phases warm,warmnoaff --cooldown 150
+
+TF_MODEL=claude-opus-5 python tests/manual/load_test_cache_tpm.py \
+  --provider anthropic --conc 48 --turns 6 --phases warm,warmnoaff --cooldown 150
 ```
 
 ---
@@ -398,8 +467,13 @@ hub（见 docs/APIM-LLM-Gateway.md §5.3），单 hub 时退化成"全挂 60 秒
 | 脚本 | 用途 | 对应章节 |
 | --- | --- | --- |
 | `load_test_ramp.py` | 递增并发压测，找并发天花板 | §2.1–§2.7 |
-| `load_test_cache_tpm.py` | 缓存受控对照（cold/bigcold/warm） | §2.8 |
+| `load_test_cache_tpm.py` | 缓存受控对照（cold/bigcold/warm/warmnoaff） | §2.8、§2.10 |
 | `apim_pool_session_cache_test.py` | 会话亲和 vs 轮询的缓存命中 | §2.9 |
+
+`load_test_cache_tpm.py` 支持 `--provider openai|anthropic|google`（自动处理各家的
+路径、认证头、body 格式和 usage 字段差异；anthropic 的 system prompt 会带
+`cache_control` 断点，否则显式缓存根本不生效），并按 provider 的缓存门槛自动抬高
+prefix。
 
 ```bash
 # 默认档（探路）：1,2,4,8,16 并发，每级 12 请求
@@ -419,6 +493,10 @@ TF_MODEL=claude-opus-5 python tests/manual/load_test_ramp.py \
 
 # 缓存是否影响配额（只有命中率不同的受控对照）
 python tests/manual/load_test_cache_tpm.py --conc 48 --turns 6 --phases bigcold,warm
+
+# session affinity 值不值（只有带不带 cookie 不同）
+python tests/manual/load_test_cache_tpm.py --provider anthropic \
+  --conc 48 --turns 6 --phases warm,warmnoaff --cooldown 150
 
 # 会话亲和的缓存收益
 python tests/manual/apim_pool_session_cache_test.py --provider openai
@@ -455,6 +533,9 @@ python tests/manual/apim_pool_session_cache_test.py --provider openai
   Opus 延迟高但单次产出多。选模型时按「要吞吐还是要响应速度」权衡。
 - **hub 用 1 vCPU / 2Gi 即可**（0.5 会排队，2 无额外收益）。
 - **缓存的收益是省钱和降延迟，不是提吞吐上限**：小并发时 p95 -10% / RPS +37%，
-  但 48 并发下延迟收益被并发压力淹没（+2%）。**session affinity 对 openai 最重要**
-  （per-hub 缓存），anthropic 跨 hub 共享所以无所谓（§2.9）。
+  但 48 并发下延迟收益被并发压力淹没（+2%）。
+- **session affinity 要按 provider 区别对待**：openai 收益最大（per-hub 缓存，
+  轮询会掉命中）、google 次之；**anthropic 应该关掉**——其缓存在上游按 prompt 内容做，
+  钉与不钉命中率完全相同（82.0% vs 82.0%），但钉住会放弃负载均衡，实测最差一次
+  造成 126 个连接断连、RPS 差 14.7 倍（§2.10，**代码尚未修改**）。
 - 压测时 `--per-level` 要够大（≥并发数×3，慢模型更甚），否则会严重低估（见 §2.4）。

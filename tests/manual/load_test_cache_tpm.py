@@ -36,11 +36,12 @@ NO SECRETS IN THIS FILE. Configure via env or a local .env:
     TF_VIRTUAL_KEY   an APIM subscription key (prefer an UNLIMITED one, so you
                      measure the Copilot quota and not our llm-token-limit)
 Optional:
-    TF_MODEL         default gpt-4o-mini
+    TF_MODEL         overrides the provider's default model
 
 Usage:
     python tests/manual/load_test_cache_tpm.py
     python tests/manual/load_test_cache_tpm.py --conc 72 --turns 6
+    python tests/manual/load_test_cache_tpm.py --provider anthropic --conc 48
     python tests/manual/load_test_cache_tpm.py --only warm --prefix-tokens 4000
 """
 
@@ -83,6 +84,36 @@ _MARKER_TOKENS = 6
 
 COLD_PROMPT = "Write a short paragraph about the ocean."
 
+# Per-provider wiring. `fmt` drives both the request body and the usage parsing:
+#   "chat"     openai/google — messages[] with a system role, prompt_tokens
+#   "messages" anthropic     — native Messages API. Its cache is EXPLICIT: the
+#              system prompt must carry a cache_control breakpoint or
+#              cache_read_input_tokens stays 0 no matter how big the prefix is.
+#              Its input_tokens EXCLUDES cached tokens (openai's includes them),
+#              so billed prompt is reconstructed in _usage_tokens().
+PROVIDERS = {
+    "openai": {
+        "path": "/llm-openai/v1/chat/completions",
+        "auth": "api-key",
+        "fmt": "chat",
+        "model": "gpt-4o-mini",
+    },
+    "anthropic": {
+        "path": "/llm-anthropic/v1/messages",
+        "auth": "x-api-key",
+        "fmt": "messages",
+        "model": "claude-opus-4.8",
+        "min_prefix": 2200,  # claude cache floor is ~1991 tok; leave margin
+    },
+    "google": {
+        "path": "/llm-google/v1/chat/completions",
+        "auth": "api-key",
+        "fmt": "chat",
+        "model": "gemini-2.5-pro",
+        "min_prefix": 2400,  # gemini implicit cache needs ~2200 tok
+    },
+}
+
 
 def load_dotenv_if_present() -> None:
     for path in (".env", os.path.join(os.path.dirname(__file__), "..", "..", ".env")):
@@ -117,13 +148,55 @@ def build_prefix(target_tokens: int, nonce: str) -> str:
     return "".join(f"[{nonce}#{i}] {FILLER}" for i in range(n)).strip()
 
 
-def _cached_tokens(usage: dict) -> int:
-    """Cached prompt tokens across provider shapes."""
+def _usage_tokens(usage: dict) -> tuple[int, int, int]:
+    """-> (billed_prompt, cached, total) across provider shapes.
+
+    OpenAI/Google: prompt_tokens ALREADY includes cached tokens.
+    Anthropic:     input_tokens EXCLUDES them, so add cache_read/cache_creation
+                   back to get a prompt count comparable to openai's.
+    """
     det = usage.get("prompt_tokens_details") or {}
     if isinstance(det, dict) and det.get("cached_tokens") is not None:
-        return int(det.get("cached_tokens") or 0)
-    # anthropic
-    return int(usage.get("cache_read_input_tokens", 0) or 0)
+        cached = int(det.get("cached_tokens") or 0)
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        total = int(usage.get("total_tokens", 0) or 0)
+        if not total:
+            total = prompt + int(usage.get("completion_tokens", 0) or 0)
+        return prompt, cached, total
+    # anthropic shape
+    cached = int(usage.get("cache_read_input_tokens", 0) or 0)
+    prompt = (int(usage.get("input_tokens", 0) or 0) + cached
+              + int(usage.get("cache_creation_input_tokens", 0) or 0))
+    if not prompt and "prompt_tokens" in usage:  # google/openai without details
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+    total = int(usage.get("total_tokens", 0) or 0)
+    if not total:
+        total = prompt + int(usage.get("completion_tokens",
+                                       usage.get("output_tokens", 0)) or 0)
+    return prompt, cached, total
+
+
+def build_body(fmt: str, model: str, prefix: str | None, history: list[dict],
+               user_msg: str, max_tokens: int) -> dict:
+    """Request body for this provider, with the cacheable prefix up front."""
+    if fmt == "messages":
+        # Anthropic caching is EXPLICIT — without the cache_control breakpoint
+        # cache_read_input_tokens stays 0 even for a huge identical prefix.
+        body: dict = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": history + [{"role": "user", "content": user_msg}],
+        }
+        if prefix:
+            body["system"] = [{"type": "text", "text": prefix,
+                               "cache_control": {"type": "ephemeral"}}]
+        return body
+    msgs = []
+    if prefix:
+        msgs.append({"role": "system", "content": prefix})
+    msgs += history
+    msgs.append({"role": "user", "content": user_msg})
+    return {"model": model, "max_tokens": max_tokens, "messages": msgs}
 
 
 def one_call(url, headers, body, timeout, cookie: str | None) -> dict:
@@ -143,13 +216,9 @@ def one_call(url, headers, body, timeout, cookie: str | None) -> dict:
             except json.JSONDecodeError:
                 obj = {}
             u = obj.get("usage", {}) or {}
-            prompt = int(u.get("prompt_tokens", u.get("input_tokens", 0)) or 0)
-            total = int(u.get("total_tokens", 0) or 0)
-            if not total:
-                total = prompt + int(u.get("completion_tokens",
-                                          u.get("output_tokens", 0)) or 0)
+            prompt, cached, total = _usage_tokens(u)
             return {"status": 200, "sec": dt, "tokens": total,
-                    "cached": _cached_tokens(u), "prompt": prompt,
+                    "cached": cached, "prompt": prompt,
                     "set_cookie": set_cookie.split(";")[0] if set_cookie else ""}
     except urllib.error.HTTPError as e:
         dt = time.perf_counter() - t0
@@ -165,12 +234,18 @@ def one_call(url, headers, body, timeout, cookie: str | None) -> dict:
 
 
 def worker(url, headers, model, mode: str, turns: int, max_tokens: int,
-           timeout: int, prefix_tokens: int) -> list[dict]:
+           timeout: int, prefix_tokens: int, fmt: str) -> list[dict]:
     """One virtual user: `turns` SEQUENTIAL requests.
 
     mode:
       "cold"    tiny prompt, no session      -> reproduces load_test_ramp.py
       "warm"    big prefix + sticky session  -> cache hot from turn 2
+      "warmnoaff" SAME reused prefix as warm, but NO SessionId cookie, so APIM
+                round-robins across hubs instead of pinning. warm vs warmnoaff
+                isolates what session affinity actually buys: for a provider
+                whose cache lives per-hub (openai/google) dropping the cookie
+                should cost hit rate; for one whose cache is shared upstream
+                (anthropic) it should keep the hits AND regain load balancing.
       "bigcold" big prefix, but a FRESH nonce every turn and no session, so the
                 prompt is the same SIZE as warm while the cache never hits. This
                 is the control that isolates "does a cached token cost quota?"
@@ -183,44 +258,42 @@ def worker(url, headers, model, mode: str, turns: int, max_tokens: int,
     """
     out = []
     cookie = None
-    warm = mode == "warm"
-    prefix = build_prefix(prefix_tokens, uuid.uuid4().hex[:6]) if warm else None
+    reuse_prefix = mode in ("warm", "warmnoaff")
+    sticky = mode == "warm"
+    prefix = build_prefix(prefix_tokens, uuid.uuid4().hex[:6]) if reuse_prefix else None
     history: list[dict] = []
     for t in range(turns):
-        if warm:
-            msgs = [{"role": "system", "content": prefix}]
-            msgs += history
-            msgs.append({"role": "user", "content": f"(turn {t}) Reply briefly."})
+        user_msg = f"(turn {t}) Reply briefly."
+        if reuse_prefix:
+            turn_prefix, hist = prefix, history
         elif mode == "bigcold":
             # Fresh nonce EVERY turn => same token count as warm, zero cache hits.
-            msgs = [
-                {"role": "system",
-                 "content": build_prefix(prefix_tokens, uuid.uuid4().hex[:6])},
-                {"role": "user", "content": f"(turn {t}) Reply briefly."},
-            ]
+            turn_prefix, hist = build_prefix(prefix_tokens, uuid.uuid4().hex[:6]), []
         else:
-            msgs = [{"role": "user", "content": COLD_PROMPT}]
-        body = {"model": model, "max_tokens": max_tokens, "messages": msgs}
+            turn_prefix, hist, user_msg = None, [], COLD_PROMPT
+        body = build_body(fmt, model, turn_prefix, hist, user_msg, max_tokens)
         r = one_call(url, headers, body, timeout, cookie)
         r["turn"] = t
         out.append(r)
-        if warm:
+        if reuse_prefix:
             # Pin every later turn to the backend that served turn 1, so the
             # prompt cache we just populated is the one we come back to.
-            if not cookie and r.get("set_cookie"):
+            # warmnoaff deliberately skips this to stay round-robin.
+            if sticky and not cookie and r.get("set_cookie"):
                 cookie = r["set_cookie"]
-            history.append({"role": "user", "content": f"(turn {t}) Reply briefly."})
+            history.append({"role": "user", "content": user_msg})
             history.append({"role": "assistant", "content": "OK."})
     return out
 
 
 def run_phase(url, headers, model, *, mode: str, conc: int, turns: int,
-              max_tokens: int, timeout: int, prefix_tokens: int) -> dict:
+              max_tokens: int, timeout: int, prefix_tokens: int,
+              fmt: str) -> dict:
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=conc) as ex:
         nested = list(ex.map(
             lambda _: worker(url, headers, model, mode, turns, max_tokens,
-                             timeout, prefix_tokens),
+                             timeout, prefix_tokens, fmt),
             range(conc)))
     wall = time.perf_counter() - t0
     res = [r for chunk in nested for r in chunk]
@@ -262,31 +335,42 @@ def show(tag: str, r: dict) -> None:
 def main() -> int:
     load_dotenv_if_present()
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--provider", choices=list(PROVIDERS), default="openai",
+                    help="which pooled provider API to hit (default openai)")
     ap.add_argument("--conc", type=int, default=CONC)
     ap.add_argument("--turns", type=int, default=TURNS)
     ap.add_argument("--prefix-tokens", type=int, default=PREFIX_TOKENS)
     ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     ap.add_argument("--timeout", type=int, default=TIMEOUT)
     ap.add_argument("--cooldown", type=int, default=COOLDOWN)
-    ap.add_argument("--only", choices=("cold", "bigcold", "warm"),
+    ap.add_argument("--only", choices=("cold", "bigcold", "warm", "warmnoaff"),
                     help="run just one phase")
     ap.add_argument("--phases", default="cold,bigcold,warm",
                     help="comma-separated phases to run, in order "
-                         "(default cold,bigcold,warm)")
+                         "(cold,bigcold,warm,warmnoaff; default cold,bigcold,warm)")
     args = ap.parse_args()
 
     gw = require("TF_GATEWAY_URL").rstrip("/")
     vk = require("TF_VIRTUAL_KEY")
-    model = os.environ.get("TF_MODEL", "gpt-4o-mini")
-    url = gw + "/llm-openai/v1/chat/completions"
-    headers = {"api-key": vk, "Content-Type": "application/json"}
+    cfg = PROVIDERS[args.provider]
+    model = os.environ.get("TF_MODEL") or cfg["model"]
+    url = gw + cfg["path"]
+    headers = {cfg["auth"]: vk, "Content-Type": "application/json"}
+    if cfg["fmt"] == "messages":
+        headers["anthropic-version"] = "2023-06-01"
+    # A provider's cache only engages above a minimum context size; below it
+    # cached is always 0 and WARM would be indistinguishable from BIGCOLD.
+    prefix_tokens = max(args.prefix_tokens, cfg.get("min_prefix", 0))
 
     total_req = args.conc * args.turns
     print(f"target : {url}")
-    print(f"model  : {model}   max_tokens={args.max_tokens}")
+    print(f"model  : {model}   max_tokens={args.max_tokens}   "
+          f"fmt={cfg['fmt']}")
     print(f"conc   : {args.conc} workers x {args.turns} sequential turns "
           f"= {total_req} requests/phase")
-    print(f"prefix : {args.prefix_tokens} tokens (WARM phase only)\n")
+    floor_note = ("" if prefix_tokens == args.prefix_tokens
+                  else f"  (raised from {args.prefix_tokens} to meet cache floor)")
+    print(f"prefix : {prefix_tokens} tokens (BIGCOLD/WARM){floor_note}\n")
 
     hdr = (f"{'phase':<6} {'ok':>4} {'429':>4} {'503':>4} {'err':>4} {'RPS':>7} "
            f"{'TPM(billed)':>11} {'TPM(new)':>11} {'hit':>7} {'warmhit':>9} "
@@ -301,7 +385,8 @@ def main() -> int:
     for i, ph in enumerate(phases):
         r = run_phase(url, headers, model, mode=ph, conc=args.conc,
                       turns=args.turns, max_tokens=args.max_tokens,
-                      timeout=args.timeout, prefix_tokens=args.prefix_tokens)
+                      timeout=args.timeout, prefix_tokens=prefix_tokens,
+                      fmt=cfg["fmt"])
         results[ph] = r
         show(ph.upper(), r)
         if i != len(phases) - 1:
@@ -330,6 +415,26 @@ def main() -> int:
         print("                                       quota (or free)")
         print("    429 counts about EQUAL          -> cached tokens are charged at")
         print("                                       full price; cache buys latency")
+
+    if "warm" in results and "warmnoaff" in results:
+        w, na = results["warm"], results["warmnoaff"]
+        print("\n" + "=" * 78)
+        print("VERDICT C — is session affinity worth it? (same reused prefix, "
+              "cookie vs no cookie)")
+        print("=" * 78)
+        print(f"  cache hit    {w['hit_pct']:>9.1f}% -> {na['hit_pct']:>9.1f}%   "
+              f"(WARM -> NOAFF)")
+        print(f"  RPS          {w['rps']:>10.2f} -> {na['rps']:>10.2f}   "
+              f"{delta(w['rps'], na['rps'])}")
+        print(f"  p95 latency  {w['p95']:>10.2f}s -> {na['p95']:>9.2f}s   "
+              f"{delta(w['p95'], na['p95'])}")
+        print(f"  429 / 503    {w['c429']:>4}/{w['c503']:<5} -> "
+              f"{na['c429']:>4}/{na['c503']:<5}")
+        print("\n  How to read it:")
+        print("    hit rate HOLDS + RPS UP   -> the cache is shared upstream; affinity")
+        print("                                 is pure cost, turn it OFF for this pool")
+        print("    hit rate DROPS            -> cache is per-hub; affinity is earning")
+        print("                                 its keep, keep it ON")
 
     if "cold" in results and "warm" in results:
         c, w = results["cold"], results["warm"]
