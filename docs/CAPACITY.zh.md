@@ -373,16 +373,54 @@ python tests/manual/apim_pool_session_cache_test.py --provider openai
 3. → **对 anthropic 而言 affinity 是纯粹的负期望值配置**：收益恒 0，代价在
    分布不均时放大 14 倍。
 
-> **待办（未实施）**：给 `llm-anthropic-pool` 关闭 `sessionAffinity`，openai/google
-> 保留。改动点在 `apim_provisioner._pool_add_service()`，目前对三个池无差别写入：
+#### 谁会真的触发它？——**官方 SDK 默认就会**
+
+一开始我们以为"只有浏览器才会回传 cookie，SDK 调用不受影响"，
+**这个判断是错的**。实测 `httpx.Client` 的行为：
+
+```text
+--- 复用同一个 Client（SDK 的标准用法）---
+  请求 1 发送 Cookie: None
+  请求 2 发送 Cookie: SessionId=bGxtLWFudGhyb3BpYw==   ← 自动回传
+
+--- 每次新建 Client ---
+  请求 1 发送 Cookie: None
+  请求 2 发送 Cookie: None
+```
+
+`httpx.Client` **自带 cookie jar 且默认开启**（语义接近 `requests.Session`，
+而不是裸 `requests`），而 `anthropic.Anthropic()` / `openai.OpenAI()` 内部持有的
+正是一个长期存活的 `httpx.Client` —— 这还是 SDK 官方推荐的用法（复用连接池）。
+
+| 调用方式 | 是否触发 affinity |
+| --- | --- |
+| `client = Anthropic()` 后多次 `.messages.create()` | ✅ **会**（第 2 次起钉住） |
+| 每次请求新建 client | ❌ 不会 |
+| `curl` / 本文的压测脚本（不存 cookie） | ❌ 不会 |
+
+> ⚠️ **所以这是现实风险，不是潜在风险。** 任何按标准写法使用 SDK 的客户端，
+> 从第二次调用起就会被钉在一个 hub 上 —— 对 anthropic 而言零收益，且在分布不均时
+> 会放大成上面那种 126 个断连的情况。
 >
-> ```python
-> pool.setdefault("sessionAffinity",
->                 {"sessionId": {"source": "Cookie", "name": "SessionId"}})
-> ```
->
-> 注意 `setdefault` 只在字段缺失时写入、**不会清除已有配置**，所以存量环境还需要
-> 一次显式移除的迁移，不能只改新建路径。
+> 也解释了为什么本文的压测数据没有自然暴露这个问题：脚本用裸 `urllib` 且
+> 不持久化 cookie，默认走轮询，只有显式实现的 WARM 相才回传 cookie。
+
+**待办（未实施）**，两个方案：
+
+| 方案 | 做法 | 取舍 |
+| --- | --- | --- |
+| **A（推荐）** | 在 anthropic API 的 outbound 策略里删掉 `Set-Cookie` 响应头 | 客户端拿不到就无从回传，等效关闭；不碰池配置、无存量迁移 |
+| B | `_pool_add_service()` 按 provider 决定是否写 `sessionAffinity` | 更彻底，但要额外处理存量池的显式移除 |
+
+方案 B 的坑：目前对三个池无差别写入
+
+```python
+pool.setdefault("sessionAffinity",
+                {"sessionId": {"source": "Cookie", "name": "SessionId"}})
+```
+
+`setdefault` 只在字段缺失时写入、**不会清除已有配置**，所以存量环境还需要一次显式
+移除的迁移，不能只改新建路径。
 
 **复现：**
 
@@ -538,4 +576,6 @@ python tests/manual/apim_pool_session_cache_test.py --provider openai
   轮询会掉命中）、google 次之；**anthropic 应该关掉**——其缓存在上游按 prompt 内容做，
   钉与不钉命中率完全相同（82.0% vs 82.0%），但钉住会放弃负载均衡，实测最差一次
   造成 126 个连接断连、RPS 差 14.7 倍（§2.10，**代码尚未修改**）。
+  > 且 **官方 SDK 默认就会触发**：`httpx.Client` 自带 cookie jar，复用 client 时
+  > 从第二次调用起自动回传 `SessionId`。这是现实风险而非潜在风险。
 - 压测时 `--per-level` 要够大（≥并发数×3，慢模型更甚），否则会严重低估（见 §2.4）。
