@@ -137,13 +137,33 @@ cache 1h write → cost_per_batch 625000000000   ← 同价
 在 Copilot 计费口径下不成立（`usage.cache_creation` 仍会拆分 TTL，
 但那是用量口径，不影响成本）。
 
-### 3.3 thinking token 并入 output 计费
+### 3.3 thinking token 全额计费，但 `copilot_usage` 里看不出占比
 
-`token_details` 里**没有独立的 thinking 条目**。effort=high 的调用中
-`usage.output_tokens_details.thinking_tokens = 1859`，而 `copilot_usage` 的
-`output` 条目 `token_count` 是含 thinking 的总数，按 $25/MTok 全额计。
+`token_details` 只有四个固定条目（`input`/`cache_read`/`cache_write`/`output`），
+**没有 thinking 条目**。实测核对 `copilot_usage` 的 output 计数：
 
-→ thinking 可观测（`usage` 里有）但**不单独计价**。
+| 场景 | `usage.output_tokens` | `..thinking_tokens` | `copilot_usage` 计费 output |
+| --- | --- | --- | --- |
+| 简单问题（未思考） | 300 | 0 | **300** |
+| 难题 · effort=high | 2980 | **1901** | **2980** |
+
+→ 计费 output **等于含 thinking 的 `output_tokens`**（不是 2980−1901=1079），
+即 **thinking 按 $25/MTok 全额收费**。那次调用中 thinking 单独就是
+`1901 × 2500e9 / 1e6 = 4,752,500,000 nano_aiu ≈ $0.0475`，
+占该次总成本的 **64%**。
+
+**两个字段必须配合使用：**
+
+```text
+成本  ← copilot_usage.total_nano_aiu               （含 thinking，但看不出占比）
+用量  ← usage.output_tokens_details.thinking_tokens （能算占比，但无价格）
+```
+
+> ⚠️ **计费透明度风险**：thinking 是不可预测的成本项——同样的 `effort` 参数，
+> 模型自行决定是否思考及思考多久（实测 low/medium/high = 880/1309/1859 tokens，
+> 而简单问题下 adaptive 会直接返回 0）。用户看到的可见回复只有 1079 token，
+> 账单却按 2980 计。若要做成本透明，**必须单独暴露 thinking 占比**，
+> 否则从用户视角看像是多收费。
 
 ---
 
@@ -267,19 +287,20 @@ event: message_stop
 
 ## 5. 与另外两条计量路径的对比
 
-| 能力 | LlmLog | customMetrics | **copilot_usage** |
-| --- | --- | --- | --- |
-| prompt / completion / total | ✅ | ✅ | ✅ |
-| cached（读） | ❌ | ✅ | ✅ |
-| cache_write（写） | ❌ | ❌ | ✅ |
-| thinking | ❌ | ❌ | ❌（并入 output） |
-| **单价** | ❌ | ❌ | ✅ |
-| **成本金额** | ❌ | ❌ | ✅ |
-| 逐笔可对账 | ✅（按 RequestId） | ❌（聚合） | ✅（响应体内） |
-| 已落地到 Azure 遥测 | ✅ | ✅ | ❓ **未验证** |
+| 能力 | LlmLog | customMetrics | **copilot_usage** | `usage`（同响应体） |
+| --- | --- | --- | --- | --- |
+| prompt / completion / total | ✅ | ✅ | ✅ | ✅ |
+| cached（读） | ❌ | ✅ | ✅ | ✅ |
+| cache_write（写） | ❌ | ❌ | ✅ | ✅（还按 TTL 拆分） |
+| **thinking 用量** | ❌ | ❌ | ❌（计费但不拆分） | ✅ |
+| **单价** | ❌ | ❌ | ✅ | ❌ |
+| **成本金额** | ❌ | ❌ | ✅ | ❌ |
+| 逐笔可对账 | ✅（按 RequestId） | ❌（聚合） | ✅（响应体内） | ✅（响应体内） |
+| 已落地到 Azure 遥测 | ✅ | ✅ | ❓ **未验证** | ❓ 部分（LlmLog/customMetrics 各取一部分） |
 
 **`copilot_usage` 是唯一能给出上游真实成本的来源**，而且不需要我们自己维护
-价格表。但它目前只存在于**响应体**里。
+价格表。但**它和 `usage` 互补、缺一不可**——成本在 `copilot_usage`，
+thinking 与 TTL 拆分在 `usage`。两者目前都只存在于**响应体**里。
 
 ---
 
@@ -289,7 +310,9 @@ event: message_stop
    PromptTokens/CompletionTokens/TotalTokens，几乎肯定不认识 `copilot_usage`；
    `llm-emit-token-metric` 策略也只认标准字段。若两条路都记不到，要做成本计费
    就必须在 **APIM outbound policy 里显式提取** `copilot_usage.total_nano_aiu`
-   写入 trace/metric，或在 hub 侧落库。
+   写入 trace/metric，或在 hub 侧落库。**注意要一并提取
+   `usage.output_tokens_details.thinking_tokens`**（§3.3：成本在
+   `copilot_usage`、thinking 占比在 `usage`，两者缺一不可）。
    > 注意 §4.2：流式响应的 `copilot_usage` 在 `message_delta` 事件里，
    > 而 APIM policy 读流式 body 历史上有 `BODY_READ_FAILED` 问题
    > （见 `customMetrics-diagnostic-troubleshooting.md` §2 路径 C）。
