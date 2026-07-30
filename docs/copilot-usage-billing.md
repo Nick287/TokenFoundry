@@ -223,24 +223,119 @@ cache 1h write → cost_per_batch 625000000000   ← 同价
 
 ### 4.2 Anthropic 流式（SSE）
 
-`copilot_usage` **只出现在 `message_delta` 事件**，`message_start` 里只有
-部分 `usage`（input 侧已定，output 侧尚未产生）：
+#### 事件分工
 
-```text
-event: message_start
-data: {"message":{...,"usage":{"cache_read_input_tokens":5071,"input_tokens":9,"output_tokens":4,...}}}
+一次完整流式响应的事件序列（实测，`max_tokens=60` 的简短回复）：
 
-event: content_block_delta
-...
+| 事件 | 次数 | `usage` | `copilot_usage` | 作用 |
+| --- | --- | --- | --- | --- |
+| `message_start` | 1 | ✅ 部分 | ❌ | input 侧已定，`output_tokens` 只是占位 |
+| `content_block_start` | 每块 1 | ❌ | ❌ | 内容块开始 |
+| `content_block_delta` | **N** | ❌ | ❌ | **逐段文本，纯内容无计量** |
+| `content_block_stop` | 每块 1 | ❌ | ❌ | 内容块结束 |
+| **`message_delta`** | **1** | ✅ **最终** | ✅ **完整** | **唯一的成本来源** |
+| `message_stop` | 1 | ❌ | ❌ | 结束信号，后跟 `data: [DONE]` |
 
-event: message_delta
-data: {"copilot_usage":{"token_details":[...],"total_nano_aiu":290550000},"usage":{...}}
+> ⚠️ **`message_delta` 不是逐 token 的增量事件**——它全程只出现**一次**，在所有
+> 内容块结束之后，一次性给出最终 `stop_reason` + `usage` + `copilot_usage`。
+> 逐 token 的文本增量走的是 `content_block_delta`。
+> **两个事件里的 `delta` 字段含义不同**：`content_block_delta.delta` 装文本，
+> `message_delta.delta` 装 `stop_reason`。
+>
+> 所以**不需要累加**任何事件——`message_delta` 的数字本身就是最终值。
 
-event: message_stop
+> ⚠️ `content_block_delta` 的切分**按网络分块，不按 token**。实测「从 1 数到 12」
+> 只产生 2 个 delta（第一个是 `"1"`，第二个是 `"\n2\n3\n...\n12"` 全部）。
+> **不能靠数 delta 个数估算 token。**
+
+#### `message_delta` 完整原文
+
+```json
+{
+  "type": "message_delta",
+  "delta": {
+    "stop_reason": "end_turn",
+    "stop_details": null,
+    "stop_sequence": null
+  },
+  "usage": {
+    "input_tokens": 11,
+    "output_tokens": 17,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "output_tokens_details": {"thinking_tokens": 0}
+  },
+  "copilot_usage": {
+    "token_details": [
+      {"batch_size": 1000000, "cost_per_batch": 500000000000,  "token_count": 11, "token_type": "input"},
+      {"batch_size": 1000000, "cost_per_batch": 50000000000,   "token_count": 0,  "token_type": "cache_read"},
+      {"batch_size": 1000000, "cost_per_batch": 625000000000,  "token_count": 0,  "token_type": "cache_write"},
+      {"batch_size": 1000000, "cost_per_batch": 2500000000000, "token_count": 17, "token_type": "output"}
+    ],
+    "total_nano_aiu": 48000000
+  }
+}
 ```
 
-→ **流式下要读 `copilot_usage` 必须解析到 `message_delta`**，
-只取 `message_start` 会拿不到成本。
+#### `message_start` 的 usage 更全（含 TTL 拆分）
+
+```json
+{
+  "type": "message_start",
+  "message": {
+    "content": [], "id": "msg_011CdXtJQUb3mnwmxXFyRDjU",
+    "model": "claude-opus-4-8", "role": "assistant",
+    "stop_reason": null, "stop_details": null, "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "input_tokens": 11,
+      "output_tokens": 5,                    // ← 占位值，最终以 message_delta 为准
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_creation": {                    // ← 只有 message_start 有
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "inference_geo": "global"              // ← 只有 message_start 有
+    }
+  }
+}
+```
+
+> **`message_delta.usage` 比 `message_start` 少两个字段**：没有 `cache_creation`
+> （TTL 拆分）和 `inference_geo`。所以流式下想拿 TTL 明细，**必须从
+> `message_start` 取**，两个事件的 usage 是互补的。
+
+#### 流式数字准确，与非流式一致
+
+同参数对比（`thinking` 场景，B 组实测）：
+
+| 指标 | 值 |
+| --- | --- |
+| `usage.output_tokens` | 2980 |
+| `usage..thinking_tokens` | 2006 |
+| `copilot_usage` 计费 output | **2980** ← 含 thinking，与非流式行为一致 |
+| `total_nano_aiu` | 7,512,500,000（$0.0751，thinking 占 67%） |
+
+输入侧（`input` / `cache_read` / `cache_write`）流式与非流式**逐项一致**；
+输出侧的差异仅来自模型每次实际生成长度不同，非计量误差。
+
+#### 解析范式
+
+```python
+for event in sse_events:
+    if event["type"] == "message_start":
+        ttl_split = event["message"]["usage"].get("cache_creation")   # 可选
+    elif event["type"] == "message_delta":
+        usage = event["usage"]                    # 最终用量
+        cost  = event["copilot_usage"]            # 最终成本
+        break                                     # 拿到即可，无需遍历全部
+```
+
+> ⚠️ **流式的成本数据是单点的**——只在 `message_delta` 一个事件里。若流在此之前
+> 中断（客户端断开、超时、网络抖动），**成本数据彻底丢失**，但上游对已生成的
+> token 照常计费。非流式至少能从 HTTP 状态判断成败，流式中断是**静默丢失**。
+> 做计费遥测必须为这种情况兜底。
 
 ### 4.3 OpenAI 兼容（`POST /llm-openai/v1/chat/completions`）
 
@@ -302,6 +397,34 @@ event: message_stop
 价格表。但**它和 `usage` 互补、缺一不可**——成本在 `copilot_usage`，
 thinking 与 TTL 拆分在 `usage`。两者目前都只存在于**响应体**里。
 
+### 5.1 上游只注入了一个字段
+
+对整个响应做递归字段扫描（流式 + 非流式），**Copilot 专属的只有
+`copilot_usage` 及其子字段**，其余全部是各厂商的标准字段：
+
+```text
+copilot_usage                                  ← 唯一的注入点
+copilot_usage.total_nano_aiu
+copilot_usage.token_details[].token_type
+copilot_usage.token_details[].token_count
+copilot_usage.token_details[].cost_per_batch
+copilot_usage.token_details[].batch_size
+```
+
+**响应头里零个** Copilot/GitHub 相关字段：
+
+```text
+Connection / Content-Type / Date / Transfer-Encoding
+Set-Cookie       ← 我们 APIM 的 session affinity，非上游
+Request-Context  ← App Insights 的，非上游
+```
+
+> ⚠️ 易混淆：`usage.inference_geo`（值如 `"global"`）看着像 Copilot 加的，
+> 其实是 **Anthropic 官方字段**（数据驻留地标识），别当成上游标记。
+
+**对遥测提取是好消息**：只需识别 `copilot_usage` 一个 key，而且它在
+anthropic 和 openai 两条路径上同名同结构，不用为每个厂商写变体。
+
 ---
 
 ## 6. 待验证 / 待办
@@ -313,9 +436,16 @@ thinking 与 TTL 拆分在 `usage`。两者目前都只存在于**响应体**里
    写入 trace/metric，或在 hub 侧落库。**注意要一并提取
    `usage.output_tokens_details.thinking_tokens`**（§3.3：成本在
    `copilot_usage`、thinking 占比在 `usage`，两者缺一不可）。
-   > 注意 §4.2：流式响应的 `copilot_usage` 在 `message_delta` 事件里，
-   > 而 APIM policy 读流式 body 历史上有 `BODY_READ_FAILED` 问题
-   > （见 `customMetrics-diagnostic-troubleshooting.md` §2 路径 C）。
+
+   **倾向 hub 侧落库**，两个理由（均见 §4.2）：
+
+   | 方案 | 非流式 | 流式 |
+   | --- | --- | --- |
+   | APIM outbound policy | ✅ 可行 | ❌ 需读 SSE body，历史上 `BODY_READ_FAILED`（见 `customMetrics-diagnostic-troubleshooting.md` §2 路径 C） |
+   | **hub 侧** | ✅ | ✅ hub 本就在解析 SSE |
+
+   另需为**流式中断**兜底：成本数据只在 `message_delta` 单点，流在此之前断掉
+   就静默丢失，而上游对已生成 token 照常计费。
 2. **其他模型的单价表**——只实测了 opus-4-8 / haiku-4.5 / gpt-4o-mini，
    gemini 系与其余 claude 型号未测。
 3. **免费档的定价策略**——gpt-4o-mini 上游成本为 0，若要计费需自定价。
