@@ -1,6 +1,7 @@
 // Reusable modal shell + a danger-confirm dialog. One overlay, two uses:
 //   <Modal>        — host for an edit form (caller renders inputs + footer)
-//   <ConfirmDialog>— destructive confirm with name echo + impact line
+//   <ConfirmDialog>— consequential-action confirm with impact line (delete by
+//                    default; labels/tone overridable)
 //
 // Closes on Esc or backdrop click; focus moves into the panel on open; the
 // fade-in is skipped under prefers-reduced-motion (CSS-driven).
@@ -68,18 +69,28 @@ export function Modal({
   );
 }
 
-// Destructive confirm: title + an impact line (resource name, "N keys use it"),
-// then Cancel / Delete. The delete button shows a busy label while pending.
+// Consequential-action confirm: title + an impact line (resource name, "N keys
+// use it"), then Cancel / <action>. Defaults to a delete confirm; the labels and
+// the solid-danger styling are overridable so a non-destructive but still
+// consequential action (turning on raw-body archival, say) can reuse the same
+// "state the impact, then make them click again" shape instead of growing a
+// second dialog that drifts from this one.
 export function ConfirmDialog({
   title,
   impact,
   busy,
+  confirmLabel,
+  busyLabel,
+  danger = true,
   onConfirm,
   onClose,
 }: {
   title: string;
   impact: ReactNode;
   busy?: boolean;
+  confirmLabel?: string;
+  busyLabel?: string;
+  danger?: boolean;
   onConfirm: () => void;
   onClose: () => void;
 }) {
@@ -93,11 +104,13 @@ export function ConfirmDialog({
         </button>
         <button
           type="button"
-          className="btn-sm btn-danger-solid"
+          className={`btn-sm${danger ? " btn-danger-solid" : ""}`}
           onClick={onConfirm}
           disabled={busy}
         >
-          {busy ? t("common.deleting") : t("common.delete")}
+          {busy
+            ? (busyLabel ?? t("common.deleting"))
+            : (confirmLabel ?? t("common.delete"))}
         </button>
       </div>
     </Modal>

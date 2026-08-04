@@ -2,9 +2,31 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { api, type UsageTelemetry } from "../api/client";
+import { api, type TokenGroup, type UsageBreakdown, type UsageTelemetry } from "../api/client";
 import { usePrincipal } from "../auth/AuthProvider";
 import { UsageCard } from "./UsageCard";
+
+// The per-type token columns, declared once and rendered by both the stat row
+// and the table. Adding a token type upstream should be one edit here, not two
+// hand-synchronised JSX blocks that silently drift apart.
+//
+// Order is billing-narrative: what went in, what was reused from cache, what was
+// written to cache, what came out.
+const TOKEN_COLS = [
+  { key: "prompt_tok", label: "usage.tokPrompt" },
+  { key: "cached_tok", label: "usage.tokCached" },
+  { key: "cache_write_tok", label: "usage.tokCacheWrite" },
+  { key: "completion_tok", label: "usage.tokCompletion" },
+] as const satisfies ReadonlyArray<{ key: keyof TokenGroup; label: string }>;
+
+// Costs run small — a cheap model's hourly spend is fractions of a cent — so a
+// fixed 2dp would render most real rows as "$0.00" and look broken. Show enough
+// significant digits that a non-zero cost never displays as zero.
+function fmtUsd(v: number): string {
+  if (!v) return "$0";
+  if (v < 0.01) return `$${v.toFixed(6)}`;
+  return `$${v.toFixed(4)}`;
+}
 
 // Calls-per-hour mini time series. CSS-only (no chart lib). The backend zero-
 // fills every hour in the window, so bars are evenly spaced across a continuous
@@ -123,7 +145,7 @@ export function UsageDashboardPage() {
   const [tenantId, setTenantId] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(15);
-  const [groupBy, setGroupBy] = useState<"model" | "api" | "subscription" | "backend">("model");
+  const [groupBy, setGroupBy] = useState<UsageBreakdown["by"]>("model");
   const PAGE_SIZE_OPTIONS = [10, 15, 20];
 
   const tenants = useQuery({
@@ -275,7 +297,7 @@ export function UsageDashboardPage() {
           <h3>{t("usage.breakdownSection")}</h3>
           <p className="hint">{t("usage.breakdownHint")}</p>
           <div className="seg-toggle">
-            {(["model", "api", "subscription", "backend"] as const).map((g) => (
+            {(["model", "api", "subscription", "backend", "end_user"] as const).map((g) => (
               <button
                 key={g}
                 type="button"
@@ -292,29 +314,21 @@ export function UsageDashboardPage() {
             <>
               <div className="stat-row">
                 <div className="stat card">
-                  <span className="stat-label">{t("usage.tokTotal")}</span>
-                  <span className="stat-value">{breakdown.data.totals.total.toLocaleString()}</span>
+                  <span className="stat-label">{t("usage.colBilled")}</span>
+                  <span className="stat-value">{fmtUsd(breakdown.data.totals.billed_usd)}</span>
                 </div>
                 <div className="stat card">
-                  <span className="stat-label">{t("usage.tokPrompt")}</span>
-                  <span className="stat-value">{breakdown.data.totals.prompt.toLocaleString()}</span>
+                  <span className="stat-label">{t("usage.colCost")}</span>
+                  <span className="stat-value">{fmtUsd(breakdown.data.totals.cost_usd)}</span>
                 </div>
-                <div className="stat card">
-                  <span className="stat-label">{t("usage.tokCached")}</span>
-                  <span className="stat-value">{breakdown.data.totals.cached.toLocaleString()}</span>
-                </div>
-                <div className="stat card">
-                  <span className="stat-label">{t("usage.tokCompletion")}</span>
-                  <span className="stat-value">{breakdown.data.totals.completion.toLocaleString()}</span>
-                </div>
-                <div className="stat card">
-                  <span className="stat-label">{t("usage.tokReasoning")}</span>
-                  <span className="stat-value">{breakdown.data.totals.reasoning.toLocaleString()}</span>
-                </div>
-                <div className="stat card">
-                  <span className="stat-label">{t("usage.tokCacheCreation")}</span>
-                  <span className="stat-value">{breakdown.data.totals.cache_creation.toLocaleString()}</span>
-                </div>
+                {TOKEN_COLS.map((c) => (
+                  <div className="stat card" key={c.key}>
+                    <span className="stat-label">{t(c.label)}</span>
+                    <span className="stat-value">
+                      {breakdown.data!.totals[c.key].toLocaleString()}
+                    </span>
+                  </div>
+                ))}
                 <div className="stat card">
                   <span className="stat-label">{t("usage.callsLabel")}</span>
                   <span className="stat-value">{breakdown.data.totals.calls.toLocaleString()}</span>
@@ -325,37 +339,42 @@ export function UsageDashboardPage() {
                   <thead>
                     <tr>
                       <th>{t(`usage.groupBy_${breakdown.data.by}`)}</th>
-                      <th>{t("usage.tokTotal")}</th>
-                      <th>{t("usage.tokPrompt")}</th>
-                      <th>{t("usage.tokCached")}</th>
-                      <th>{t("usage.tokCompletion")}</th>
-                      <th>{t("usage.tokReasoning")}</th>
-                      <th>{t("usage.tokCacheCreation")}</th>
+                      <th>{t("usage.colBilled")}</th>
+                      <th>{t("usage.colCost")}</th>
+                      {TOKEN_COLS.map((c) => (
+                        <th key={c.key}>{t(c.label)}</th>
+                      ))}
                       <th>{t("usage.callsLabel")}</th>
                     </tr>
                   </thead>
                   <tbody>
                     {breakdown.data.groups.map((g) => {
-                      const label = g.model ?? g.api ?? g.subscription ?? g.backend;
+                      const label =
+                        g.model ?? g.api ?? g.subscription ?? g.backend ?? g.end_user;
+                      // Opaque identifiers (key ids, hub ids, customer-supplied
+                      // user ids) get monospace treatment; model/api names are prose.
+                      const isId =
+                        breakdown.data!.by === "subscription" ||
+                        breakdown.data!.by === "backend" ||
+                        breakdown.data!.by === "end_user";
                       return (
                         <tr key={label ?? "unknown"}>
                           <td>
-                            {breakdown.data!.by === "subscription" || breakdown.data!.by === "backend" ? (
+                            {isId ? (
                               <code className="id-cell">{label || t("usage.modelUnknown")}</code>
                             ) : (
                               label || t("usage.modelUnknown")
                             )}
                           </td>
-                          <td>{g.total.toLocaleString()}</td>
-                          <td>{g.prompt.toLocaleString()}</td>
-                          <td>{g.cached.toLocaleString()}</td>
-                          <td>{g.completion.toLocaleString()}</td>
-                          <td className={g.reasoning > 0 ? undefined : "cell-zero"}>
-                            {g.reasoning.toLocaleString()}
+                          <td>{fmtUsd(g.billed_usd)}</td>
+                          <td className={g.cost_usd > 0 ? undefined : "cell-zero"}>
+                            {fmtUsd(g.cost_usd)}
                           </td>
-                          <td className={g.cache_creation > 0 ? undefined : "cell-zero"}>
-                            {g.cache_creation.toLocaleString()}
-                          </td>
+                          {TOKEN_COLS.map((c) => (
+                            <td key={c.key} className={g[c.key] > 0 ? undefined : "cell-zero"}>
+                              {g[c.key].toLocaleString()}
+                            </td>
+                          ))}
                           <td>{g.calls.toLocaleString()}</td>
                         </tr>
                       );

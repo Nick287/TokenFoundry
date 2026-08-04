@@ -10,6 +10,7 @@ warm.
 Endpoints (admin-only, mirrors app/api/routes.py):
   POST /github-accounts/device/start  -> begin device flow, create a pending record
   POST /github-accounts/device/poll   -> poll GitHub; on success kick off deploy
+  POST /github-accounts/{id}/relogin/start|poll -> re-authorize an EXISTING account
   GET  /github-accounts               -> list accounts + their deploy status
   DELETE /github-accounts/{id}        -> destroy the hub + remove from pools
 
@@ -33,7 +34,12 @@ from app.api.auth import Principal, require_admin
 from app.db import SessionLocal, get_db
 from app.models.enums import AuthMode, DeployStatus, OwnerScope, Provider
 from app.models.orm import GitHubAccount, ModelRoute
-from app.models.schemas import DevicePollOut, DeviceStartOut, GitHubAccountOut
+from app.models.schemas import (
+    DevicePollOut,
+    DeviceStartOut,
+    GitHubAccountOut,
+    ReloginPollOut,
+)
 from app.services import copilot_device, terraform_runner
 from app.services.apim_provisioner import ApimProvisioner
 from app.services.keyvault import KeyVaultService
@@ -42,6 +48,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _HUB_MODELS_TIMEOUT = 30.0
+_HUB_TOKEN_INSTALL_TIMEOUT = 30.0
 
 
 def _provider_for_model(model_id: str) -> str | None:
@@ -316,6 +323,159 @@ def resync_catalog(
         ) from exc
     after = db.query(ModelRoute).count()
     return {"account_id": account_id, "routes_before": before, "routes_after": after}
+
+
+# --------------------------------------------------------------------------- #
+# Re-login (recover an expired Copilot OAuth token without a redeploy)          #
+# --------------------------------------------------------------------------- #
+def _install_token_on_hub(fqdn: str, admin_token: str, oauth_token: str) -> None:
+    """Hot-swap a running hub's Copilot OAuth token via its admin API.
+
+    The hub validates the token against GitHub's exchange endpoint before
+    keeping it, so a non-2xx here means the new token genuinely does not work —
+    not that the call was malformed. Raises RuntimeError with the hub's own
+    detail (rejected) or httpx.HTTPError (unreachable); the two need different
+    advice, so they stay distinguishable.
+    """
+    with httpx.Client(timeout=_HUB_TOKEN_INSTALL_TIMEOUT) as hc:
+        r = hc.post(
+            f"https://{fqdn}/api/auth/copilot/token",
+            headers={"x-admin-token": admin_token},
+            json={"access_token": oauth_token},
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"hub rejected the token ({r.status_code}): {r.text[:400]}")
+
+
+def _account_for_relogin(db: Session, account_id: str) -> GitHubAccount:
+    """Fetch an account that can actually accept a new token, or 404/409."""
+    acct = db.get(GitHubAccount, account_id)
+    if not acct:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="account not found")
+    # READY only: a pending account is mid-deploy and owns `device_code` for its
+    # own flow, and a failed/deleting one has no hub to install the token into.
+    if acct.status != DeployStatus.READY:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"account is {acct.status.value}; re-login needs a ready account",
+        )
+    if not acct.container_app_fqdn or not acct.admin_token_kv_ref:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="account has no hub endpoint / admin token (redeploy required)",
+        )
+    return acct
+
+
+@router.post("/github-accounts/{account_id}/relogin/start", response_model=DeviceStartOut)
+def relogin_start(
+    account_id: str,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> DeviceStartOut:
+    """Begin a device flow that REPLACES an existing account's Copilot token.
+
+    Why this exists: the `ghu_` token minted by the device flow can stop being
+    accepted without anything on our side changing — signing the same GitHub
+    account in from somewhere else is the common trigger. The hub caches the
+    exchanged API token in-process, so nothing looks wrong until that cache turns
+    over, and then every request through this account's hub 503s. Before this
+    endpoint the only fix was a full terraform redeploy (minutes, new revision)
+    or a manual Key Vault + container edit; now it is one button and a browser
+    round-trip.
+    """
+    acct = _account_for_relogin(db, account_id)
+    flow = copilot_device.start_device_flow()
+    acct.device_code = flow["device_code"]
+    db.commit()
+    return DeviceStartOut(
+        account_id=account_id,
+        user_code=flow["user_code"],
+        verification_uri=flow["verification_uri"],
+        interval=flow["interval"],
+        expires_in=flow["expires_in"],
+    )
+
+
+@router.post("/github-accounts/{account_id}/relogin/poll", response_model=ReloginPollOut)
+def relogin_poll(
+    account_id: str,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+) -> ReloginPollOut:
+    """Poll the re-login flow; on success install the token and persist it.
+
+    Order matters: the hub is updated FIRST and Key Vault only after that
+    succeeds. Key Vault is the durable copy that a future redeploy injects, so
+    it must never hold a token that was not proven to work — a hub that has been
+    down for a week would otherwise be redeployed straight back into 401s.
+
+    The deploy state machine is untouched throughout: the account was ready
+    before and stays ready, because nothing is being deployed.
+    """
+    acct = _account_for_relogin(db, account_id)
+    if not acct.device_code:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="no re-login in progress; call relogin/start first",
+        )
+
+    result = copilot_device.poll_device_flow(acct.device_code)
+    if result["status"] == "pending":
+        return ReloginPollOut(account_id=account_id, status="pending")
+    if result["status"] == "error":
+        acct.device_code = None
+        db.commit()
+        return ReloginPollOut(
+            account_id=account_id,
+            status="failed",
+            detail=f"device flow: {result.get('error')}",
+        )
+
+    token = result["access_token"]
+    who = copilot_device.whoami(token)
+
+    # The browser that authorized may have been signed into a DIFFERENT GitHub
+    # account. Installing that token would silently re-point this hub at someone
+    # else's Copilot quota while the portal, the pool membership and every usage
+    # record still say the original login — so refuse rather than guess.
+    if acct.github_user_id and who.get("id") and who["id"] != acct.github_user_id:
+        acct.device_code = None
+        db.commit()
+        return ReloginPollOut(
+            account_id=account_id,
+            status="failed",
+            detail=(
+                f"authorized as {who.get('login') or 'another user'}, "
+                f"but this account is {acct.github_login or acct.github_user_id}"
+            ),
+        )
+
+    kv = KeyVaultService()
+    admin_token = kv.get_secret(acct.admin_token_kv_ref or "")
+    if not admin_token:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="hub admin token not found in Key Vault",
+        )
+
+    try:
+        _install_token_on_hub(acct.container_app_fqdn or "", admin_token, token)
+    except (RuntimeError, httpx.HTTPError) as exc:
+        acct.device_code = None
+        db.commit()
+        logger.warning("relogin: %s token install failed: %s", account_id, exc)
+        return ReloginPollOut(account_id=account_id, status="failed", detail=str(exc)[:500])
+
+    kv.set_secret(_github_token_name(account_id), token)
+    acct.oauth_token_kv_ref = _github_token_name(account_id)
+    acct.github_login = who.get("login") or acct.github_login
+    acct.device_code = None
+    db.commit()
+    logger.info("relogin: %s token replaced (login=%s)", account_id, acct.github_login)
+    return ReloginPollOut(
+        account_id=account_id, status="success", github_login=acct.github_login
+    )
 
 
 # --------------------------------------------------------------------------- #

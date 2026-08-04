@@ -499,6 +499,19 @@ code.id-cell {
   color: var(--error);
 }
 
+/* Raw-body archival. Amber rather than green: "on" here means customer content
+   is being written to disk, which is a state to notice, not to reassure about.
+   "off" is the default and stays visually quiet. */
+.badge-audit-on {
+  background: #fbeee0;
+  color: var(--accent-dark);
+}
+
+.badge-off {
+  background: var(--border);
+  color: var(--muted);
+}
+
 /* --- Row action buttons (Users page) --- */
 .row-actions {
   display: flex;

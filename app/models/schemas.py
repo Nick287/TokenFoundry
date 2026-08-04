@@ -98,12 +98,18 @@ class TenantOut(BaseModel):
     billing_account_id: str | None
     apim_product_ids: list[str]
     status: TenantStatus
+    audit_enabled: bool
     created_at: datetime
 
 
 class TenantUpdate(BaseModel):
     name: str | None = None
     mode: TenantMode | None = None
+    # Raw request/response archival. Kept out of TenantCreate on purpose: a
+    # tenant is never born archiving, it is switched on by a deliberate act
+    # after somebody has consented. Applying it also pushes the flag to APIM, so
+    # unlike the other fields here it can fail on an APIM outage.
+    audit_enabled: bool | None = None
 
 
 # ----- Project -----
@@ -246,6 +252,19 @@ class DevicePollOut(BaseModel):
     status walks pending -> deploying -> ready (or failed)."""
     account_id: str
     status: DeployStatus
+    github_login: str | None = None
+    detail: str | None = None
+
+
+class ReloginPollOut(BaseModel):
+    """Returned by POST /github-accounts/{id}/relogin/poll.
+
+    Deliberately NOT a DeployStatus like DevicePollOut: re-login does not deploy
+    anything and must not move the account's deploy state machine. The account
+    stays `ready` throughout — this status describes the login attempt only.
+    """
+    account_id: str
+    status: str  # pending | success | failed
     github_login: str | None = None
     detail: str | None = None
 

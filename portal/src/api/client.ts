@@ -16,6 +16,9 @@ export interface Tenant {
   mode: "RESELL" | "BYO" | "INTERNAL";
   status: string;
   apim_product_ids: string[];
+  // Whether raw request/response bodies are archived for this tenant. Off for
+  // everyone until a platform operator turns it on; see docs/AUDIT.zh.md.
+  audit_enabled: boolean;
   created_at: string;
 }
 
@@ -102,6 +105,16 @@ export interface DevicePoll {
   detail: string | null;
 }
 
+// Returned by POST /github-accounts/{id}/relogin/poll. NOT a deploy status:
+// re-login replaces an expired Copilot token on a live hub and deliberately
+// leaves the account's deploy state alone. Mirrors schemas.py:ReloginPollOut.
+export interface ReloginPoll {
+  account_id: string;
+  status: "pending" | "success" | "failed";
+  github_login: string | null;
+  detail: string | null;
+}
+
 // Readiness of the 方案 A GitHub deploy wiring (drives the add-account gate).
 // Never carries secret VALUES — only presence booleans. Mirrors
 // app/models/schemas.py:DeployConfigStatus.
@@ -158,46 +171,47 @@ export interface UsageTelemetry {
   by_hour: Array<{ ts: string; calls: number }>;
 }
 
-// Per-model (or per-endpoint / per-subscription) token breakdown from App
-// Insights metering. Covers streaming + non-streaming. Each group carries the
-// five token types + metered call count; `trend` is a zero-filled dual series
-// (tokens + calls) on the same buckets.
+// Per-model (or per-endpoint / per-subscription / per-hub / per-end-user) token
+// AND cost breakdown, aggregated by Cosmos over the same rows the invoice is
+// built from. Covers streaming and non-streaming alike, and prices each call
+// from upstream's own `copilot_usage` — so these totals reconcile with the bill
+// rather than approximating it.
+//
+// `cost_usd` is what upstream charged us; `billed_usd` adds the route's markup
+// (identical for INTERNAL/BYO tenants, where markup is 0).
 export interface TokenGroup {
   model?: string;
   api?: string;
   subscription?: string;
   backend?: string;
-  total: number;
-  prompt: number;
-  cached: number;
-  completion: number;
-  reasoning: number;
-  cache_creation: number;
-  // Emitted for multimodal / speculative-decoding; 0 for plain-text calls.
-  accepted_prediction?: number;
-  rejected_prediction?: number;
-  prompt_audio?: number;
-  completion_audio?: number;
+  end_user?: string;
+  prompt_tok: number;
+  cached_tok: number;
+  // Priced HIGHER than input upstream, so it is shown rather than folded into
+  // the prompt count — otherwise cache-heavy traffic looks cheaper than billed.
+  cache_write_tok: number;
+  completion_tok: number;
+  cost_usd: number;
+  billed_usd: number;
+  calls: number;
+}
+export interface UsageTotals {
+  prompt_tok: number;
+  cached_tok: number;
+  cache_write_tok: number;
+  completion_tok: number;
+  cost_usd: number;
+  billed_usd: number;
   calls: number;
 }
 export interface UsageBreakdown {
-  by: "model" | "api" | "subscription" | "backend";
+  by: "model" | "api" | "subscription" | "backend" | "end_user";
   hours: number;
   groups: TokenGroup[];
-  trend: Array<{ ts: string; tokens: number; calls: number }>;
-  totals: {
-    total: number;
-    prompt: number;
-    cached: number;
-    completion: number;
-    reasoning: number;
-    cache_creation: number;
-    accepted_prediction?: number;
-    rejected_prediction?: number;
-    prompt_audio?: number;
-    completion_audio?: number;
-    calls: number;
-  };
+  trend: Array<{ ts: string; tokens: number; calls: number; cost_usd: number }>;
+  // Queried independently of `groups`, not summed from it: the group list can be
+  // truncated on a high-cardinality dimension and the headline must stay whole.
+  totals: UsageTotals;
 }
 
 async function request<T>(
@@ -262,7 +276,13 @@ export const api = {
     request<Tenant>(`/tenants/${tenantId}/ensure-product`, token, {
       method: "POST",
     }),
-  updateTenant: (token: string, id: string, body: { name?: string; mode?: string }) =>
+  // `audit_enabled` is applied at the APIM gateway BEFORE it is recorded, so a
+  // 502 here means nothing changed — the toggle stays where it was.
+  updateTenant: (
+    token: string,
+    id: string,
+    body: { name?: string; mode?: string; audit_enabled?: boolean },
+  ) =>
     request<Tenant>(`/tenants/${id}`, token, {
       method: "PATCH",
       body: JSON.stringify(body),
@@ -337,7 +357,7 @@ export const api = {
     token: string,
     tenantId: string,
     hours = 24,
-    by: "model" | "api" | "subscription" | "backend" = "model",
+    by: UsageBreakdown["by"] = "model",
   ) =>
     request<UsageBreakdown>(
       `/admin/usage/${tenantId}/breakdown?hours=${hours}&by=${by}`,
@@ -346,7 +366,7 @@ export const api = {
   platformUsageBreakdown: (
     token: string,
     hours = 24,
-    by: "model" | "api" | "subscription" | "backend" = "model",
+    by: UsageBreakdown["by"] = "model",
   ) =>
     request<UsageBreakdown>(
       `/admin/usage-breakdown?hours=${hours}&by=${by}`,
@@ -408,6 +428,19 @@ export const api = {
       token,
       { method: "POST" },
     ),
+  // Re-authorize an EXISTING account. The ghu_ token GitHub minted for this hub
+  // can stop working without anything here changing — signing the same account
+  // in elsewhere is the common cause — and the hub only discovers it when its
+  // cached API token turns over, at which point everything through that hub
+  // 503s. These two swap the token on the live hub, no redeploy and no restart.
+  startGithubRelogin: (token: string, id: string) =>
+    request<DeviceStart>(`/github-accounts/${id}/relogin/start`, token, {
+      method: "POST",
+    }),
+  pollGithubRelogin: (token: string, id: string) =>
+    request<ReloginPoll>(`/github-accounts/${id}/relogin/poll`, token, {
+      method: "POST",
+    }),
   // --- Deploy config (GitHub PATs + SP push; gates add-account) ---
   getDeployStatus: (token: string) =>
     request<DeployConfigStatus>("/deploy-config/status", token),

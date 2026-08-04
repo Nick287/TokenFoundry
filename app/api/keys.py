@@ -85,6 +85,13 @@ def create_key(
         provisioner.upsert_key_limits(
             key_id, body.tokens_per_minute, quota_tier, period
         )
+        # A key issued under an audit-enabled tenant must inherit the flag in
+        # the same breath. Skipping it would leave the tenant believing all its
+        # traffic is archived while this one key's is not — a silent hole in
+        # exactly the record an audit exists to provide. Rolled back with the
+        # issuance on failure, same as the limits.
+        if tenant.audit_enabled:
+            provisioner.set_audit_flag([key_id], True)
     except Exception as exc:  # noqa: BLE001 — roll back issuance on any limit failure
         try:
             provisioner.delete_subscription(key_id)

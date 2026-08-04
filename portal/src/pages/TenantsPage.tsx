@@ -18,6 +18,11 @@ export function TenantsPage() {
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<Tenant | null>(null);
   const [removing, setRemoving] = useState<Tenant | null>(null);
+  // The tenant whose archival switch is being flipped, if any. Deliberately a
+  // separate confirm rather than a checkbox inside the edit form: this one
+  // decides whether the customer's prompts and source code start landing on
+  // disk, and it should not be reachable by the same reflex as a rename.
+  const [auditing, setAuditing] = useState<Tenant | null>(null);
 
   const tenants = useQuery({
     queryKey: ["tenants"],
@@ -59,6 +64,25 @@ export function TenantsPage() {
     },
   });
 
+  // Separate from `save` because the failure mode is different: the control
+  // plane pushes the flag to APIM first and only records it if that succeeds,
+  // so a 502 here means archival did NOT change. That has to be visible —
+  // silently leaving the switch where it was is how an operator ends up
+  // believing a tenant is being audited when nothing is being captured.
+  const toggleAudit = useMutation({
+    mutationFn: (vars: { id: string; enabled: boolean }) =>
+      api.updateTenant(principal.token, vars.id, { audit_enabled: vars.enabled }),
+    onSuccess: (_data, vars) => {
+      setAuditing(null);
+      toast(vars.enabled ? t("tenants.auditOnDone") : t("tenants.auditOffDone"));
+      qc.invalidateQueries({ queryKey: ["tenants"] });
+    },
+    onError: () => {
+      setAuditing(null);
+      toast(t("tenants.auditFailed"), "error");
+    },
+  });
+
   function onSubmit(e: FormEvent) {
     e.preventDefault();
     if (!name || create.isPending) return;
@@ -94,6 +118,9 @@ export function TenantsPage() {
       </form>
       )}
       {create.isError && <p className="error">{String(create.error)}</p>}
+      {/* Persistent, unlike the toast: a gateway rejection is worth reading
+          after the 3-second window has gone. */}
+      {toggleAudit.isError && <p className="error">{String(toggleAudit.error)}</p>}
 
       {tenants.isLoading ? (
         <p>{t("common.loading")}</p>
@@ -113,6 +140,7 @@ export function TenantsPage() {
               <th>{t("common.id")}</th>
               <th>{t("tenants.mode")}</th>
               <th>{t("tenants.product")}</th>
+              <th>{t("tenants.audit")}</th>
               <th>{t("common.status")}</th>
               <th>{t("common.actions")}</th>
             </tr>
@@ -139,11 +167,28 @@ export function TenantsPage() {
                   )}
                 </td>
                 <td>
+                  <span
+                    className={`badge badge-${tn.audit_enabled ? "audit-on" : "off"}`}
+                  >
+                    {tn.audit_enabled ? t("tenants.auditOn") : t("tenants.auditOff")}
+                  </span>
+                </td>
+                <td>
                   <span className={`badge badge-${tn.status}`}>{tn.status}</span>
                 </td>
                 <td className="row-actions">
                   <button type="button" className="btn-sm" onClick={() => setEditing(tn)}>
                     {t("common.edit")}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={toggleAudit.isPending}
+                    onClick={() => setAuditing(tn)}
+                  >
+                    {tn.audit_enabled
+                      ? t("tenants.auditDisable")
+                      : t("tenants.auditEnable")}
                   </button>
                   <button
                     type="button"
@@ -166,6 +211,42 @@ export function TenantsPage() {
           busy={save.isPending}
           onClose={() => setEditing(null)}
           onSave={(body) => save.mutate({ id: editing.id, body })}
+        />
+      )}
+      {auditing && (
+        <ConfirmDialog
+          title={
+            auditing.audit_enabled
+              ? t("tenants.auditOffTitle")
+              : t("tenants.auditOnTitle")
+          }
+          impact={
+            auditing.audit_enabled ? (
+              t("tenants.auditOffImpact", { name: auditing.name })
+            ) : (
+              <>
+                {t("tenants.auditOnImpact", { name: auditing.name })}{" "}
+                <strong>{t("tenants.auditOnWarning")}</strong>
+              </>
+            )
+          }
+          busy={toggleAudit.isPending}
+          confirmLabel={
+            auditing.audit_enabled
+              ? t("tenants.auditDisable")
+              : t("tenants.auditEnable")
+          }
+          busyLabel={t("common.saving")}
+          // Solid-danger only in the direction that starts writing customer
+          // content to disk. Switching archival off needs no alarm colour.
+          danger={!auditing.audit_enabled}
+          onConfirm={() =>
+            toggleAudit.mutate({
+              id: auditing.id,
+              enabled: !auditing.audit_enabled,
+            })
+          }
+          onClose={() => setAuditing(null)}
         />
       )}
       {removing && (

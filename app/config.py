@@ -48,6 +48,33 @@ class Settings(BaseSettings):
     cosmos_database: str = "tokenfoundry"
     cosmos_usage_container: str = "usage"
 
+    # --- Usage pipeline (hub -> Event Hub -> Capture blobs -> Cosmos) ---
+    # The first three are pass-through only: the control plane never produces to
+    # the Event Hub, it just republishes the coordinates as HUB_EVENTHUB_*
+    # Actions variables so each hub's deploy can point its producer at them.
+    eventhub_namespace_id: str = ""
+    eventhub_fqdn: str = ""
+    eventhub_name: str = ""
+    # These are what the import job reads. Capture writes Avro blobs on a fixed
+    # interval; running the import faster than that only re-lists the same
+    # blobs, so the interval is the floor on the job's schedule.
+    usage_capture_storage_account: str = ""
+    usage_capture_container: str = "usage-capture"
+    usage_capture_interval_seconds: int = 300
+
+    # --- Audit archive (raw bodies, opt-in per tenant) ---
+    # Pass-through only, and it stays that way on purpose: these are republished
+    # as HUB_AUDIT_* Actions variables so each hub can write payloads, and the
+    # control plane holds NO role on that storage account. It records blob paths
+    # next to usage documents; reading one takes a role granted out of band to a
+    # named person. retention_days is echoed from infra so anything the app says
+    # about how long content is kept matches what lifecycle management actually
+    # enforces.
+    audit_account_url: str = ""
+    audit_container: str = "audit"
+    audit_container_scope: str = ""
+    audit_retention_days: int = 90
+
     # --- Key Vault (subscription keys + BYO provider secrets) ---
     keyvault_uri: str = ""
 

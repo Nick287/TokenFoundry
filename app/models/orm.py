@@ -13,6 +13,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     Enum,
     Float,
@@ -64,6 +65,14 @@ class Tenant(Base, TimestampMixin):
     status: Mapped[TenantStatus] = mapped_column(
         Enum(TenantStatus), default=TenantStatus.ACTIVE
     )
+    # Raw request/response archival for this tenant's traffic. Default OFF and
+    # deliberately per tenant, not global: what gets archived is customer
+    # content (source code, and whatever was pasted into a prompt), so it is
+    # stored only where someone has consented. Flipping this pushes an `a` flag
+    # into the APIM named-value map, which makes the gateway stamp `x-tf-audit`;
+    # the hub archives nothing without that header. See
+    # apim_provisioner.set_audit_flag and vendored/gitmodel-hub/hub/audit.py.
+    audit_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     projects: Mapped[list[Project]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
@@ -214,7 +223,9 @@ class GitHubAccount(Base, TimestampMixin):
         Enum(DeployStatus), default=DeployStatus.PENDING
     )
     error_detail: Mapped[str | None] = mapped_column(String(2048))
-    # Device-flow handle kept only while status=pending (to poll GitHub).
+    # Device-flow handle, held only while a flow is in progress: the initial
+    # login (status=pending) or a re-login on a ready account (see
+    # /github-accounts/{id}/relogin/*). Cleared as soon as the flow resolves.
     device_code: Mapped[str | None] = mapped_column(String(128))
     # Deployed-infra coordinates (populated once terraform apply succeeds).
     resource_group: Mapped[str | None] = mapped_column(String(128))
@@ -224,6 +235,25 @@ class GitHubAccount(Base, TimestampMixin):
     # e.g. ["llm-openai-<id>", "llm-anthropic-<id>", "llm-google-<id>"]. Used to
     # remove them from the pools on delete.
     backend_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+
+class ImportWatermark(Base, TimestampMixin):
+    """How far a batch importer has read its source. One row per source.
+
+    Currently the only source is `usage_capture` — the Event Hub Capture blobs
+    the usage import job drains into Cosmos (app/services/usage_capture_import).
+
+    `position` is deliberately an opaque string rather than a typed cursor: what
+    "how far" means is the importer's business (an ISO timestamp here, a blob
+    name or offset for something else), and keeping it opaque means a new
+    importer needs no schema change. Re-reading from a stale position must be
+    harmless — every importer using this writes idempotently.
+    """
+
+    __tablename__ = "import_watermarks"
+
+    source: Mapped[str] = mapped_column(String(64), primary_key=True)
+    position: Mapped[str] = mapped_column(String(512), default="")
 
 
 # NOTE: UsageRecord is intentionally NOT an ORM model — it's a high-write,

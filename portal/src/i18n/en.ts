@@ -62,6 +62,21 @@ export const en = {
     emptyTitle: "No tenants yet",
     emptyHint: "A tenant is the billing & isolation boundary. Create your first.",
     editTitle: "Edit tenant",
+    audit: "Body archival",
+    auditOn: "on",
+    auditOff: "off",
+    auditEnable: "Turn on archival",
+    auditDisable: "Turn off archival",
+    auditOnTitle: "Archive raw bodies?",
+    auditOnImpact:
+      "Every subsequent call by {{name}} has its full request and response body archived, kept for 90 days.",
+    auditOnWarning:
+      "That content includes the customer's source code and whatever users paste into a prompt, secrets and personal data included. Confirm the customer has been told before turning this on.",
+    auditOffImpact:
+      "New calls by {{name}} stop being archived. Already-archived content is untouched and still expires on its original retention.",
+    auditOnDone: "Body archival is on.",
+    auditOffDone: "Body archival is off.",
+    auditFailed: "The gateway rejected the change — archival is unchanged.",
     deleteTitle: "Delete tenant?",
     deleteImpact: "Removes {{name}} and its projects.",
     hasKeys: "This tenant still has keys — delete those first.",
@@ -197,6 +212,16 @@ export const en = {
     resyncHint:
       "Re-read this hub's model catalog: add new models, drop retired ones (platform routes only).",
     resyncedOk: "Models resynced ({{count}} added).",
+    relogin: "Re-login",
+    reloginHint:
+      "Signing this GitHub account in elsewhere can invalidate the authorization held here, and every request through this hub then fails. Re-run the device flow and the new token is hot-swapped into the running hub: no redeploy, no restart, no dropped requests. Note: if the hub restarts before the next deploy it falls back to the deploy-time token.",
+    reloginTitle: "Re-login to GitHub",
+    reloginOk: "Token replaced",
+    reloginOkHint:
+      "The new token is live on the running hub and written to Key Vault for the next deploy.",
+    reloginFailed: "Re-login failed.",
+    reloginUnchanged:
+      "Nothing was changed — the hub still has its previous token. Safe to retry.",
     status: {
       pending: "Awaiting authorization",
       deploying: "Deploying",
@@ -242,14 +267,15 @@ export const en = {
     colFailures: "Failures",
     trendSection: "Calls per hour",
     noTelemetry: "No telemetry (App Insights not configured or no calls yet).",
-    breakdownSection: "Token breakdown — from App Insights",
+    breakdownSection: "Tokens & cost — billing source",
     breakdownHint:
-      "Token metering from APIM (covers streaming + non-streaming). Group by model, endpoint, or key; split by token type.",
+      "Priced per call from the upstream provider's own usage report, covering streaming and non-streaming alike — these are the numbers the invoice is built from. Group by model, endpoint, key, hub, or end user. Arrives via a capture pipeline, so the most recent few minutes may not be here yet.",
     colEndpoint: "Endpoint",
     groupBy_model: "Model",
     groupBy_api: "Endpoint",
     groupBy_subscription: "Key (token)",
     groupBy_backend: "Hub (backend)",
+    groupBy_end_user: "End user",
     modelUnknown: "(unlabeled)",
     tokTotal: "Total",
     tokPrompt: "Prompt",
@@ -257,11 +283,14 @@ export const en = {
     tokCompletion: "Completion",
     tokReasoning: "Reasoning",
     tokCacheCreation: "Cache write",
+    tokCacheWrite: "Cache write",
+    colCost: "Cost (USD)",
+    colBilled: "Billed (USD)",
     callsLabel: "Calls",
     tokTrendSection: "Tokens & calls over time",
     tokTrendSeries: "Tokens",
     callTrendSeries: "Calls",
-    noBreakdown: "No token metrics yet for this tenant (or App Insights not configured).",
+    noBreakdown: "No usage recorded for this tenant in this window yet.",
   },
   users: {
     title: "Users",

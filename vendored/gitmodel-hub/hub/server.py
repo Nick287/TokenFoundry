@@ -15,25 +15,32 @@ Management portal API:
     GET  /api/status
     POST /api/auth/device/start
     POST /api/auth/device/poll
-    POST /api/auth/logout
+    POST /api/auth/copilot/logout
+    POST /api/auth/copilot/token   (install a token minted by the control plane)
     GET  /api/models
-    GET  /api/usage
-    GET  /api/usage/recent
     GET/POST /api/keys, DELETE /api/keys/{key}
+
+There is no usage-query endpoint: the hub keeps no usage store. Every completed
+request is emitted to Azure Event Hub (see `hub.eventhub`) carrying upstream's
+`copilot_usage` verbatim, and the control plane reports off Cosmos.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
+import uuid
+from datetime import UTC, datetime
 from typing import Any, AsyncIterator
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import anthropic_adapter as aa
+from . import audit, eventhub, store
 from . import copilot_client as cc
 from . import image_client as ic
-from . import store
 from .config import get_settings
 
 app = FastAPI(title="GitModel Hub", version="0.1.0")
@@ -50,12 +57,23 @@ _LOGIN_ATTEMPTS: dict[str, dict[str, float]] = {}
 @app.on_event("startup")
 def _startup() -> None:
     # Create the (ephemeral) SQLite tables the runtime still needs — require_auth
-    # lookups, usage records, and the api_keys fallback. We deliberately do NOT
-    # seed admin credentials: the management portal + its login are removed, and
-    # all admin calls authenticate via the injected HUB_ADMIN_TOKEN. So the DB
-    # holds no identity of any kind (no admin/admin, no persisted keys); the real
-    # identities live in the control plane's Postgres + Key Vault.
+    # lookups and the api_keys fallback. Usage is NOT among them: it goes to
+    # Event Hub. We deliberately do NOT seed admin credentials: the management
+    # portal + its login are removed, and all admin calls authenticate via the
+    # injected HUB_ADMIN_TOKEN. So the DB holds no identity of any kind (no
+    # admin/admin, no persisted keys); the real identities live in the control
+    # plane's Postgres + Key Vault.
     store.init_db()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    # Flush whatever is still sitting in the Event Hub producer's buffer, so a
+    # graceful stop (Container Apps rolling update, SIGTERM) loses no usage.
+    await eventhub.aclose()
+    # Same for audit uploads still in flight: finish them, then release the
+    # storage connection.
+    await audit.aclose()
 
 
 # --------------------------------------------------------------------------- #
@@ -187,23 +205,173 @@ def _norm_usage(usage: dict[str, Any] | None, *, responses_shape: bool) -> tuple
     return i, o, t, cached
 
 
-def _record(
-    *, client_key, model, served, endpoint, usage3, streamed, estimated,
-    status=200, cached=0,
+# --------------------------------------------------------------------------- #
+# Usage attribution + emission
+# --------------------------------------------------------------------------- #
+def _key_fingerprint(key: str | None) -> str | None:
+    """Stable, non-reversible identifier for an API key.
+
+    The raw key must never leave the hub: usage events land in Event Hub, then
+    in Capture blobs, then in Cosmos — three places a credential has no business
+    being. A truncated SHA-256 still groups a caller's requests together, which
+    is all attribution needs.
+    """
+    if not key:
+        return None
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _extract_tenant(request: Request) -> dict[str, str | None]:
+    """Who is being billed for this request.
+
+    APIM's inbound policy stamps `x-tf-subscription` / `x-tf-api` /
+    `x-tf-request-id` with `exists-action="override"`, so a client cannot forge
+    them. Every APIM tenant shares one hub credential, which is why the header
+    — not the API key — is the authoritative tenant id.
+
+    Direct (non-APIM) callers have no such header; they fall back to the key
+    fingerprint, and get a locally minted request id so the import side still
+    has a unique document key.
+    """
+    h = request.headers
+    sub = (h.get("x-tf-subscription") or "").strip()
+    fp = _key_fingerprint(_extract_client_key(request))
+    return {
+        "subscription": sub or fp,
+        "api_id": (h.get("x-tf-api") or "").strip() or None,
+        "request_id": (h.get("x-tf-request-id") or "").strip() or uuid.uuid4().hex,
+        "client_key_fp": fp,
+        "via_apim": "1" if sub else "",
+        # Raw-body archival opt-in, also stamped by APIM with override. Default
+        # off, so a direct caller (no header) is never archived.
+        "audit": "1" if audit.wants_audit(h) else "",
+    }
+
+
+def _extract_end_user(body: Any) -> str | None:
+    """The end user *inside* a tenant, if the client bothered to say.
+
+    Both vendors have a standard field for this — Anthropic `metadata.user_id`,
+    OpenAI `user` — so no custom protocol is needed. Optional by nature: a
+    client that omits it simply cannot be split below the subscription level.
+    """
+    if not isinstance(body, dict):
+        return None
+    meta = body.get("metadata")
+    if isinstance(meta, dict):
+        uid = meta.get("user_id")
+        if isinstance(uid, str) and uid.strip():
+            return uid.strip()
+    user = body.get("user")
+    if isinstance(user, str) and user.strip():
+        return user.strip()
+    return None
+
+
+def _extract_copilot_usage(obj: Any) -> dict[str, Any] | None:
+    """Pull upstream's `copilot_usage` out of a response object, verbatim.
+
+    This object carries token counts, unit price (`cost_per_batch / batch_size`)
+    and total price (`total_nano_aiu`) as billed by GitHub. The hub deliberately
+    does NO arithmetic on it: it ships as-is and the control plane converts to
+    USD at import time, so an upstream pricing-schema change is a re-import
+    rather than a data-loss event.
+    """
+    if isinstance(obj, dict):
+        cu = obj.get("copilot_usage")
+        if isinstance(cu, dict):
+            return cu
+    return None
+
+
+def _scan_sse_copilot_usage(text: str) -> dict[str, Any] | None:
+    """Find `copilot_usage` anywhere in a full SSE stream.
+
+    It must be a whole-stream scan, not a peek at the chunk carrying `usage`:
+    on the OpenAI-compatible path the two end up on DIFFERENT chunks, because
+    `_standardize_openai_usage_line()` splits `usage` off into its own
+    spec-compliant chunk and leaves `copilot_usage` behind on the finish chunk.
+    (Verified end-to-end through the gateway.) On the Anthropic path it rides
+    `message_delta`; on Responses-shaped streams it is nested under `.response`.
+    """
+    found: dict[str, Any] | None = None
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        cand = _extract_copilot_usage(obj)
+        if cand is None and isinstance(obj, dict):
+            cand = _extract_copilot_usage(obj.get("response"))
+        if cand is not None:
+            found = cand
+    return found
+
+
+async def _emit_usage(
+    *, tenant, end_user, model, served, endpoint, usage3, streamed, estimated,
+    status=200, cached=0, usage=None, copilot_usage=None,
+    req_body=None, resp_body=None,
 ) -> None:
+    """Ship one completed request to Event Hub. Never raises (see `eventhub`).
+
+    Also the single place raw-body archival is triggered, so the six call sites
+    do not each have to remember it. `audit.submit` returns the blob path
+    without waiting for the upload, so the archive costs the request path
+    nothing but adds a pointer to the usage record.
+    """
     i, o, t = usage3
-    store.record_usage(
-        api_key=client_key,
-        model=model,
-        served_model=served,
-        endpoint=endpoint,
-        input_tokens=i,
-        output_tokens=o,
-        total_tokens=t,
-        streamed=streamed,
-        estimated=estimated,
-        status=status,
-        cached_tokens=cached,
+    ts = datetime.now(UTC)
+    audit_blob = None
+    if tenant.get("audit"):
+        audit_blob = audit.submit(
+            request_id=tenant["request_id"],
+            ts=ts,
+            subscription=tenant["subscription"],
+            api_id=tenant["api_id"],
+            end_user=end_user,
+            model=model,
+            endpoint=endpoint,
+            streamed=streamed,
+            status=status,
+            request_body=req_body,
+            response_body=resp_body,
+        )
+    await eventhub.emit(
+        {
+            "request_id": tenant["request_id"],
+            "ts": ts.isoformat(),
+            "subscription": tenant["subscription"],
+            "api_id": tenant["api_id"],
+            "client_key_fp": tenant["client_key_fp"],
+            "via_apim": bool(tenant["via_apim"]),
+            "end_user": end_user,
+            "model": model,
+            "served_model": served,
+            "endpoint": endpoint,
+            "streamed": streamed,
+            "status": status,
+            # Normalized counts, kept so the import side does not have to know
+            # each vendor's usage shape. `estimated` flags the streaming case
+            # where upstream omitted prompt_tokens and we guessed.
+            "input_tokens": i,
+            "output_tokens": o,
+            "total_tokens": t,
+            "cached_tokens": cached,
+            "estimated": estimated,
+            # Raw upstream payloads — the billing source of truth.
+            "usage": usage,
+            "copilot_usage": copilot_usage,
+            # Pointer into the audit archive, or None when the tenant did not
+            # opt in. A promise, not a receipt: see audit.submit.
+            "audit_blob": audit_blob,
+        }
     )
 
 
@@ -377,8 +545,10 @@ async def v1_models(request: Request) -> JSONResponse:
 async def _passthrough(
     request: Request, path: str, *, responses_shape: bool
 ) -> Any:
-    client_key = _check_client_auth(request)
+    _check_client_auth(request)
     body = await request.json()
+    tenant = _extract_tenant(request)
+    end_user = _extract_end_user(body)
     model = body.get("model")
     stream = bool(body.get("stream"))
     endpoint = path.strip("/").replace("/", ".")
@@ -398,15 +568,19 @@ async def _passthrough(
         except cc.NotAuthenticatedError as e:
             raise HTTPException(status_code=503, detail=str(e))
         if status != 200:
-            _record(client_key=client_key, model=model, served=None,
-                    endpoint=endpoint, usage3=(0, 0, 0), streamed=False,
-                    estimated=False, status=status)
+            await _emit_usage(tenant=tenant, end_user=end_user, model=model,
+                              served=None, endpoint=endpoint, usage3=(0, 0, 0),
+                              streamed=False, estimated=False, status=status,
+                              req_body=body, resp_body=data)
             return JSONResponse(data, status_code=status)
         served = data.get("model") if isinstance(data, dict) else None
         i, o, t, cached = _norm_usage(data.get("usage"), responses_shape=responses_shape)
-        _record(client_key=client_key, model=model, served=served,
-                endpoint=endpoint, usage3=(i, o, t), streamed=False,
-                estimated=False, cached=cached)
+        await _emit_usage(tenant=tenant, end_user=end_user, model=model,
+                          served=served, endpoint=endpoint, usage3=(i, o, t),
+                          streamed=False, estimated=False, cached=cached,
+                          usage=data.get("usage"),
+                          copilot_usage=_extract_copilot_usage(data),
+                          req_body=body, resp_body=data)
         return JSONResponse(data)
 
     # Streaming passthrough. Ask the backend to report usage for chat.
@@ -445,16 +619,21 @@ async def _passthrough(
         finally:
             if buf:
                 yield _emit(buf)
-            usage = _parse_sse_usage("".join(collected), responses_shape=responses_shape)
+            raw = "".join(collected)
+            usage = _parse_sse_usage(raw, responses_shape=responses_shape)
             i, o, t, cached = _norm_usage(usage, responses_shape=responses_shape)
             # Backend often omits prompt_tokens on streams — estimate input.
             input_estimated = not i
             if input_estimated:
                 i = est_input
                 t = i + o
-            _record(client_key=client_key, model=model, served=None,
-                    endpoint=endpoint, usage3=(i, o, t), streamed=True,
-                    estimated=usage is None or input_estimated, cached=cached)
+            await _emit_usage(
+                tenant=tenant, end_user=end_user, model=model, served=None,
+                endpoint=endpoint, usage3=(i, o, t), streamed=True,
+                estimated=usage is None or input_estimated, cached=cached,
+                usage=usage, copilot_usage=_scan_sse_copilot_usage(raw),
+                req_body=body, resp_body=raw,
+            )
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -472,36 +651,79 @@ async def v1_responses(request: Request) -> Any:
 # =========================================================================== #
 # Image generation endpoints (Azure OpenAI gpt-image backend)
 # =========================================================================== #
-def _record_image(client_key, model, endpoint, data, status) -> None:
-    """Record a usage row for an image request, reusing the Responses-shaped
-    usage parser (Azure image ``usage`` matches that shape)."""
+def _strip_image_bytes(data: Any) -> Any:
+    """Replace base64 image payloads with a size marker for the audit archive.
+
+    Deliberate exception to "archive the whole body". A gpt-image response is
+    megabytes of base64 pixels per image; keeping them would multiply the audit
+    store's size and cost by two orders of magnitude while adding nothing an
+    audit asks for. Everything that carries meaning — the revised prompt, the
+    content-filter verdict, the model, usage — is JSON around the pixels and is
+    kept verbatim. The prompt itself (the request body) is archived in full.
+    """
+    if not isinstance(data, dict):
+        return data
+    items = data.get("data")
+    if not isinstance(items, list):
+        return data
+    out = dict(data)
+    out["data"] = [
+        {
+            **{k: v for k, v in item.items() if k != "b64_json"},
+            "b64_json": f"[omitted {len(item['b64_json'])} b64 chars]",
+        }
+        if isinstance(item, dict) and isinstance(item.get("b64_json"), str)
+        else item
+        for item in items
+    ]
+    return out
+
+
+async def _emit_image_usage(
+    tenant, end_user, model, endpoint, data, status, req_body=None
+) -> None:
+    """Emit a usage event for an image request, reusing the Responses-shaped
+    usage parser (Azure image ``usage`` matches that shape).
+
+    The image backend is Azure OpenAI, not Copilot, so there is no
+    `copilot_usage` here — the import side sees `copilot_usage: null` and must
+    fall back to the local price table for these rows.
+    """
     if status == 200 and isinstance(data, dict):
         i, o, t, cached = _norm_usage(data.get("usage"), responses_shape=True)
         served = data.get("model")
+        usage = data.get("usage")
     else:
-        i, o, t, cached, served = 0, 0, 0, 0, None
-    _record(client_key=client_key, model=model, served=served,
-            endpoint=endpoint, usage3=(i, o, t), streamed=False,
-            estimated=False, status=status, cached=cached)
+        i, o, t, cached, served, usage = 0, 0, 0, 0, None, None
+    await _emit_usage(tenant=tenant, end_user=end_user, model=model,
+                      served=served, endpoint=endpoint, usage3=(i, o, t),
+                      streamed=False, estimated=False, status=status,
+                      cached=cached, usage=usage,
+                      req_body=req_body, resp_body=_strip_image_bytes(data))
 
 
 @app.post("/v1/images/generations")
 async def v1_images_generations(request: Request) -> Any:
-    client_key = _check_client_auth(request)
+    _check_client_auth(request)
     body = await request.json()
+    tenant = _extract_tenant(request)
     if not ic.is_configured():
         raise HTTPException(
             status_code=503, detail="Image backend not configured"
         )
     model = body.get("model") or ic.get_model()
     status, data = await ic.generate(body)
-    _record_image(client_key, model, "images.generations", data, status)
+    await _emit_image_usage(
+        tenant, _extract_end_user(body), model, "images.generations", data, status,
+        req_body=body,
+    )
     return JSONResponse(data, status_code=status)
 
 
 @app.post("/v1/images/edits")
 async def v1_images_edits(request: Request) -> Any:
-    client_key = _check_client_auth(request)
+    _check_client_auth(request)
+    tenant = _extract_tenant(request)
     if not ic.is_configured():
         raise HTTPException(
             status_code=503, detail="Image backend not configured"
@@ -526,7 +748,19 @@ async def v1_images_edits(request: Request) -> Any:
             data[field] = value
     model = data.get("model") or ic.get_model()
     status, resp = await ic.edit(data, files)
-    _record_image(client_key, model, "images.edits", resp, status)
+    await _emit_image_usage(
+        tenant, _extract_end_user(data), model, "images.edits", resp, status,
+        # Form fields (prompt, size, ...) verbatim; the uploaded source images
+        # are recorded by name and size only, for the same reason the generated
+        # ones are — see _strip_image_bytes.
+        req_body={
+            **data,
+            "_files": [
+                {"field": f, "filename": meta[0], "bytes": len(meta[1])}
+                for f, meta in files
+            ],
+        },
+    )
     return JSONResponse(resp, status_code=status)
 
 
@@ -544,8 +778,10 @@ async def v1_messages(request: Request) -> Any:
     used to be 0). Pass-through also means tool_use, image blocks, and the full
     Anthropic SSE event shape are handled by Copilot, not re-implemented here.
     """
-    client_key = _check_client_auth(request)
+    _check_client_auth(request)
     req = await request.json()
+    tenant = _extract_tenant(request)
+    end_user = _extract_end_user(req)
     model = req.get("model")
     stream = bool(req.get("stream"))
 
@@ -566,17 +802,21 @@ async def v1_messages(request: Request) -> Any:
         except cc.NotAuthenticatedError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
         if status != 200:
-            _record(client_key=client_key, model=model, served=None,
-                    endpoint="messages", usage3=(0, 0, 0), streamed=False,
-                    estimated=False, status=status)
+            await _emit_usage(tenant=tenant, end_user=end_user, model=model,
+                              served=None, endpoint="messages", usage3=(0, 0, 0),
+                              streamed=False, estimated=False, status=status,
+                              req_body=req, resp_body=data)
             return JSONResponse(data, status_code=status)
         u = data.get("usage") or {}
         i = int(u.get("input_tokens", 0) or 0)
         o = int(u.get("output_tokens", 0) or 0)
-        _record(client_key=client_key, model=model, served=data.get("model"),
-                endpoint="messages", usage3=(i, o, i + o),
-                streamed=False, estimated=False,
-                cached=int(u.get("cache_read_input_tokens", 0) or 0))
+        await _emit_usage(tenant=tenant, end_user=end_user, model=model,
+                          served=data.get("model"), endpoint="messages",
+                          usage3=(i, o, i + o), streamed=False, estimated=False,
+                          cached=int(u.get("cache_read_input_tokens", 0) or 0),
+                          usage=data.get("usage"),
+                          copilot_usage=_extract_copilot_usage(data),
+                          req_body=req, resp_body=data)
         return JSONResponse(data)
 
     # Streaming: forward Copilot's native Anthropic SSE unchanged; sniff usage
@@ -588,12 +828,16 @@ async def v1_messages(request: Request) -> Any:
                 collected.append(chunk.decode("utf-8", "replace"))
                 yield chunk
         finally:
-            u = _parse_anthropic_sse_usage("".join(collected))
+            raw = "".join(collected)
+            u = _parse_anthropic_sse_usage(raw)
             i, o = u["input_tokens"], u["output_tokens"]
-            _record(client_key=client_key, model=model, served=None,
-                    endpoint="messages", usage3=(i, o, i + o),
-                    streamed=True, estimated=not i,
-                    cached=u["cache_read_input_tokens"])
+            await _emit_usage(
+                tenant=tenant, end_user=end_user, model=model, served=None,
+                endpoint="messages", usage3=(i, o, i + o), streamed=True,
+                estimated=not i, cached=u["cache_read_input_tokens"],
+                usage=u, copilot_usage=_scan_sse_copilot_usage(raw),
+                req_body=req, resp_body=raw,
+            )
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -612,7 +856,6 @@ async def api_get_settings(x_admin_token: str | None = Header(default=None)) -> 
     img = store.get_image_config()
     return {
         "require_auth": store.get_require_auth(s.require_auth),
-        "pricing": store.get_pricing(),
         "image": {
             "endpoint": img.get("endpoint", ""),
             "model": img.get("model", "") or ic.DEFAULT_IMAGE_MODEL,
@@ -629,8 +872,6 @@ async def api_set_settings(
     body = await request.json()
     if "require_auth" in body:
         store.set_require_auth(bool(body["require_auth"]))
-    if "pricing" in body and isinstance(body["pricing"], dict):
-        store.set_pricing(body["pricing"])
     if "image" in body and isinstance(body["image"], dict):
         img = body["image"]
         store.set_image_config(
@@ -640,7 +881,6 @@ async def api_set_settings(
     img = store.get_image_config()
     return {
         "require_auth": store.get_require_auth(s.require_auth),
-        "pricing": store.get_pricing(),
         "image": {
             "endpoint": img.get("endpoint", ""),
             "model": img.get("model", "") or ic.DEFAULT_IMAGE_MODEL,
@@ -654,6 +894,14 @@ async def api_status() -> dict[str, Any]:
     return {
         "logged_in": cc.is_authenticated(),
         "require_auth": store.get_require_auth(get_settings().require_auth),
+        # Usage events the hub could not hand to Event Hub since process start.
+        # The billing feed fails silently by design (serving must not break), so
+        # this counter is the only signal that it is broken — alert on it.
+        "usage_events_dropped": eventhub.dropped_count(),
+        # Audit payloads that never reached the archive. A usage record can
+        # carry an `audit_blob` pointer to a blob that failed to upload, so a
+        # non-zero value here means some pointers dangle.
+        "audit_payloads_dropped": audit.dropped_count(),
     }
 
 
@@ -682,6 +930,37 @@ async def api_copilot_logout(x_admin_token: str | None = Header(default=None)) -
     return {"ok": True}
 
 
+@app.post("/api/auth/copilot/token")
+async def api_copilot_install_token(
+    request: Request, x_admin_token: str | None = Header(default=None)
+) -> Any:
+    """Install an OAuth token obtained elsewhere, without a redeploy.
+
+    The control plane runs the device flow (it owns the Key Vault copy of the
+    token and the account record), so it needs a way to hand the result to a
+    live hub. Without this the only way to replace an expired token is a full
+    terraform redeploy — minutes of rollout for a value that takes milliseconds
+    to swap, and a new revision on every 8-hour token expiry.
+
+    400 means the token itself was rejected by GitHub; the hub keeps whatever it
+    had. 502 means we could not reach GitHub to find out, which is the caller's
+    cue to retry rather than to re-run the device flow.
+    """
+    _check_admin(x_admin_token)
+    body = await request.json()
+    token = (body or {}).get("access_token")
+    if not token:
+        raise HTTPException(status_code=400, detail="access_token required")
+    try:
+        return await cc.install_oauth_token(token)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"could not reach GitHub: {exc}"
+        ) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/models")
 async def api_models(x_admin_token: str | None = Header(default=None)) -> Any:
     _check_admin(x_admin_token)
@@ -702,24 +981,6 @@ async def api_models(x_admin_token: str | None = Header(default=None)) -> Any:
             {"id": ic.get_model(), "vendor": "azure-openai", "type": "image"}
         )
     return {"data": chat_models}
-
-
-@app.get("/api/usage")
-async def api_usage(
-    since: float | None = None,
-    until: float | None = None,
-    x_admin_token: str | None = Header(default=None),
-) -> Any:
-    _check_admin(x_admin_token)
-    return store.usage_summary_with_cost(since, until)
-
-
-@app.get("/api/usage/recent")
-async def api_usage_recent(
-    limit: int = 50, x_admin_token: str | None = Header(default=None)
-) -> Any:
-    _check_admin(x_admin_token)
-    return {"data": store.recent_usage(limit)}
 
 
 @app.get("/api/keys")

@@ -228,6 +228,8 @@ Key Vault 引用形式注入:
 | `TF_ACR_NAME` / `TF_KEYVAULT_NAME` / `TF_ACR_LOGIN_SERVER` / `TF_AZURE_LOCATION` | terraform | 门户 deploy-config 流程发布成 `HUB_*` GitHub Actions 变量的纯值。 |
 | `TF_HUB_IMAGE_TAG` | terraform(`image_tag`) | hub 部署要拉的 `gitmodel:<tag>` —— 设为 `deploy.sh` 实际构建的 tag(绝非写死的 `:latest`)。 |
 | `TF_TFSTATE_STORAGE_ACCOUNT` / `TF_TFSTATE_CONTAINER` | deployer 模块 | 方案 A 远程 state 位置。 |
+| `TF_EVENTHUB_NAMESPACE_ID` / `TF_EVENTHUB_FQDN` / `TF_EVENTHUB_NAME` | eventhub 模块 | 纯透传:控制平面自己不往 Event Hub 写,只把这三个值发布成 `HUB_EVENTHUB_*` Actions 变量,让每个 hub 的 producer 知道往哪发。 |
+| `TF_USAGE_CAPTURE_STORAGE_ACCOUNT` / `TF_USAGE_CAPTURE_CONTAINER` / `TF_USAGE_CAPTURE_INTERVAL_SECONDS` | eventhub 模块 | 导入作业读 Capture 落的 Avro blob 的位置;interval 同时是作业调度的下限(跑得比它快只是重复列同一批 blob)。 |
 | `TF_ENVIRONMENT` | 静态 `prod` | 控制本地 dev-token 鉴权旁路是否开启。 |
 
 ## 运行(在 Dev Container 内)
@@ -344,6 +346,7 @@ URL 和一个虚拟密钥;所需变量见脚本头部。
 | **[docs/SECURITY.zh.md](docs/SECURITY.zh.md)**([English](docs/SECURITY.md)) | 密钥存储、鉴权、RBAC、方案 A 密钥分层、取舍。 |
 | **[docs/APIM-LLM-Gateway.md](docs/APIM-LLM-Gateway.md)** | APIM LLM 网关设计:池、会话粘性、prompt 缓存、每 key 限额、SKU 支持。 |
 | **[docs/PRICING.zh.md](docs/PRICING.zh.md)**([English](docs/PRICING.md)) | 分档价格与选型:APIM SKU 价格 + 吞吐量、整套环境月度估算、何时升级。 |
+| **[docs/AUDIT.zh.md](docs/AUDIT.zh.md)** | 原文审计归档(默认关闭):归档什么、独立存储账户、谁能读写、保留期、按租户开关。 |
 
 ## 实现状态
 

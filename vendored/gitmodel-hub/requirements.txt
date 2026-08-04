@@ -2,3 +2,12 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 httpx>=0.27
 python-multipart>=0.0.9
+# Usage-record outlet. Only imported when TF_EVENTHUB_FQDN is set, so the hub
+# still runs standalone without any Azure credential; the packages are always
+# installed because the container image is built once for both cases.
+azure-eventhub>=5.11
+azure-identity>=1.17
+# Raw request/response archive for audit-enabled tenants (hub/audit.py). Same
+# deal: imported only when TF_AUDIT_ACCOUNT_URL is set. aio needs aiohttp.
+azure-storage-blob>=12.19
+aiohttp>=3.9

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from azure.cosmos import CosmosClient, PartitionKey
 from azure.identity import DefaultAzureCredential
@@ -141,6 +141,18 @@ class UsageStore:
         item["id"] = record.request_id
         self._container.upsert_item(item)
 
+    def upsert(self, doc: dict) -> None:
+        """Upsert a pre-shaped usage document (already carrying `id` and `pk`).
+
+        The batch importer builds its own document rather than going through
+        UsageRecord, because it carries fields UsageRecord has no room for (the
+        verbatim upstream `copilot_usage`, the end-user tag, streaming flag).
+        Upsert, not create: Event Hub Capture is at-least-once, so the same
+        request id can arrive twice and overwriting is what makes re-imports
+        free of duplicates.
+        """
+        self._container.upsert_item(doc)
+
     def query_tenant(self, tenant_id: str, limit: int = 1000) -> list[dict]:
         # Local/dev without a Cosmos account configured: return empty instead of
         # constructing a CosmosClient("") that would throw. Keeps /usage and
@@ -228,6 +240,250 @@ class UsageStore:
             )
         )
         return int(rows[0]) if rows else 0
+
+    # ----------------------------------------------------------------- #
+    # Server-side aggregation (the billing-grade breakdown)              #
+    # ----------------------------------------------------------------- #
+    # Requested dimension -> the document field it groups on. A WHITELIST, not a
+    # convenience map: the value is interpolated into the query text (Cosmos has
+    # no bind parameter for an identifier), so anything reaching the SQL string
+    # must come from these literals and never from the caller.
+    _AGG_DIMS = {
+        "model": "route",
+        "api": "api",
+        "subscription": "subscription",
+        "backend": "hub_id",
+        # Cosmos-only: App Insights never saw the end user, because the metric
+        # policy can't read the request body.
+        "end_user": "end_user",
+    }
+
+    # Per-type token columns, in the order the portal renders them.
+    _TOKEN_FIELDS = ("prompt_tok", "cached_tok", "cache_write_tok", "completion_tok")
+
+    # Why these aggregate in Python rather than in Cosmos
+    # ---------------------------------------------------
+    # Cosmos NoSQL rejects every cross-partition aggregate except a bare
+    # `SELECT VALUE <AggregateFunc>`:
+    #
+    #   SELECT COUNT(1) AS calls, SUM(...) AS p FROM c
+    #     -> BadRequest: "Cross partition query only supports 'VALUE
+    #        <AggregateFunc>' for aggregates."
+    #   ...and adding GROUP BY fails the same way; `SELECT VALUE COUNT(1) ...
+    #        GROUP BY` is rejected as an unsupported feature.
+    #
+    # (Verified against the deployed account, not inferred from the docs.) The
+    # partition key is `<subscription>_<yyyyMM>`, so ANY breakdown spans
+    # partitions by construction — a tenant has several keys, and a window can
+    # cross a month. Server-side grouping is therefore not available to us at
+    # all, and the honest implementation is to project the few columns we need
+    # and fold them here.
+    #
+    # The cost of that is bounded by _MAX_ROWS below, and it is a real cost: the
+    # rows travel over the wire. It is nonetheless the correct trade, because
+    # the alternative shapes do not execute.
+    #
+    # Only the projected columns are fetched, never `SELECT *` — the documents
+    # also carry the verbatim upstream `copilot_usage` and the raw provider
+    # `usage` blob, which would dominate the payload and are not needed here.
+    _MAX_ROWS = 20000
+
+    # Cap on distinct groups RETURNED (not scanned). Group counts are naturally
+    # small for model/api/subscription; `end_user` is whatever the customer sent
+    # and has no natural bound.
+    _MAX_GROUPS = 500
+
+    def _agg_where(
+        self, subscription_ids: list[str] | None, since_iso: str | None
+    ) -> tuple[str, list[dict]]:
+        """WHERE clause + parameters shared by every aggregate below.
+
+        `subscription_ids=None` means platform-wide (admin); an EMPTY list is a
+        different thing entirely — a tenant with no keys — and the callers
+        short-circuit it before getting here rather than letting it degrade into
+        an unfiltered query over every tenant's data.
+        """
+        clauses: list[str] = []
+        params: list[dict] = []
+        if subscription_ids:
+            clauses.append("ARRAY_CONTAINS(@ids, c.subscription)")
+            params.append({"name": "@ids", "value": subscription_ids})
+        if since_iso:
+            # String comparison over ISO-8601. Sound only because _parse_ts
+            # normalizes every stored ts to UTC (see usage_capture_import).
+            clauses.append("c.ts >= @since")
+            params.append({"name": "@since", "value": since_iso})
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def _fetch_agg_rows(
+        self,
+        subscription_ids: list[str] | None,
+        since_iso: str | None,
+        extra_fields: tuple[str, ...] = (),
+    ) -> list[dict]:
+        """Project the columns an aggregate needs, newest first, capped.
+
+        Ordered by ts DESC so that if the cap does bite, what survives is the
+        most recent window rather than an arbitrary slice — a partial view of
+        "just now" is explicable to a user; a partial view of nothing in
+        particular is not.
+        """
+        cols = ", ".join(
+            f"c.{f}" for f in (*self._TOKEN_FIELDS, "cost_usd", "billed_usd", *extra_fields)
+        )
+        where, params = self._agg_where(subscription_ids, since_iso)
+        params = [*params, {"name": "@n", "value": self._MAX_ROWS}]
+        rows = list(
+            self._container.query_items(
+                query=f"SELECT {cols} FROM c{where} ORDER BY c.ts DESC OFFSET 0 LIMIT @n",
+                parameters=params,
+                enable_cross_partition_query=True,
+            )
+        )
+        if len(rows) >= self._MAX_ROWS:
+            # Never silently. At the cap the numbers below are a floor, not a
+            # total, and a dashboard that says so is worth more than one that
+            # quietly under-reports spend.
+            logger.warning(
+                "usage aggregation hit the %d-row cap; totals are partial for this window",
+                self._MAX_ROWS,
+            )
+        return rows
+
+    @staticmethod
+    def _blank(fields: tuple[str, ...]) -> dict:
+        return {
+            "calls": 0,
+            **dict.fromkeys(fields, 0),
+            "cost_usd": 0.0,
+            "billed_usd": 0.0,
+        }
+
+    @classmethod
+    def _accumulate(cls, bucket: dict, row: dict) -> None:
+        """Fold one document into a running bucket.
+
+        `or 0` on every read is load-bearing rather than defensive: a document
+        written before a column existed carries JSON null for it (verified —
+        legacy rows have `cache_write_tok: null`), and `null + int` raises.
+        """
+        bucket["calls"] += 1
+        for f in cls._TOKEN_FIELDS:
+            bucket[f] += int(row.get(f) or 0)
+        bucket["cost_usd"] += float(row.get("cost_usd") or 0.0)
+        bucket["billed_usd"] += float(row.get("billed_usd") or 0.0)
+
+    def cost_breakdown(
+        self,
+        subscription_ids: list[str] | None = None,
+        since_iso: str | None = None,
+        group_by: str = "model",
+    ) -> list[dict]:
+        """Per-group token + cost totals.
+
+        This is the billing-grade breakdown: `cost_usd`/`billed_usd` come from
+        upstream's own `total_nano_aiu` (recorded per call at import time), and
+        streaming calls are included on equal terms — the two things the App
+        Insights breakdown structurally cannot do.
+
+        Returns rows shaped {<group_by>, calls, prompt_tok, cached_tok,
+        cache_write_tok, completion_tok, cost_usd, billed_usd}, most expensive
+        first. [] when Cosmos isn't configured, the tenant has no keys, or
+        `group_by` isn't a known dimension.
+        """
+        if not self._endpoint or subscription_ids == []:
+            return []
+        field = self._AGG_DIMS.get(group_by)
+        if not field:
+            return []
+
+        rows = self._fetch_agg_rows(subscription_ids, since_iso, extra_fields=(field,))
+        buckets: dict[str, dict] = {}
+        for r in rows:
+            key = str(r.get(field) or "unknown")
+            bucket = buckets.get(key)
+            if bucket is None:
+                bucket = {group_by: key, **self._blank(self._TOKEN_FIELDS)}
+                buckets[key] = bucket
+            self._accumulate(bucket, r)
+
+        out = sorted(buckets.values(), key=lambda d: d["cost_usd"], reverse=True)
+        if len(out) > self._MAX_GROUPS:
+            # Say what was dropped. A silently truncated list reads as "this is
+            # everything", and the totals (computed over every row) would then
+            # not equal the sum of the rows shown.
+            logger.warning(
+                "cost_breakdown by=%s produced %d groups; showing the %d costliest",
+                group_by, len(out), self._MAX_GROUPS,
+            )
+            out = out[: self._MAX_GROUPS]
+        return out
+
+    def cost_totals(
+        self,
+        subscription_ids: list[str] | None = None,
+        since_iso: str | None = None,
+    ) -> dict:
+        """Window totals.
+
+        Computed over every row rather than by summing `cost_breakdown` so the
+        headline numbers stay whole even when the group list was truncated, and
+        so a NULL dimension (an unset end_user) can't drop calls from the total.
+        """
+        empty = self._blank(self._TOKEN_FIELDS)
+        if not self._endpoint or subscription_ids == []:
+            return empty
+
+        totals = self._blank(self._TOKEN_FIELDS)
+        for r in self._fetch_agg_rows(subscription_ids, since_iso):
+            self._accumulate(totals, r)
+        return totals
+
+    def cost_trend(
+        self,
+        subscription_ids: list[str] | None = None,
+        since_iso: str | None = None,
+        hours: int = 24,
+    ) -> list[dict]:
+        """Hourly tokens/calls/cost series, zero-filled, oldest first.
+
+        Buckets on the first 13 characters of the stored timestamp
+        ("2026-08-04T10"), which IS the UTC hour because every ts is normalized
+        to UTC at import. The zero-fill matters: without it a quiet hour vanishes
+        and the chart draws a straight line across the gap, implying traffic that
+        never happened.
+        """
+        if not self._endpoint or subscription_ids == []:
+            return []
+
+        rows = self._fetch_agg_rows(subscription_ids, since_iso, extra_fields=("ts",))
+        by_bucket: dict[str, dict] = {}
+        for r in rows:
+            ts = r.get("ts")
+            if not isinstance(ts, str):
+                continue
+            bucket = by_bucket.setdefault(ts[:13], self._blank(self._TOKEN_FIELDS))
+            self._accumulate(bucket, r)
+
+        now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        out: list[dict] = []
+        for i in range(max(hours, 1) - 1, -1, -1):
+            hour = now - timedelta(hours=i)
+            got = by_bucket.get(hour.strftime("%Y-%m-%dT%H"))
+            out.append(
+                {
+                    "ts": hour.isoformat(),
+                    # Every token type, cache_write included — omitting it would
+                    # make cache-heavy hours read as a dip in the chart.
+                    "tokens": (
+                        sum(got[f] for f in self._TOKEN_FIELDS) if got else 0
+                    ),
+                    "calls": got["calls"] if got else 0,
+                    "cost_usd": got["cost_usd"] if got else 0.0,
+                }
+            )
+        return out
 
 
 class AppInsightsUsage:

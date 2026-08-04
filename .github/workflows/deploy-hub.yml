@@ -53,6 +53,17 @@ jobs:
       TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
       TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
       KEYVAULT_NAME: ${{ vars.HUB_KEYVAULT_NAME }}   # e.g. tokenfoundrykv86a2226cd4
+      # Usage reporting target. Unset => the hub deploys without the Event Hubs
+      # role assignment and reports nothing (it still serves traffic normally).
+      HUB_EVENTHUB_NAMESPACE_ID: ${{ vars.HUB_EVENTHUB_NAMESPACE_ID }}
+      HUB_EVENTHUB_FQDN: ${{ vars.HUB_EVENTHUB_FQDN }}
+      HUB_EVENTHUB_NAME: ${{ vars.HUB_EVENTHUB_NAME }}
+      # Audit archive target. Unset => the hub deploys without the blob role
+      # assignment and archives nothing, whatever header APIM sends. Unset is
+      # the safe state here: this pipeline writes raw customer prompts.
+      HUB_AUDIT_ACCOUNT_URL: ${{ vars.HUB_AUDIT_ACCOUNT_URL }}
+      HUB_AUDIT_CONTAINER: ${{ vars.HUB_AUDIT_CONTAINER }}
+      HUB_AUDIT_CONTAINER_SCOPE: ${{ vars.HUB_AUDIT_CONTAINER_SCOPE }}
 
     steps:
       - name: Checkout
@@ -116,6 +127,16 @@ jobs:
           TF_VAR_acr_resource_group_name: ${{ env.HUB_ACR_RG }}
           TF_VAR_require_auth: "true"
           TF_VAR_image_ref_override: ${{ env.HUB_IMAGE_REF }}
+          TF_VAR_eventhub_namespace_id: ${{ env.HUB_EVENTHUB_NAMESPACE_ID }}
+          TF_VAR_eventhub_fqdn: ${{ env.HUB_EVENTHUB_FQDN }}
+          TF_VAR_eventhub_name: ${{ env.HUB_EVENTHUB_NAME }}
+          # Stamped on every usage event so the shared Event Hub's records can be
+          # split back out per GitHub account. Not a repo var: it is this run's
+          # account, and it is already the RG suffix and the state key.
+          TF_VAR_hub_id: ${{ inputs.account_id }}
+          TF_VAR_audit_account_url: ${{ env.HUB_AUDIT_ACCOUNT_URL }}
+          TF_VAR_audit_container: ${{ env.HUB_AUDIT_CONTAINER }}
+          TF_VAR_audit_container_scope: ${{ env.HUB_AUDIT_CONTAINER_SCOPE }}
         run: |
           set -euo pipefail
           if [ "${{ inputs.action }}" = "destroy" ]; then

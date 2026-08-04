@@ -137,6 +137,20 @@ _KEY_LIMITS_MAX_BYTES = 4000
 _TPM_UNLIMITED = 1_000_000_000
 _PERIOD_DEFAULT = "Yearly"
 
+# Policy expression for the raw-body audit opt-in, read out of the same
+# per-subscription map as the token limits (field "a"). Emitted as the value of
+# `x-tf-audit` with exists-action="override", which is what stops a client from
+# switching its own auditing on or off. Defaults to "0" on any parse failure:
+# a broken map must fail CLOSED, since the alternative is archiving customer
+# source code for a tenant that never consented.
+_AUDIT_FLAG_EXPR = (
+    "@{ try {"
+    " var m=Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables[\"tfRaw\"]);"
+    " var e=m[context.Subscription.Id] as Newtonsoft.Json.Linq.JObject;"
+    " return (e!=null&amp;&amp;e[\"a\"]!=null&amp;&amp;(int)e[\"a\"]==1)?\"1\":\"0\";"
+    " } catch { return \"0\"; } }"
+)
+
 
 def _merge_key_limit(
     mapping: dict,
@@ -151,7 +165,13 @@ def _merge_key_limit(
     {"t": tpm, "qt": quota_tier, "p": period}; absent fields are omitted. A
     quota_tier of "none" (or None) is treated as absent. Pure — no Azure calls —
     so it's unit-testable. Raises ValueError if the resulting map would exceed the
-    named value size cap (surfaces at issuance, never silent)."""
+    named value size cap (surfaces at issuance, never silent).
+
+    The audit flag ("a") is written by `_merge_audit_flag` and is CARRIED OVER
+    untouched here: limits and auditing are set by different operations, so a
+    limits update must not silently switch a tenant's archival off (or a stale
+    caller switch it back on).
+    """
     out = dict(mapping)
     entry: dict[str, object] = {}
     if tpm is not None:
@@ -160,6 +180,9 @@ def _merge_key_limit(
         entry["qt"] = quota_tier
     if period is not None:
         entry["p"] = period
+    prior = mapping.get(sub_id)
+    if isinstance(prior, dict) and prior.get("a"):
+        entry["a"] = prior["a"]
     if entry:
         out[sub_id] = entry
     else:
@@ -170,6 +193,39 @@ def _merge_key_limit(
             f"per-key limits map would exceed {_KEY_LIMITS_MAX_BYTES} bytes "
             f"({len(serialized)}); too many keys have custom limits for the "
             f"single-named-value scheme — see docs/APIM-LLM-Gateway.md §4.5"
+        )
+    return out
+
+
+def _merge_audit_flag(mapping: dict, sub_ids: list[str], enabled: bool) -> dict:
+    """Return a NEW map with the audit flag set/cleared for several keys at once.
+
+    Bulk because the toggle is per TENANT while the map is keyed per APIM
+    subscription — flipping one tenant touches all of its keys, and doing that
+    as N read-merge-writes would lose races against itself.
+
+    Only the "a" field is touched; limits are carried over. An entry that ends
+    up empty is dropped so switching auditing off does not leave a growing tail
+    of `{}` entries in a size-capped named value.
+    """
+    out = dict(mapping)
+    for sub_id in sub_ids:
+        entry = dict(out.get(sub_id) or {})
+        if enabled:
+            entry["a"] = 1
+        else:
+            entry.pop("a", None)
+        if entry:
+            out[sub_id] = entry
+        else:
+            out.pop(sub_id, None)
+    serialized = json.dumps(out, separators=(",", ":"))
+    if len(serialized) > _KEY_LIMITS_MAX_BYTES:
+        raise ValueError(
+            f"per-key limits map would exceed {_KEY_LIMITS_MAX_BYTES} bytes "
+            f"({len(serialized)}); too many keys carry custom limits or audit "
+            f"flags for the single-named-value scheme — see "
+            f"docs/APIM-LLM-Gateway.md §4.5"
         )
     return out
 
@@ -261,9 +317,9 @@ class ApimProvisioner:
         self._sub_id = s.azure_subscription_id
         self._rg = s.resource_group
         self._service = s.apim_service_name
-        self._cosmos_endpoint = s.cosmos_endpoint.rstrip("/")
-        self._cosmos_db = s.cosmos_database
-        self._cosmos_container = s.cosmos_usage_container
+        # No Cosmos coordinates here any more: APIM no longer writes usage
+        # documents (see `_build_provider_policy`). Cosmos is reached only by the
+        # control plane's own ingest/import services.
         self._client: ApiManagementClient | None = None
 
     @property
@@ -574,65 +630,79 @@ class ApimProvisioner:
     </choose>"""
 
     def _build_provider_policy(self, backend_id: str, provider: str) -> str:
-        """Inbound governance + outbound Cosmos usage write for a provider API.
+        """Inbound governance + caller-identity injection for a provider API.
 
         Each provider API binds one backend; the upstream (multi-model) backend
-        dispatches by the body's `model`. Outbound writes one usage record per
-        successful, NON-STREAMING call to the `usage` container
-        (send-one-way-request, fire-and-forget, MI auth) — the Cosmos endpoint
-        comes from settings so it always matches the deployed account (never a
-        hardcoded host).
+        dispatches by the body's `model`.
 
-        Streaming (SSE) responses are deliberately NOT persisted to Cosmos: the
-        outbound `As<JObject>()` body read would force APIM to buffer the whole
-        response, defeating token-by-token passthrough, and an event-stream body
-        isn't a single JSON object anyway. Streaming token accounting therefore
-        rides on the native `llm-emit-token-metric` (App Insights), which counts
-        inside the pipeline without reading the body. The outbound write is gated
-        on the response Content-Type not being `text/event-stream` (provider-
-        agnostic — all four providers stream with that media type).
+        **Identity injection.** Every APIM tenant reaches the hub with the SAME
+        credential — `add_hub_to_pools()` configures all provider backends with
+        one `hub_key` — so the hub cannot tell tenants apart from the request
+        alone. These three headers are the chargeback key:
+
+          * `x-tf-subscription` — the billed party (APIM subscription id)
+          * `x-tf-api`          — which provider API was used
+          * `x-tf-request-id`   — APIM's request id, reused downstream as the
+                                  Cosmos document id, which makes the import
+                                  idempotent under at-least-once delivery
+
+        `exists-action="override"` is load-bearing: without it a client could
+        send its own `x-tf-subscription` and be billed as somebody else.
+
+        **Audit opt-in.** A fourth header, `x-tf-audit`, tells the hub whether
+        this tenant consented to having its raw request/response bodies
+        archived. It is read from the same per-subscription named value the
+        token limits come from, so it must sit AFTER `{limit_block}` (that is
+        where `tfRaw` is populated). Same override rule, for a sharper reason:
+        the header is the only consent record the hub sees, so a forgeable one
+        would let a caller either archive its own traffic or hide it.
+
+        **No Cosmos write here.** The outbound `send-one-way-request` that used
+        to persist a usage document was removed. It could only ever read
+        NON-streaming bodies (`As<JObject>()` on an SSE response is meaningless,
+        and buffering it would defeat token-by-token passthrough), so it silently
+        billed nothing for every streaming call — unusable as a billing source.
+        Usage now originates at the hub, which sees both shapes and forwards
+        upstream's authoritative `copilot_usage`, and travels
+        hub → Event Hub → Capture → import job → Cosmos.
+
+        `llm-emit-token-metric` and `_USAGE_TRACE` stay: that is the real-time
+        App Insights observability line, deliberately decoupled from billing.
 
         `provider` is accepted for symmetry with the per-operation streaming
         policy (see `_build_chat_stream_policy`); the API-level policy itself is
         provider-agnostic.
         """
         _ = provider  # API-level policy is provider-agnostic; kept for symmetry
-        docs = f"{self._cosmos_endpoint}/dbs/{self._cosmos_db}/colls/{self._cosmos_container}/docs"
         limit_block = self._build_limit_block()
         return f"""<policies>
   <inbound>
     <base />
     <set-backend-service backend-id="{backend_id}" />
+    <set-header name="x-tf-subscription" exists-action="override">
+      <value>@(context.Subscription?.Id ?? "none")</value>
+    </set-header>
+    <set-header name="x-tf-api" exists-action="override">
+      <value>@(context.Api.Id)</value>
+    </set-header>
+    <set-header name="x-tf-request-id" exists-action="override">
+      <value>@(context.RequestId.ToString())</value>
+    </set-header>
     {limit_block}
+    <set-header name="x-tf-audit" exists-action="override">
+      <value>{_AUDIT_FLAG_EXPR}</value>
+    </set-header>
     {self._MODEL_VAR}
     <llm-emit-token-metric namespace="tokenfoundry">
       <dimension name="subscription" value="@(context.Subscription.Id)" />
       <dimension name="api" value="@(context.Api.Id)" />
       <dimension name="model" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;tfModel&quot;, &quot;unknown&quot;))" />
     </llm-emit-token-metric>
-    <authentication-managed-identity resource="https://cosmos.azure.com"
-      output-token-variable-name="cosmosToken" ignore-error="true" />
   </inbound>
   <backend><base /></backend>
   <outbound>
     <base />
     {self._USAGE_TRACE}
-    <choose>
-      <when condition="@(context.Response.StatusCode == 200 &amp;&amp; context.Variables.ContainsKey(&quot;cosmosToken&quot;) &amp;&amp; !context.Response.Headers.GetValueOrDefault(&quot;Content-Type&quot;,&quot;&quot;).Contains(&quot;text/event-stream&quot;))">
-        <send-one-way-request mode="new">
-          <set-url>{docs}</set-url>
-          <set-method>POST</set-method>
-          <set-header name="Authorization" exists-action="override">
-            <value>@(System.Net.WebUtility.UrlEncode("type=aad&amp;ver=1.0&amp;sig=" + (string)context.Variables["cosmosToken"]))</value>
-          </set-header>
-          <set-header name="x-ms-version" exists-action="override"><value>2018-12-31</value></set-header>
-          <set-header name="x-ms-documentdb-partitionkey" exists-action="override">
-            <value>@("[\\"" + context.Subscription.Id + "_" + DateTime.UtcNow.ToString("yyyyMM") + "\\"]")</value>
-          </set-header>
-          <set-body>@{{var doc=new JObject();doc["id"]=context.RequestId;doc["pk"]=context.Subscription.Id+"_"+DateTime.UtcNow.ToString("yyyyMM");doc["ts"]=DateTime.UtcNow.ToString("o");doc["subscription"]=context.Subscription.Id;doc["api"]=context.Api.Id;try{{doc["raw_response"]=context.Response.Body.As&lt;JObject&gt;(preserveContent:true);}}catch{{doc["raw_response"]=null;}}return doc.ToString();}}</set-body>
-        </send-one-way-request>
-      </when>
-    </choose>
   </outbound>
   <on-error><base /></on-error>
 </policies>"""
@@ -798,6 +868,34 @@ class ApimProvisioner:
                 return
             except HttpResponseError as exc:
                 # 412 precondition failed -> someone else wrote; re-read and retry.
+                if getattr(exc, "status_code", None) == 412 and attempt < 2:
+                    logger.info("named value %s changed; retrying", KEY_LIMITS_NV)
+                    continue
+                raise
+
+    def set_audit_flag(self, subscription_ids: list[str], enabled: bool) -> None:
+        """Turn raw-body archival on/off for a set of keys, in one write.
+
+        The gateway reads this out of the same named value as the token limits
+        and stamps `x-tf-audit` on every request, which is the hub's only
+        authority for archiving a body. Takes a LIST because the product-level
+        toggle is per tenant while the map is keyed per subscription.
+
+        Raises on over-cap or persistent write failure — a caller that just
+        promised a customer "auditing is on" must not report success when the
+        gateway was never told.
+        """
+        if not subscription_ids:
+            return
+        for attempt in range(3):
+            current, etag = self._read_key_limits()
+            merged = _merge_audit_flag(current, subscription_ids, enabled)
+            if merged == current:
+                return
+            try:
+                self._write_key_limits(merged, etag)
+                return
+            except HttpResponseError as exc:
                 if getattr(exc, "status_code", None) == 412 and attempt < 2:
                     logger.info("named value %s changed; retrying", KEY_LIMITS_NV)
                     continue

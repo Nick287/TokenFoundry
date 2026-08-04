@@ -41,6 +41,9 @@ def _ensure_columns() -> None:
         "ALTER TABLE model_routes ADD COLUMN IF NOT EXISTS api_version varchar(64)",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS hub_key_kv_ref varchar(512)",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS admin_token_kv_ref varchar(512)",
+        # Raw-body audit archival opt-in. Defaults false: an existing tenant must
+        # never start archiving customer content because of a deploy.
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS audit_enabled boolean NOT NULL DEFAULT false",
         # Per-key gateway limits (replace the retired tpm_tier / budget columns).
         # token_quota is a TIER label (varchar) not a number — APIM's token-quota
         # attribute can't take an expression, so the amount is a policy literal.

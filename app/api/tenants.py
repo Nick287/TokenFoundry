@@ -83,9 +83,42 @@ def update_tenant(
         tenant.name = body.name
     if body.mode is not None:
         tenant.mode = body.mode
+    if body.audit_enabled is not None and body.audit_enabled != tenant.audit_enabled:
+        _apply_audit_flag(db, tenant, body.audit_enabled)
+        tenant.audit_enabled = body.audit_enabled
     db.commit()
     db.refresh(tenant)
     return tenant
+
+
+def _apply_audit_flag(db: Session, tenant: Tenant, enabled: bool) -> None:
+    """Push the tenant's audit decision to APIM before recording it locally.
+
+    Gateway first, DB second, and a failure raises. The hub archives only what
+    APIM's `x-tf-audit` header tells it to, so the named-value map — not this
+    table — is what actually governs whether customer content gets written to
+    disk. If they disagree, the DB is the lie: it would either claim auditing is
+    on while nothing is being captured, or claim it is off while bodies keep
+    landing in storage. The second is a consent violation, so neither is
+    allowed to happen quietly.
+    """
+    sub_ids = [
+        vk.apim_subscription_id
+        for vk in (
+            db.query(VirtualKey)
+            .join(Project, VirtualKey.project_id == Project.id)
+            .filter(Project.tenant_id == tenant.id)
+            .all()
+        )
+        if vk.apim_subscription_id
+    ]
+    try:
+        ApimProvisioner().set_audit_flag(sub_ids, enabled)
+    except Exception as exc:  # noqa: BLE001 — surface, never half-apply
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"failed to apply audit flag at the gateway: {exc}",
+        ) from exc
 
 
 @router.delete("/tenants/{tenant_id}", status_code=status.HTTP_204_NO_CONTENT)

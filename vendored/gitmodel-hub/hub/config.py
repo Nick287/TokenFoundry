@@ -117,6 +117,63 @@ class Settings:
         self.login_max_fails = _int("HUB_LOGIN_MAX_FAILS", 5)
         self.login_lock_seconds = _int("HUB_LOGIN_LOCK_SECONDS", 15 * 60)
 
+        # Azure Event Hub — the hub's only usage-record outlet. One event per
+        # completed /v1 request carrying the upstream `copilot_usage` verbatim;
+        # the control plane drains Event Hub Capture into Cosmos and does the
+        # cost arithmetic there. Leave `eventhub_fqdn` empty (the default) and
+        # emission is a no-op, so the hub still runs standalone with no Azure
+        # dependency. Auth is the container's user-assigned managed identity —
+        # `eventhub_client_id` is that identity's client id; blank falls back to
+        # DefaultAzureCredential's own resolution (system-assigned MI, az login).
+        self.eventhub_fqdn = os.environ.get("TF_EVENTHUB_FQDN", "").strip()
+        self.eventhub_name = os.environ.get("TF_EVENTHUB_NAME", "").strip()
+        self.eventhub_client_id = os.environ.get("TF_EVENTHUB_CLIENT_ID", "").strip()
+
+        # Which deployment this is. Every hub publishes to the SAME Event Hub, so
+        # without it a usage record cannot say which GitHub account's Copilot
+        # quota actually served the call — fine for billing a tenant (that keys
+        # off the APIM subscription), not fine for reconciling against the
+        # per-account bill GitHub sends us. The control plane injects its own
+        # GitHubAccount.id (`gha_…`), so the Cosmos field joins straight back to
+        # that row. Blank on a standalone hub, which is honest: there is no
+        # account registry to point at.
+        self.hub_id = os.environ.get("TF_HUB_ID", "").strip()
+
+        # Buffered-producer tuning. `max_wait_time` bounds how long an event
+        # sits in the SDK buffer before being flushed — it is also the data-loss
+        # window if the instance is killed ungracefully (a graceful shutdown
+        # flushes). `max_buffer_length` bounds memory; past it the SDK invokes
+        # the error callback and the event is dropped rather than blocking the
+        # request path.
+        self.eventhub_max_wait_seconds = _int("TF_EVENTHUB_MAX_WAIT_SECONDS", 5)
+        self.eventhub_max_buffer = _int("TF_EVENTHUB_MAX_BUFFER", 5000)
+
+        # Audit archive — raw request/response bodies for tenants that opted in
+        # (APIM stamps `x-tf-audit`). Deliberately a DIFFERENT storage account
+        # from Event Hub Capture: this one holds customer content, so it gets its
+        # own retention and its own RBAC, and the control plane is not granted
+        # read access to it. Empty `audit_account_url` (the default) disables
+        # archival outright, regardless of what the header says.
+        self.audit_account_url = os.environ.get("TF_AUDIT_ACCOUNT_URL", "").strip()
+        self.audit_container = os.environ.get("TF_AUDIT_CONTAINER", "").strip()
+        # Same managed identity as Event Hub unless overridden; blank falls back
+        # to DefaultAzureCredential's own resolution.
+        self.audit_client_id = (
+            os.environ.get("TF_AUDIT_CLIENT_ID", "").strip() or self.eventhub_client_id
+        )
+        # Cap on the UNCOMPRESSED record. Past it the bodies are clipped and the
+        # record is flagged `truncated` — it bounds gateway memory and per-blob
+        # cost, not correctness. 4 MB holds a very large agent prompt whole.
+        self.audit_max_bytes = _int("TF_AUDIT_MAX_BYTES", 4 * 1024 * 1024)
+
+    @property
+    def eventhub_enabled(self) -> bool:
+        return bool(self.eventhub_fqdn and self.eventhub_name)
+
+    @property
+    def audit_enabled(self) -> bool:
+        return bool(self.audit_account_url and self.audit_container)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

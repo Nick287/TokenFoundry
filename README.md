@@ -257,6 +257,8 @@ as Key Vault references:
 | `TF_ACR_NAME` / `TF_KEYVAULT_NAME` / `TF_ACR_LOGIN_SERVER` / `TF_AZURE_LOCATION` | terraform | Pure values the Portal's deploy-config flow publishes as `HUB_*` GitHub Actions variables. |
 | `TF_HUB_IMAGE_TAG` | terraform (`image_tag`) | The `gitmodel:<tag>` the hub deploy pulls — set to the tag `deploy.sh` actually built (never a hard-coded `:latest`). |
 | `TF_TFSTATE_STORAGE_ACCOUNT` / `TF_TFSTATE_CONTAINER` | deployer module | 方案 A remote-state location. |
+| `TF_EVENTHUB_NAMESPACE_ID` / `TF_EVENTHUB_FQDN` / `TF_EVENTHUB_NAME` | eventhub module | Pass-through only: the control plane never produces to the Event Hub, it republishes these as `HUB_EVENTHUB_*` Actions variables so each hub's producer knows where to send. |
+| `TF_USAGE_CAPTURE_STORAGE_ACCOUNT` / `TF_USAGE_CAPTURE_CONTAINER` / `TF_USAGE_CAPTURE_INTERVAL_SECONDS` | eventhub module | Where the import job reads Capture's Avro blobs. The interval is also the floor on its schedule — running faster only re-lists the same blobs. |
 | `TF_ENVIRONMENT` | static `prod` | Gates the local dev-token auth bypass. |
 
 ## Run it (inside the Dev Container)
@@ -382,6 +384,7 @@ list of trade-offs — is documented in
 | **[docs/SECURITY.md](docs/SECURITY.md)** ([中文](docs/SECURITY.zh.md)) | Secret storage, authentication, RBAC, 方案 A secret tiers, trade-offs. |
 | **[docs/APIM-LLM-Gateway.md](docs/APIM-LLM-Gateway.md)** | The APIM LLM-gateway design: pools, session affinity, prompt caching. |
 | **[docs/PRICING.md](docs/PRICING.md)** ([中文](docs/PRICING.zh.md)) | Cost & sizing by tier: APIM SKU prices + throughput, whole-env monthly estimates, when to upgrade. |
+| **[docs/AUDIT.zh.md](docs/AUDIT.zh.md)** (中文) | Raw request/response archival (off by default): what is kept, its own storage account, who can read/write, retention, the per-tenant switch. |
 
 ## Implementation status
 

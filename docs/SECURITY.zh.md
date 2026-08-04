@@ -16,6 +16,7 @@ Token Foundry 怎么存储密钥和数据:什么存在哪、存的是值还是�
 | 用户登录密码 | **PostgreSQL** | **PBKDF2-HMAC-SHA256 哈希**(24 万次迭代,每用户独立盐)—— 绝非明文 | 数据库登录;常数时间校验。 |
 | 租户 / 项目 / 虚拟密钥元数据 / 模型路由 / 预算 / 用户 | **PostgreSQL** | 标识符、设置、引用 —— **不存任何密钥值** | 关系型控制平面状态。 |
 | 每次调用的用量记录(每次 LLM 调用一条) | **Cosmos DB** | 供应商原始响应 JSON + 元数据;以**虚拟密钥 id** 为键,从不存密钥值 | 用于计量的高写入时序;90 天 TTL。 |
+| 请求体/响应体原文 —— **客户内容** | **独立的存储账户**(绝不与 Capture 账户共用) | gzip 的 JSON,每次调用一个 blob,路径 `YYYY/MM/DD/<subscription>/` | 按租户的审计归档,**默认关闭**。hub 可写;**没有任何服务身份可读**。90 天生命周期删除。详见 [AUDIT.zh.md](AUDIT.zh.md)。 |
 
 **串起这一切的那条铁律:** 控制平面**绝不在 PostgreSQL 里持久化原始密钥** ——
 只存 Key Vault 引用([`app/services/keyvault.py`](../app/services/keyvault.py) 第 1–7 行)。

@@ -9,6 +9,8 @@ a separate port. Health endpoint is unauthenticated for Container Apps probes.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -35,6 +37,34 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
+async def _usage_import_loop() -> None:
+    """Drain Event Hub Capture blobs into Cosmos, forever, on a timer.
+
+    The interval mirrors Capture's own flush interval: running faster only
+    re-lists the same blobs. The importer is synchronous (the Blob and Cosmos
+    SDKs are), so each pass goes to a worker thread — a slow import must not
+    stall the event loop serving the portal.
+
+    `run_once` swallows its own failures, so this loop only has to survive
+    cancellation. It is safe to have several replicas running it: imports are
+    idempotent upserts keyed on the request id.
+    """
+    from app.services.usage_capture_import import UsageCaptureImporter
+
+    importer = UsageCaptureImporter()
+    if not importer.configured:
+        logger.info("usage-import: no capture storage configured; importer disabled")
+        return
+
+    interval = max(settings.usage_capture_interval_seconds, 60)
+    # Stagger the first pass: on a rolling deploy every replica would otherwise
+    # start listing the same container in the same second.
+    await asyncio.sleep(interval)
+    while True:
+        await asyncio.to_thread(importer.run_once)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Bootstrap: create tables + seed the admin user before serving traffic.
@@ -44,7 +74,13 @@ async def lifespan(_app: FastAPI):
     from app.init_db import init_db
 
     init_db()
-    yield
+    importer = asyncio.create_task(_usage_import_loop())
+    try:
+        yield
+    finally:
+        importer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await importer
 
 
 app = FastAPI(

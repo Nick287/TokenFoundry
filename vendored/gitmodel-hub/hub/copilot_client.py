@@ -49,9 +49,28 @@ def _client() -> httpx.AsyncClient:
 # --------------------------------------------------------------------------- #
 # OAuth token resolution
 # --------------------------------------------------------------------------- #
+def _resolve_oauth_token() -> str | None:
+    """The store wins over the environment. Order matters — see below.
+
+    `COPILOT_OAUTH_TOKEN` is injected as a Container App secret at deploy time,
+    so it is *always* set in the cloud. Reading it first made every runtime login
+    a no-op: a device flow (or `install_oauth_token`) would write the store, the
+    env token would keep being used, and the hub would go on 401-ing against a
+    dead token while the UI reported success.
+
+    Reversing it is safe precisely because the store is NOT durable — SQLite
+    lives in /tmp (see infra/main.tf), so any restart or new revision starts with
+    an empty store and falls back to the freshly injected env token. A stale
+    store value can therefore never outlive the deploy that would replace it;
+    the only thing the store can hold is a token installed *after* this process
+    started, which is by definition newer than the one it booted with.
+    """
+    return store.get_oauth_token() or get_settings().copilot_oauth_token
+
+
 def get_oauth_token() -> str:
     """Return the long-lived Copilot OAuth token or raise."""
-    token = get_settings().copilot_oauth_token or store.get_oauth_token()
+    token = _resolve_oauth_token()
     if not token:
         raise NotAuthenticatedError(
             "No Copilot OAuth token configured. Log in via the web portal first."
@@ -60,7 +79,7 @@ def get_oauth_token() -> str:
 
 
 def is_authenticated() -> bool:
-    return bool(get_settings().copilot_oauth_token or store.get_oauth_token())
+    return bool(_resolve_oauth_token())
 
 
 def logout() -> None:
@@ -145,6 +164,50 @@ async def get_api_token() -> tuple[str, str]:
         token, endpoint, expires_at = await _exchange_for_api_token()
         _api_token_mem.update(token=token, endpoint=endpoint, expires_at=expires_at)
         return token, endpoint
+
+
+async def install_oauth_token(token: str) -> dict[str, Any]:
+    """Swap the OAuth token on a RUNNING hub, proving it works before committing.
+
+    The recovery path for a `ghu_` token that stopped being accepted. GitHub App
+    user tokens can be invalidated without warning — signing the same account in
+    elsewhere does it — and the exchanged API token is cached in-process, so the
+    hub keeps serving until something forces a re-exchange, then every request
+    503s. The control plane drives a fresh device flow and calls this to install
+    the result: no redeploy, no restart, no dropped requests.
+
+    Validation is not optional here. The caller is a UI button, and "installed
+    successfully" while the hub goes on failing would be worse than no button at
+    all — so the token is exercised against the real exchange endpoint and only
+    kept if it works. On failure BOTH the store and the API-token cache are put
+    back, because a bad paste must not take down a hub that was still serving on
+    a cached (not yet expired) API token.
+
+    NOTE: only affects this process. The deploy-time `COPILOT_OAUTH_TOKEN`
+    secret is unchanged, so a restart falls back to it — the control plane also
+    writes the new token to Key Vault so the next real deploy picks it up.
+    """
+    token = (token or "").strip()
+    if not token:
+        raise ValueError("access_token is required")
+
+    async with _api_token_lock:
+        previous_oauth = store.get_oauth_token()
+        previous_api = dict(_api_token_mem)
+        store.set_oauth_token(token)
+        _api_token_mem.clear()
+        try:
+            api_token, endpoint, expires_at = await _exchange_for_api_token()
+        except Exception:
+            if previous_oauth is None:
+                store.clear_oauth_token()
+            else:
+                store.set_oauth_token(previous_oauth)
+            _api_token_mem.clear()
+            _api_token_mem.update(previous_api)
+            raise
+        _api_token_mem.update(token=api_token, endpoint=endpoint, expires_at=expires_at)
+    return {"ok": True, "api_token_expires_at": expires_at}
 
 
 # --------------------------------------------------------------------------- #

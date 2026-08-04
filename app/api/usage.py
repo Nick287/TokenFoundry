@@ -3,14 +3,21 @@
 The customer endpoint derives tenant_id from the token (tenant_scope), NEVER
 from a request param. An admin endpoint can read any tenant explicitly.
 
-Usage records are written by the APIM outbound policy (one document per LLM
-call, carrying the full backend response under `raw_response`). Token counts
-live inside that raw response in provider-specific shapes, so we normalize them
-here at read time rather than at write time.
+Usage records reach Cosmos through the hub -> Event Hub -> Capture -> importer
+chain (app/services/usage_capture_import.py), which normalizes tokens and prices
+each call from upstream's own `copilot_usage` at WRITE time. So the breakdowns
+here are plain aggregations over already-normalized columns.
+
+App Insights survives on exactly one endpoint (`/admin/usage-telemetry`), for
+latency and failure counts. That is genuinely different data, not a second
+opinion: Cosmos only ever sees calls that COMPLETED, so it cannot show a request
+the gateway rejected. Everything token- or money-shaped comes from Cosmos, so
+the portal and the invoice are reading the same rows.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -81,8 +88,9 @@ def _summarize(tenant_id: str, rows: list[dict]) -> UsageSummary:
         prompt, completion, _cached = _extract_tokens(r)
         summary.total_prompt_tok += prompt
         summary.total_completion_tok += completion
-        # cost/billed are not computed at write time yet; fall back to any value
-        # already on the record (legacy) so the field is populated when present.
+        # Priced at write time from upstream's own `copilot_usage` (see
+        # usage_capture_import). `or 0.0` still guards pre-cutover rows, which
+        # carry no cost at all rather than a wrong one.
         summary.total_cost_usd += float(r.get("cost_usd", 0.0) or 0.0)
         summary.total_billed_usd += float(r.get("billed_usd", 0.0) or 0.0)
     summary.total_cost_usd = round(summary.total_cost_usd, 4)
@@ -117,31 +125,33 @@ def _to_record_view(r: dict, key_projects: dict[str, dict] | None = None) -> dic
 def _usage_breakdown_payload(
     key_ids: list[str] | None, hours: int, by: str
 ) -> dict[str, Any]:
-    """Shared shape for the breakdown endpoints: per-group token split + trend.
+    """Shared shape for the breakdown endpoints: per-group token + cost split.
 
     `key_ids` restricts to a tenant's virtual keys; None = platform-wide (admin).
-    `by` selects the grouping dimension: "model" (default), "api"/"endpoint", or
-    "subscription" (virtual key). Returns {"by", "hours", "groups", "trend",
-    "totals"} where each group has total/prompt/cached/completion/reasoning token
-    counts + calls, and trend carries per-bucket tokens + calls (dual-line chart).
+    `by` selects the grouping dimension: "model" (default), "api"/"endpoint",
+    "subscription" (virtual key), "backend"/"hub", or "end_user".
+
+    Returns {"by", "hours", "groups", "trend", "totals"}. Each group carries
+    per-type token counts, `calls`, and — new with the Cosmos source —
+    `cost_usd`/`billed_usd`, so "which model spent the money" is answerable
+    without leaving this payload.
+
+    `totals` is queried independently rather than summed from `groups`: the group
+    list can be truncated on a high-cardinality dimension, and the headline
+    numbers should stay whole when it is.
     """
-    ai = AppInsightsUsage()
+    store = UsageStore()
     # Normalize the requested grouping to a canonical dimension name.
     group_by = {"endpoint": "api", "hub": "backend"}.get(by, by)
-    if group_by not in ("model", "api", "subscription", "backend"):
+    if group_by not in UsageStore._AGG_DIMS:
         group_by = "model"
-    groups = ai.token_usage_breakdown(key_ids, hours=hours, group_by=group_by)
-    trend = ai.token_usage_trend(key_ids, hours=hours)
-    totals = {
-        k: sum(int(g.get(k, 0) or 0) for g in groups)
-        for k in (*AppInsightsUsage._TOKEN_KEYS, "calls")
-    }
+    since = (datetime.now(UTC) - timedelta(hours=max(hours, 1))).isoformat()
     return {
         "by": group_by,
         "hours": hours,
-        "groups": groups,
-        "trend": trend,
-        "totals": totals,
+        "groups": store.cost_breakdown(key_ids, since_iso=since, group_by=group_by),
+        "trend": store.cost_trend(key_ids, since_iso=since, hours=hours),
+        "totals": store.cost_totals(key_ids, since_iso=since),
     }
 
 
@@ -233,12 +243,12 @@ def my_usage_breakdown(
     tenant_id: str = Depends(tenant_scope),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Customer self-service: token breakdown (App Insights) for the CALLER's
-    tenant, grouped by model (default) or api/endpoint, split by token type
-    (total / prompt / cached / completion / reasoning), plus a total-token trend.
+    """Customer self-service: token + cost breakdown for the CALLER's tenant,
+    grouped by model (default), api/endpoint, subscription, backend or end_user.
 
-    App Insights metering covers BOTH streaming and non-streaming calls, so this
-    reflects true token consumption (the Cosmos call log skips SSE)."""
+    Sourced from Cosmos, which covers streaming and non-streaming calls alike and
+    carries the same per-call cost the invoice is built from — so a customer
+    querying this sees the numbers they will be billed on, not an estimate."""
     key_ids = _tenant_key_ids(db, tenant_id)
     return _usage_breakdown_payload(key_ids, hours=hours, by=by)
 

@@ -20,9 +20,12 @@ endpoint (which the deployed hub calls to exchange for a short-lived API token).
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # copilot.vim public client_id (must match the vendored hub so the token the
 # hub later exchanges is valid). See vendored/gitmodel-hub/hub/copilot_client.py.
@@ -71,7 +74,19 @@ def poll_device_flow(device_code: str) -> dict[str, Any]:
         )
         data = r.json()
     if "access_token" in data:
-        return {"status": "success", "access_token": data["access_token"]}
+        # The `ghu_` tokens this flow mints can stop working without notice, and
+        # unattended renewal is only possible if GitHub also hands back a
+        # refresh token. That depends on the app registration, not on us, so log
+        # which fields actually came back — NAMES ONLY, these are credentials.
+        logger.info("device flow authorized; response fields: %s", sorted(data))
+        return {
+            "status": "success",
+            "access_token": data["access_token"],
+            # None unless the client_id is a GitHub App with token expiration on.
+            "refresh_token": data.get("refresh_token"),
+            "expires_in": data.get("expires_in"),
+            "refresh_token_expires_in": data.get("refresh_token_expires_in"),
+        }
     err = data.get("error")
     if err in ("authorization_pending", "slow_down"):
         return {"status": "pending", "error": err}

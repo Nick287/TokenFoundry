@@ -148,7 +148,13 @@ def _find_run(correlation_id: str, since_iso: str) -> int:
     return a run id, so poll the workflow's runs filtered by created>=since and
     match run-name containing the correlation id."""
     url = f"{_workflow_base()}/runs"
-    params = {"event": "workflow_dispatch", "created": f">={since_iso}", "per_page": 30}
+    # Annotated because a bare literal infers dict[str, object] (mixed str/int
+    # values), which httpx's params type does not accept.
+    params: dict[str, str | int] = {
+        "event": "workflow_dispatch",
+        "created": f">={since_iso}",
+        "per_page": 30,
+    }
     deadline = time.time() + _FIND_RUN_TIMEOUT
     while time.time() < deadline:
         with httpx.Client(timeout=30.0) as hc:

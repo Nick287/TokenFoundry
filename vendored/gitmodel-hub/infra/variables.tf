@@ -129,3 +129,64 @@ variable "memory" {
   description = "Memory per replica (must pair with cpu, e.g. 2.0Gi for 1 vCPU)."
   default     = "2.0Gi"
 }
+
+# --- Usage reporting to the control plane's Event Hub ---------------------
+#
+# All three default to empty so a hub still deploys standalone: the hub reads an
+# unset TF_EVENTHUB_FQDN as "reporting disabled" and serves requests normally.
+# The values come from the control-plane terraform's eventhub outputs, carried
+# here as repo variables by the Portal's deploy-config flow.
+
+variable "eventhub_namespace_id" {
+  type        = string
+  description = "Resource id of the control plane's Event Hub namespace. Scope for this hub identity's `Azure Event Hubs Data Sender` grant — cross-scope, since the namespace lives in the control plane's resource group. Empty => no grant and no reporting."
+  default     = ""
+}
+
+variable "eventhub_fqdn" {
+  type        = string
+  description = "Namespace host the hub's usage producer connects to, e.g. tokenfoundry-ehns-<suffix>.servicebus.windows.net. Injected as TF_EVENTHUB_FQDN."
+  default     = ""
+}
+
+variable "eventhub_name" {
+  type        = string
+  description = "Event hub (topic) usage events are sent to. Injected as TF_EVENTHUB_NAME."
+  default     = ""
+}
+
+variable "hub_id" {
+  type        = string
+  description = "Identity of THIS deployment, stamped on every usage event as `hub_id`. The control plane passes its GitHubAccount.id (`gha_…`), which is also the account_id in the RG name and remote-state key — so a Cosmos usage document joins back to the account whose Copilot quota served the call. Empty on a standalone deploy: the field lands as null rather than as a guess. Injected as TF_HUB_ID."
+  default     = ""
+}
+
+# --- Audit archive (raw request/response bodies) --------------------------
+#
+# Same standalone-safe defaults, but the stakes of the empty case are inverted:
+# unset means the hub archives NOTHING, which is the correct direction for a
+# feature that writes customer content to disk. A misconfigured hub loses an
+# audit trail; a wrongly-configured one leaks prompts.
+#
+# Note this is only half the gate. Even fully configured, the hub archives a
+# request solely when APIM stamped `x-tf-audit: 1` on it, which happens only for
+# tenants a platform operator switched on. Deploying this infra does not start
+# archiving anyone.
+
+variable "audit_container_scope" {
+  type        = string
+  description = "Resource id of the audit blob CONTAINER. Scope for this hub identity's `Storage Blob Data Contributor` grant — container-scoped, not account-scoped, so the hub can write payloads and touch nothing else in that account. Empty => no grant."
+  default     = ""
+}
+
+variable "audit_account_url" {
+  type        = string
+  description = "Blob endpoint the hub writes audit payloads to, e.g. https://tokenfoundryaudit<suffix>.blob.core.windows.net/. Injected as TF_AUDIT_ACCOUNT_URL."
+  default     = ""
+}
+
+variable "audit_container" {
+  type        = string
+  description = "Container audit payloads are written to. Injected as TF_AUDIT_CONTAINER."
+  default     = ""
+}

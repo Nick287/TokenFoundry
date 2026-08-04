@@ -1,10 +1,15 @@
 """Persistence layer for GitModel Hub (SQLite).
 
-Stores three things:
+Stores two things:
 
-* the long-lived Copilot OAuth token (single row),
-* locally issued hub API keys (used by Codex / Claude Code / curl clients),
-* per-request token usage records for statistics.
+* the long-lived Copilot OAuth token + generic settings (single `kv` table),
+* locally issued hub API keys (used by Codex / Claude Code / curl clients).
+
+Usage records are deliberately NOT stored here. They go straight to Azure Event
+Hub (`hub.eventhub`) carrying upstream's `copilot_usage` verbatim, and the
+control plane computes cost downstream — so the hub holds no usage table and no
+price table. A local store would not have been a usable fallback anyway: this
+SQLite DB lives on ephemeral container storage and is empty after any restart.
 
 A small connection-per-call model keeps things thread-safe under the FastAPI
 threadpool without needing an async DB driver.
@@ -31,25 +36,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at REAL NOT NULL,
     revoked    INTEGER NOT NULL DEFAULT 0
 );
-
-CREATE TABLE IF NOT EXISTS usage (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts            REAL NOT NULL,
-    api_key       TEXT,
-    model         TEXT,
-    served_model  TEXT,
-    endpoint      TEXT,
-    input_tokens  INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    total_tokens  INTEGER NOT NULL DEFAULT 0,
-    cached_tokens INTEGER NOT NULL DEFAULT 0,
-    streamed      INTEGER NOT NULL DEFAULT 0,
-    estimated     INTEGER NOT NULL DEFAULT 0,
-    status        INTEGER NOT NULL DEFAULT 200
-);
-
-CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
-CREATE INDEX IF NOT EXISTS idx_usage_model ON usage(model);
 """
 
 
@@ -73,12 +59,13 @@ def init_db() -> None:
 
 
 def _migrate(c: sqlite3.Connection) -> None:
-    """Apply in-place schema upgrades for existing databases."""
-    cols = {row["name"] for row in c.execute("PRAGMA table_info(usage)")}
-    if "cached_tokens" not in cols:
-        c.execute(
-            "ALTER TABLE usage ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0"
-        )
+    """Apply in-place schema upgrades for existing databases.
+
+    Drops the retired `usage` table: usage now goes to Event Hub, never to
+    SQLite. Harmless on the ephemeral deployment (the DB starts empty every
+    cold start); it matters for long-lived local dev databases.
+    """
+    c.execute("DROP TABLE IF EXISTS usage")
 
 
 # --------------------------------------------------------------------------- #
@@ -214,118 +201,6 @@ def set_image_config(
 
 
 # --------------------------------------------------------------------------- #
-# Pricing (USD per 1M tokens, split input / output) — used for cost estimates
-# --------------------------------------------------------------------------- #
-# Public list prices (USD per 1M tokens) as of the Anthropic pricing page;
-# the admin can edit them in the portal. "default" is the fallback applied to
-# any model not listed. Source: platform.claude.com/docs/.../pricing
-DEFAULT_PRICING: dict[str, dict[str, float]] = {
-    "default": {"input": 3.0, "output": 15.0},
-    # Claude Sonnet (3.5 / 3.7 / 4 / 4.5 / 4.6) — $3 / $15
-    "claude-3.5-sonnet": {"input": 3.0, "output": 15.0},
-    "claude-3.7-sonnet": {"input": 3.0, "output": 15.0},
-    "claude-sonnet-4": {"input": 3.0, "output": 15.0},
-    "claude-sonnet-4.5": {"input": 3.0, "output": 15.0},
-    "claude-sonnet-4.6": {"input": 3.0, "output": 15.0},
-    # Claude Opus 4 / 4.1 (older tier) — $15 / $75
-    "claude-opus-4": {"input": 15.0, "output": 75.0},
-    "claude-opus-4.1": {"input": 15.0, "output": 75.0},
-    # Claude Opus 4.5 / 4.6 / 4.7 / 4.8 (current tier) — $5 / $25
-    "claude-opus-4.5": {"input": 5.0, "output": 25.0},
-    "claude-opus-4.6": {"input": 5.0, "output": 25.0},
-    "claude-opus-4.7": {"input": 5.0, "output": 25.0},
-    "claude-opus-4.8": {"input": 5.0, "output": 25.0},
-    # Claude Haiku — 4.5: $1 / $5, 3.5: $0.80 / $4
-    "claude-haiku-4.5": {"input": 1.0, "output": 5.0},
-    "claude-3.5-haiku": {"input": 0.80, "output": 4.0},
-    # OpenAI-side models (rough public list prices, for reference)
-    "gpt-4.1": {"input": 2.0, "output": 8.0},
-    "gpt-5.5": {"input": 1.25, "output": 10.0},
-    "gpt-5.3-codex": {"input": 1.25, "output": 10.0},
-    # Google Gemini (rates observed from Copilot's copilot_usage payload)
-    "gemini-2.5-pro": {"input": 1.25, "output": 10.0},
-    "gemini-3-flash-preview": {"input": 0.50, "output": 3.0},
-    "gemini-3.1-pro-preview": {"input": 2.0, "output": 12.0},
-    "gemini-3.5-flash": {"input": 1.5, "output": 9.0},
-    # Azure OpenAI image model (token-based; image output tokens dominate)
-    "gpt-image-2": {"input": 5.0, "output": 40.0},
-}
-
-
-def get_pricing() -> dict[str, dict[str, float]]:
-    """Return the saved pricing table merged over the defaults.
-
-    Each model has ``input`` / ``output`` and an optional ``cache_read`` rate
-    (USD per 1M tokens). When ``cache_read`` is absent it defaults to
-    ``input * 0.1`` — matching Anthropic's cache-hit pricing (0.1x base input).
-    """
-    import json
-
-    pricing = {k: dict(v) for k, v in DEFAULT_PRICING.items()}
-    raw = get_setting("pricing")
-    if raw:
-        try:
-            saved = json.loads(raw)
-            if isinstance(saved, dict):
-                for model, rates in saved.items():
-                    if isinstance(rates, dict):
-                        entry = {
-                            "input": float(rates.get("input", 0) or 0),
-                            "output": float(rates.get("output", 0) or 0),
-                        }
-                        if rates.get("cache_read") is not None:
-                            entry["cache_read"] = float(rates.get("cache_read") or 0)
-                        pricing[model] = entry
-        except (ValueError, TypeError):
-            pass
-    # Fill in a default cache_read (0.1x input) wherever it's missing.
-    for rates in pricing.values():
-        rates.setdefault("cache_read", round(rates.get("input", 0) * 0.1, 6))
-    return pricing
-
-
-def set_pricing(pricing: dict[str, Any]) -> None:
-    import json
-
-    clean: dict[str, dict[str, float]] = {}
-    for model, rates in (pricing or {}).items():
-        if not isinstance(rates, dict):
-            continue
-        try:
-            entry = {
-                "input": float(rates.get("input", 0) or 0),
-                "output": float(rates.get("output", 0) or 0),
-            }
-            if rates.get("cache_read") is not None:
-                entry["cache_read"] = float(rates.get("cache_read") or 0)
-            clean[str(model)] = entry
-        except (ValueError, TypeError):
-            continue
-    set_setting("pricing", json.dumps(clean))
-
-
-def estimate_cost(
-    pricing: dict[str, dict[str, float]], model: str | None,
-    input_tokens: int, output_tokens: int, cached_tokens: int = 0,
-) -> float:
-    """USD cost for a row given the pricing table (per 1M tokens).
-
-    ``cached_tokens`` are a subset of ``input_tokens`` that hit the prompt
-    cache; they are billed at the (cheaper) ``cache_read`` rate, and the
-    remaining uncached input at the normal ``input`` rate.
-    """
-    rates = pricing.get(model or "") or pricing.get("default") or {}
-    in_rate = rates.get("input", 0)
-    cache_rate = rates.get("cache_read", in_rate * 0.1)
-    cached = max(0, min(cached_tokens or 0, input_tokens or 0))
-    uncached = (input_tokens or 0) - cached
-    cost_in = (uncached / 1_000_000) * in_rate
-    cost_cache = (cached / 1_000_000) * cache_rate
-    cost_out = (output_tokens / 1_000_000) * rates.get("output", 0)
-    return cost_in + cost_cache + cost_out
-
-
-# --------------------------------------------------------------------------- #
 # API keys
 # --------------------------------------------------------------------------- #
 def create_api_key(name: str) -> dict[str, Any]:
@@ -359,164 +234,3 @@ def is_valid_api_key(key: str) -> bool:
         ).fetchone()
         return row is not None
 
-
-# --------------------------------------------------------------------------- #
-# Usage
-# --------------------------------------------------------------------------- #
-def record_usage(
-    *,
-    api_key: str | None,
-    model: str | None,
-    served_model: str | None,
-    endpoint: str,
-    input_tokens: int,
-    output_tokens: int,
-    total_tokens: int,
-    streamed: bool,
-    estimated: bool,
-    status: int = 200,
-    cached_tokens: int = 0,
-) -> None:
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO usage(ts, api_key, model, served_model, endpoint, "
-            "input_tokens, output_tokens, total_tokens, cached_tokens, "
-            "streamed, estimated, status) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                time.time(),
-                api_key,
-                model,
-                served_model,
-                endpoint,
-                int(input_tokens or 0),
-                int(output_tokens or 0),
-                int(total_tokens or 0),
-                int(cached_tokens or 0),
-                1 if streamed else 0,
-                1 if estimated else 0,
-                int(status),
-            ),
-        )
-
-
-def usage_summary(since: float | None, until: float | None) -> dict[str, Any]:
-    where = []
-    params: list[Any] = []
-    if since is not None:
-        where.append("ts >= ?")
-        params.append(since)
-    if until is not None:
-        where.append("ts <= ?")
-        params.append(until)
-    clause = ("WHERE " + " AND ".join(where)) if where else ""
-    # Same predicate but table-qualified, for queries that JOIN api_keys.
-    uclause = clause.replace("ts ", "u.ts ") if clause else ""
-
-    with _conn() as c:
-        totals = c.execute(
-            f"SELECT COUNT(*) AS requests, "
-            f"COALESCE(SUM(input_tokens),0) AS input_tokens, "
-            f"COALESCE(SUM(output_tokens),0) AS output_tokens, "
-            f"COALESCE(SUM(cached_tokens),0) AS cached_tokens, "
-            f"COALESCE(SUM(total_tokens),0) AS total_tokens "
-            f"FROM usage {clause}",
-            params,
-        ).fetchone()
-
-        by_model = c.execute(
-            f"SELECT model, COUNT(*) AS requests, "
-            f"COALESCE(SUM(input_tokens),0) AS input_tokens, "
-            f"COALESCE(SUM(output_tokens),0) AS output_tokens, "
-            f"COALESCE(SUM(cached_tokens),0) AS cached_tokens, "
-            f"COALESCE(SUM(total_tokens),0) AS total_tokens "
-            f"FROM usage {clause} GROUP BY model ORDER BY total_tokens DESC",
-            params,
-        ).fetchall()
-
-        by_day = c.execute(
-            f"SELECT date(ts, 'unixepoch', 'localtime') AS day, "
-            f"COALESCE(SUM(total_tokens),0) AS total_tokens, "
-            f"COUNT(*) AS requests "
-            f"FROM usage {clause} GROUP BY day ORDER BY day",
-            params,
-        ).fetchall()
-
-        # Per-API-key token totals, joined to api_keys for a friendly name.
-        by_api_key = c.execute(
-            f"SELECT u.api_key AS key, "
-            f"COALESCE(k.name, '') AS key_name, "
-            f"COUNT(*) AS requests, "
-            f"COALESCE(SUM(u.input_tokens),0) AS input_tokens, "
-            f"COALESCE(SUM(u.output_tokens),0) AS output_tokens, "
-            f"COALESCE(SUM(u.cached_tokens),0) AS cached_tokens, "
-            f"COALESCE(SUM(u.total_tokens),0) AS total_tokens "
-            f"FROM usage u LEFT JOIN api_keys k ON u.api_key = k.key {uclause} "
-            f"GROUP BY u.api_key ORDER BY total_tokens DESC",
-            params,
-        ).fetchall()
-
-        # (key, model) breakdown — used to compute per-key cost (cost is
-        # per-model, but a key spans models). Not returned directly.
-        by_key_model = c.execute(
-            f"SELECT u.api_key AS key, u.model AS model, "
-            f"COALESCE(SUM(u.input_tokens),0) AS input_tokens, "
-            f"COALESCE(SUM(u.output_tokens),0) AS output_tokens, "
-            f"COALESCE(SUM(u.cached_tokens),0) AS cached_tokens "
-            f"FROM usage u {uclause} GROUP BY u.api_key, u.model",
-            params,
-        ).fetchall()
-
-    return {
-        "totals": dict(totals),
-        "by_model": [dict(r) for r in by_model],
-        "by_day": [dict(r) for r in by_day],
-        "by_api_key": [dict(r) for r in by_api_key],
-        "_by_key_model": [dict(r) for r in by_key_model],
-        "pricing": pricing_table(),
-    }
-
-
-def pricing_table() -> dict[str, dict[str, float]]:
-    """Public alias kept stable for callers/tests."""
-    return get_pricing()
-
-
-def usage_summary_with_cost(since: float | None, until: float | None) -> dict[str, Any]:
-    """usage_summary plus per-model, per-key and total USD cost estimates."""
-    data = usage_summary(since, until)
-    pricing = data["pricing"]
-    total_cost = 0.0
-    for row in data["by_model"]:
-        cost = estimate_cost(
-            pricing, row.get("model"),
-            row.get("input_tokens", 0), row.get("output_tokens", 0),
-            row.get("cached_tokens", 0),
-        )
-        row["cost"] = round(cost, 4)
-        total_cost += cost
-    data["totals"]["cost"] = round(total_cost, 4)
-
-    # Per-key cost: cost is per-model, so sum each (key, model) slice.
-    cost_by_key: dict[Any, float] = {}
-    for row in data.pop("_by_key_model", []):
-        cost_by_key[row.get("key")] = cost_by_key.get(row.get("key"), 0.0) + estimate_cost(
-            pricing, row.get("model"),
-            row.get("input_tokens", 0), row.get("output_tokens", 0),
-            row.get("cached_tokens", 0),
-        )
-    for row in data["by_api_key"]:
-        row["cost"] = round(cost_by_key.get(row.get("key"), 0.0), 4)
-
-    return data
-
-
-def recent_usage(limit: int = 50) -> list[dict[str, Any]]:
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT ts, api_key, model, served_model, endpoint, input_tokens, "
-            "output_tokens, total_tokens, cached_tokens, streamed, estimated, status "
-            "FROM usage ORDER BY ts DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]

@@ -119,6 +119,40 @@ resource "azurerm_role_assignment" "acr_pull" {
   principal_id         = azurerm_user_assigned_identity.app.principal_id
 }
 
+# --- Usage reporting: send to the control plane's Event Hub ----------------
+#
+# Cross-scope like acr_pull above: the namespace lives in the control plane's
+# resource group, not this per-account one, so the scope is an id passed in
+# rather than a resource declared here. Data SENDER only — the hub produces and
+# never reads back; the control plane is the consumer (via Capture blobs).
+#
+# Gated on the namespace id being supplied so a hub can still be deployed
+# standalone (no usage reporting) — the hub treats an unset TF_EVENTHUB_FQDN as
+# "don't report" and serves requests normally.
+resource "azurerm_role_assignment" "eventhub_sender" {
+  count                = var.eventhub_namespace_id != "" ? 1 : 0
+  scope                = var.eventhub_namespace_id
+  role_definition_name = "Azure Event Hubs Data Sender"
+  principal_id         = azurerm_user_assigned_identity.app.principal_id
+}
+
+# --- Audit archive: write raw bodies for tenants that opted in -------------
+#
+# Cross-scope again, and scoped to the CONTAINER rather than the account: the
+# hub creates blobs there and can do nothing else in an account that holds every
+# other tenant's archived prompts. `Storage Blob Data Contributor` is the
+# narrowest built-in role that permits creating a blob — Azure has no write-only
+# blob role, so this identity can technically read back what it wrote. That is
+# the residual, and it is why the account is separate from usage capture.
+#
+# Gated on the scope being supplied, same as the sender grant above.
+resource "azurerm_role_assignment" "audit_writer" {
+  count                = var.audit_container_scope != "" ? 1 : 0
+  scope                = var.audit_container_scope
+  role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = azurerm_user_assigned_identity.app.principal_id
+}
+
 # --- Container Apps environment + app -------------------------------------
 #
 # The hub is stateless: no Azure Files storage account / share / volume. All
@@ -255,11 +289,62 @@ resource "azurerm_container_app" "hub" {
           secret_name = "hub-api-key"
         }
       }
+
+      # --- Usage reporting (hub/eventhub.py) ---
+      # No secret: the producer authenticates with the user-assigned identity
+      # above, so only the client_id is needed to disambiguate it from any other
+      # identity on the container. All three unset = reporting disabled.
+      env {
+        name  = "TF_EVENTHUB_FQDN"
+        value = var.eventhub_fqdn
+      }
+
+      env {
+        name  = "TF_EVENTHUB_NAME"
+        value = var.eventhub_name
+      }
+
+      env {
+        name  = "TF_EVENTHUB_CLIENT_ID"
+        value = azurerm_user_assigned_identity.app.client_id
+      }
+
+      # Which deployment this is. Every hub sends to the SAME Event Hub, so
+      # without this the records cannot be split by upstream GitHub account.
+      env {
+        name  = "TF_HUB_ID"
+        value = var.hub_id
+      }
+
+      # --- Audit archive (hub/audit.py) ---
+      # Same identity, no secret. Both unset = the hub archives nothing, no
+      # matter what header APIM sends. TF_AUDIT_CLIENT_ID is omitted on purpose:
+      # audit.py falls back to the Event Hub client id, and there is only one
+      # identity on this container.
+      env {
+        name  = "TF_AUDIT_ACCOUNT_URL"
+        value = var.audit_account_url
+      }
+
+      env {
+        name  = "TF_AUDIT_CONTAINER"
+        value = var.audit_container
+      }
     }
   }
 
   # terraform_data.build is count-gated (0 when using a pre-built image), so use
   # a splat reference — [] when skipped, [<build>] when building. Either way the
   # app waits for the build only if one actually runs.
-  depends_on = [azurerm_role_assignment.acr_pull, terraform_data.build]
+  #
+  # The Event Hub grant is in here too: without it the first revision's producer
+  # would 401 on every emit until RBAC caught up, silently losing that usage.
+  # The audit grant likewise — a 401 there loses the archive for exactly the
+  # requests an operator just turned archiving on to capture.
+  depends_on = [
+    azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.eventhub_sender,
+    azurerm_role_assignment.audit_writer,
+    terraform_data.build,
+  ]
 }

@@ -34,6 +34,7 @@ export function GitHubAccountsPage() {
   const { t } = useTranslation();
   const toast = useToast();
   const [flow, setFlow] = useState<DeviceStart | null>(null);
+  const [relogin, setRelogin] = useState<DeviceStart | null>(null);
   const [removing, setRemoving] = useState<GitHubAccount | null>(null);
 
   // The accounts list drives the table AND the deploying->ready transition:
@@ -77,6 +78,16 @@ export function GitHubAccountsPage() {
       toast(t("github.resyncedOk", { count: added }));
       qc.invalidateQueries({ queryKey: ["model-routes"] });
     },
+    onError: (e) => toast(String(e), "error"),
+  });
+
+  // Re-login: the account's Copilot authorization can be invalidated out from
+  // under this hub (signing the same GitHub account in elsewhere does it), and
+  // there is no way to renew it unattended — so this is the recovery path. It
+  // swaps the token on the running hub; no deploy, no restart.
+  const reloginStart = useMutation({
+    mutationFn: (id: string) => api.startGithubRelogin(principal.token, id),
+    onSuccess: (d) => setRelogin(d),
     onError: (e) => toast(String(e), "error"),
   });
 
@@ -151,6 +162,21 @@ export function GitHubAccountsPage() {
                     <button
                       type="button"
                       className="btn-sm"
+                      onClick={() => reloginStart.mutate(a.id)}
+                      disabled={
+                        !a.container_app_fqdn ||
+                        a.status !== "ready" ||
+                        (reloginStart.isPending && reloginStart.variables === a.id)
+                      }
+                      title={t("github.reloginHint")}
+                    >
+                      {reloginStart.isPending && reloginStart.variables === a.id
+                        ? t("github.starting")
+                        : t("github.relogin")}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-sm"
                       onClick={() => resync.mutate(a.id)}
                       disabled={
                         !a.container_app_fqdn ||
@@ -188,6 +214,15 @@ export function GitHubAccountsPage() {
           }}
         />
       )}
+      {relogin && (
+        <ReloginModal
+          flow={relogin}
+          onClose={() => {
+            setRelogin(null);
+            qc.invalidateQueries({ queryKey: ["github-accounts"] });
+          }}
+        />
+      )}
       {removing && (
         <ConfirmDialog
           title={t("github.deleteTitle")}
@@ -206,12 +241,45 @@ export function GitHubAccountsPage() {
   );
 }
 
+// The half both flows share: show the one-time code, offer a copy button, link
+// out to GitHub. Onboarding and re-login differ only in what happens AFTER
+// GitHub answers, so only that part lives in the two modals below.
+function DeviceCodePrompt({ flow }: { flow: DeviceStart }) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+
+  async function onCopy() {
+    try {
+      await navigator.clipboard.writeText(flow.user_code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // clipboard blocked (insecure context) — the code is shown for manual copy
+    }
+  }
+
+  return (
+    <div className="device-flow">
+      <p>{t("github.userCodeHint")}</p>
+      <div className="device-code">
+        <code>{flow.user_code}</code>
+        <button type="button" className="btn-sm" onClick={onCopy}>
+          {copied ? t("keys.copied") : t("keys.copy")}
+        </button>
+      </div>
+      <a className="btn-sm" href={flow.verification_uri} target="_blank" rel="noreferrer">
+        {t("github.openGithub")}
+      </a>
+      <p className="hint">{t("github.awaitingHint")}</p>
+    </div>
+  );
+}
+
 // Device-flow modal: shows the user_code + verification link, polls the backend
 // on the flow's interval, and advances awaiting -> deploying -> ready/failed.
 function DeviceFlowModal({ flow, onClose }: { flow: DeviceStart; onClose: () => void }) {
   const principal = usePrincipal()!;
   const { t } = useTranslation();
-  const [copied, setCopied] = useState(false);
 
   // Poll device/poll while still awaiting authorization; once the backend flips
   // past PENDING (deploying/failed) it echoes the status and we stop polling.
@@ -226,37 +294,10 @@ function DeviceFlowModal({ flow, onClose }: { flow: DeviceStart; onClose: () => 
 
   const status = poll.data?.status ?? "pending";
 
-  async function onCopy() {
-    try {
-      await navigator.clipboard.writeText(flow.user_code);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // clipboard blocked (insecure context) — the code is shown for manual copy
-    }
-  }
-
   return (
     <Modal title={t("github.authorizeTitle")} onClose={onClose}>
       {status === "pending" ? (
-        <div className="device-flow">
-          <p>{t("github.userCodeHint")}</p>
-          <div className="device-code">
-            <code>{flow.user_code}</code>
-            <button type="button" className="btn-sm" onClick={onCopy}>
-              {copied ? t("keys.copied") : t("keys.copy")}
-            </button>
-          </div>
-          <a
-            className="btn-sm"
-            href={flow.verification_uri}
-            target="_blank"
-            rel="noreferrer"
-          >
-            {t("github.openGithub")}
-          </a>
-          <p className="hint">{t("github.awaitingHint")}</p>
-        </div>
+        <DeviceCodePrompt flow={flow} />
       ) : status === "failed" ? (
         <div className="device-flow">
           <p className="error">{poll.data?.detail ?? t("github.failedHint")}</p>
@@ -274,6 +315,53 @@ function DeviceFlowModal({ flow, onClose }: { flow: DeviceStart; onClose: () => 
       <div className="modal-actions">
         <button type="button" className="btn-sm" onClick={onClose}>
           {status === "ready" ? t("common.close") : t("github.runInBackground")}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+// Re-login modal: same device flow, but it replaces the Copilot token on an
+// already-deployed hub instead of creating an account. Nothing is deployed, so
+// there is no deploy status to walk — it resolves to success or failure and the
+// hub is serving again the moment it succeeds.
+function ReloginModal({ flow, onClose }: { flow: DeviceStart; onClose: () => void }) {
+  const principal = usePrincipal()!;
+  const { t } = useTranslation();
+
+  const poll = useQuery({
+    queryKey: ["gh-relogin-poll", flow.account_id],
+    queryFn: () => api.pollGithubRelogin(principal.token, flow.account_id),
+    refetchInterval: (q) =>
+      !q.state.data || q.state.data.status === "pending"
+        ? Math.max(flow.interval, 1) * 1000
+        : false,
+  });
+
+  const status = poll.data?.status ?? "pending";
+
+  return (
+    <Modal title={t("github.reloginTitle")} onClose={onClose}>
+      {status === "pending" ? (
+        <DeviceCodePrompt flow={flow} />
+      ) : status === "failed" ? (
+        <div className="device-flow">
+          <p className="error">{poll.data?.detail ?? t("github.reloginFailed")}</p>
+          {/* The hub is left exactly as it was on every failure path, so say so:
+              a failed re-login reads like an outage otherwise. */}
+          <p className="hint">{t("github.reloginUnchanged")}</p>
+        </div>
+      ) : (
+        <div className="device-flow">
+          <p>
+            <span className="badge badge-active">{t("github.reloginOk")}</span>
+          </p>
+          <p className="hint">{t("github.reloginOkHint")}</p>
+        </div>
+      )}
+      <div className="modal-actions">
+        <button type="button" className="btn-sm" onClick={onClose}>
+          {t("common.close")}
         </button>
       </div>
     </Modal>

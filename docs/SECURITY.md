@@ -18,6 +18,7 @@ check.
 | User login passwords | **PostgreSQL** | **PBKDF2-HMAC-SHA256 hash** (240k iterations, per-user salt) — never plaintext | Database-backed login; verified in constant time. |
 | Tenants / projects / virtual-key metadata / model routes / budgets / users | **PostgreSQL** | Identifiers, settings, references — **no secret values** | Relational control-plane state. |
 | Per-call usage records (one per LLM call) | **Cosmos DB** | Raw provider response JSON + metadata; keyed by **virtual-key id**, never the key value | High-write time-series for metering; 90-day TTL. |
+| Raw request/response bodies — **customer content** | **Its own storage account** (never the capture one) | gzipped JSON, one blob per call, under `YYYY/MM/DD/<subscription>/` | Per-tenant audit archive, **off by default**. Hubs can write; **no service identity can read**. 90-day lifecycle delete. See [AUDIT.zh.md](AUDIT.zh.md). |
 
 **The one rule that ties it together:** the control plane **never persists a raw
 secret in PostgreSQL** — only a Key Vault reference

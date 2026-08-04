@@ -148,7 +148,17 @@ openai 流式 chunk 注入 `"object":"chat.completion.chunk"`（并顺带把 usa
 - `emit-token-metric` → `customMetrics` 被订阅 feature `Microsoft.Insights/EnableCustomMetricsV2`
   卡死（注册 8h+ 仍 Pending，unregister/register 与 re-register provider 均无效，疑似订阅侧
   异常，需 support ticket）。**修复不依赖它**。
-- 自研 `traces` 对流式 `BODY_READ_FAILED`；hub `/api/usage` 虽精确但计费不采用（计费走 APIM）。
+- 自研 `traces` 对流式 `BODY_READ_FAILED`。hub 的 `/api/usage` 已随计费改造删除：hub 不再本地
+  存用量，改为把上游 `copilot_usage` 原样发到 Event Hub，Capture 落 Blob 后由控制平面批量导入
+  Cosmos（见 `app/services/usage_capture_import.py`）。APIM outbound 直写 Cosmos 那条路也已删除
+  ——它读不到流式响应体，本就无法覆盖全部计费。
+  （事件里只有用量与价格。**请求/响应原文**走另一条完全独立的管线、默认关闭，见
+  [AUDIT.zh.md](AUDIT.zh.md)。）
+  （**所有 hub 共用同一个 Event Hub**：每个 hub 用自己的托管标识发送，去重靠
+  `id = request_id`（APIM 的 `context.RequestId`，全局唯一）+ upsert，所以"多账号多 hub"
+  对导入侧是透明的。事件另带 `hub_id` —— 部署时由 `TF_HUB_ID` 注入的 `GitHubAccount.id`，
+  它不参与计费（计费按 `subscription`），存在的意义是能把一个月的成本按上游 GitHub 账号
+  拆开，跟 GitHub 给每个账号出的账单对账。）
 
 **回归测试**：`tests/manual/verify_token_vs_diagnostic.py` —— 一条命令打 openai/anthropic ×
 流式/非流式 4 组，用响应 id 比对上游权威 usage vs LlmLog，输出 PASS/FAIL 报表。
@@ -239,6 +249,12 @@ product 级的 `rate-limit` / `quota` 数值写死、不支持表达式。这正
 - **与美元预算的关系**：key 上旧的 `monthly_budget_usd`/`budget_action` 是**只存不用的死字段**
   （`budget_enforcer.py` 读的是独立的 `Budget` 表，不读 key 字段），随本改造删除；独立的
   `Budget` 表 + `budget_enforcer`（美元事后对账）**保留不动**。
+
+> ⚠️ **这张 named value 后来被第二个功能复用了**：原文审计开关以 `"a": 1` 的形式写在
+> 同一个条目里（`{"sub-x":{"t":50000,"p":"Daily","a":1}}`）。复用是为了让"开/关审计"
+> 不需要改策略、不需要重部署 hub。代价是**同一张表由两个操作写**——改限额的代码必须
+> 原样带过 `"a"`，改审计的代码必须不碰 `t/qt/p`，否则会互相抹掉。两个方向都有单测
+> 钉住，见 [AUDIT.zh.md](AUDIT.zh.md) §5。
 
 策略骨架（示意，`{{tf-key-limits}}` 为 named value）：
 
