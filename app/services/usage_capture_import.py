@@ -338,4 +338,12 @@ class UsageCaptureImporter:
             _write_watermark(high_water)
         if stats["blobs"]:
             logger.info("usage-import: %s", stats)
+        else:
+            # Log the idle pass too, at DEBUG. "No log line" previously meant
+            # both "found nothing" and "never ran", and the two need completely
+            # different fixes — that ambiguity already sent one investigation
+            # down the wrong path. The watermark is included because it is the
+            # single most useful value when usage appears to be missing: if it
+            # is advancing, the gap is upstream of this job.
+            logger.debug("usage-import: no new blobs (watermark=%s)", watermark)
         return stats

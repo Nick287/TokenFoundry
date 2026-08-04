@@ -34,6 +34,28 @@ from app.api import (
 from app.config import get_settings
 
 settings = get_settings()
+
+# Configure the ROOT logger before anything else logs. Nothing in this app did
+# so previously, which meant Python's default WARNING level silently swallowed
+# every `logger.info` the service emits — the usage importer's per-run counters,
+# the re-login trail, the device-flow field names. Debugging then relies on
+# guessing from an empty log, and absence of a log line gets misread as absence
+# of the behaviour.
+#
+# `force=True` matters under uvicorn: it installs its own handlers on import, so
+# a plain basicConfig() would be a no-op and this would silently do nothing.
+#
+# Azure SDK loggers are pinned to WARNING regardless: at INFO they emit a block
+# per HTTP request (every Cosmos query, every Key Vault read), which would drown
+# the lines above in traffic nobody reads.
+logging.basicConfig(
+    level=settings.log_level.upper(),
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    force=True,
+)
+for _noisy in ("azure", "azure.core.pipeline.policies.http_logging_policy", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 

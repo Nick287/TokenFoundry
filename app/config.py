@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     # --- App ---
     environment: str = Field(default="local", description="local | dev | prod")
     api_prefix: str = "/api"
+    # Root log level. INFO by default because this service's own logs are
+    # low-volume and diagnostic — the usage importer's per-run counters, the
+    # re-login audit trail, which fields GitHub returned from a device flow.
+    # Without configuration Python's root logger defaults to WARNING and every
+    # one of those lines is silently discarded, which turns routine debugging
+    # into guesswork against an empty log. DEBUG is deliberately NOT the default:
+    # the Azure SDKs are extremely chatty at that level and would bury us.
+    log_level: str = Field(default="INFO", description="DEBUG | INFO | WARNING | ERROR")
 
     # --- Azure subscription / resource targets ---
     azure_subscription_id: str = ""
@@ -37,6 +45,12 @@ class Settings(BaseSettings):
     # Image tag deploy.sh built (gitmodel:<tag> / tokenfoundry:<tag>). The Portal
     # publishes gitmodel:<hub_image_tag> as HUB_IMAGE_REF so the hub deploy pulls a
     # tag that actually exists in ACR (never a hard-coded :latest).
+    #
+    # NOTE: this is the tag of the deploy that built BOTH images together, so
+    # rebuilding only the hub (az acr build -t gitmodel:<new>) leaves this value
+    # behind, and the next "push SP creds" would republish the older hub image to
+    # new accounts. Either rebuild via deploy.sh, or set TF_HUB_IMAGE_TAG on the
+    # control plane to match the hub image you actually want new accounts to get.
     hub_image_tag: str = "latest"
 
     # --- Metadata DB (PostgreSQL Flexible Server) ---
