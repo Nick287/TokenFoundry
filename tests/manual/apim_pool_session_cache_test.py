@@ -90,8 +90,8 @@ PROVIDERS = {
         "auth": "api-key",
         "suffix": "/llm-google/v1/chat/completions",
         "fmt": "chat",
-        "default": "gemini-2.5-pro",
-        "min_prefix": 2200,  # gemini-2.5-pro implicit cache needs ~2048 tok
+        "default": "gemini-3.1-pro-preview",
+        "min_prefix": 2200,  # gemini-3.1-pro-preview implicit cache needs ~2048 tok
     },
 }
 

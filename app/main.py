@@ -53,7 +53,17 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     force=True,
 )
-for _noisy in ("azure", "azure.core.pipeline.policies.http_logging_policy", "urllib3"):
+for _noisy in (
+    "azure",
+    "azure.core.pipeline.policies.http_logging_policy",
+    "urllib3",
+    # httpx logs a line per request at INFO. Observed on dev-15: provisioning one
+    # account emitted dozens of ARM URLs, burying the four lines that actually
+    # describe what happened. The URLs also carry subscription and resource ids
+    # into the log, which is needless exposure for a line nobody reads.
+    "httpx",
+    "httpcore",
+):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
