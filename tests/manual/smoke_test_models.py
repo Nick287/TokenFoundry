@@ -45,6 +45,15 @@ chunk arrives — which for openai/azure chat proves the gateway injected
 `stream_options.include_usage`. anthropic and the gpt-5.x responses op emit usage
 natively; google chat may omit it (soft warning, not a failure).
 
+Every request also carries an end-user tag in the provider's own field
+(`metadata.user_id` for anthropic, `user` for the OpenAI-compatible ones), so a
+run exercises chargeback layer B end to end: the tag has to survive hub ->
+Event Hub -> Capture -> importer -> Cosmos to show up under
+`/admin/usage/<tenant>/breakdown?by=end_user`. Unit tests can prove the hub
+PARSES those fields; only this proves the value still exists at the far end.
+Without the tags every smoke record lands as `end_user: unknown`, and a change
+that drops the tag mid-pipeline would still report 52/52 green.
+
 Exit code is non-zero if any model fails, so it doubles as a CI/health check.
 """
 
@@ -233,6 +242,42 @@ def is_responses_model(alias: str) -> bool:
     return alias.startswith("gpt-5.")
 
 
+def end_user_for(alias: str, provider: str) -> str:
+    """The end-user tag this call carries, per the provider's own convention.
+
+    Chargeback layer B: one virtual key can serve many people, and the only way
+    to split a bill below the key is for the CLIENT to say who it was calling
+    for. Anthropic spells that `metadata.user_id`, OpenAI/Google spell it `user`
+    — both are official fields, so sending them costs nothing upstream.
+
+    The smoke test sends them because it is the only thing that exercises the
+    whole path: a unit test can prove `_extract_end_user` parses a body, but not
+    that the value survives hub -> Event Hub -> Capture -> importer -> Cosmos.
+    Without this, every smoke record lands as `end_user: unknown`, and any change
+    that silently drops the tag mid-pipeline still shows 52/52 green.
+
+    The value encodes provider and model so a Cosmos row can be traced back to
+    the exact call that produced it.
+    """
+    return f"smoke-{provider}-{alias}@test".lower()
+
+
+def tag_end_user(body: dict, provider: str, alias: str) -> dict:
+    """Attach the end-user tag using the shape this provider defines.
+
+    Mutates and returns `body` — called from route_for, where every request body
+    in this file is constructed, so no caller can forget it.
+    """
+    who = end_user_for(alias, provider)
+    if provider == "anthropic":
+        # Anthropic nests it, and `metadata` may carry other keys in future.
+        body.setdefault("metadata", {})["user_id"] = who
+    else:
+        # OpenAI / Azure OpenAI / Google (OpenAI-compatible): top-level `user`.
+        body["user"] = who
+    return body
+
+
 def route_for(alias: str, provider: str) -> dict:
     """Return {url_suffix, fmt, body, extract} for a model, given the gateway
     path is prefixed separately."""
@@ -240,18 +285,26 @@ def route_for(alias: str, provider: str) -> dict:
         return {
             "suffix": "/v1/messages",
             "fmt": "messages",
-            "body": {
-                "model": alias,
-                "max_tokens": MAX_TOKENS,
-                "messages": [{"role": "user", "content": PROMPT}],
-            },
+            "body": tag_end_user(
+                {
+                    "model": alias,
+                    "max_tokens": MAX_TOKENS,
+                    "messages": [{"role": "user", "content": PROMPT}],
+                },
+                provider,
+                alias,
+            ),
             "extract": extract_messages,
         }
     if provider == "openai" and is_responses_model(alias):
         return {
             "suffix": "/v1/responses",
             "fmt": "responses",
-            "body": {"model": alias, "input": PROMPT, "max_output_tokens": MAX_TOKENS},
+            "body": tag_end_user(
+                {"model": alias, "input": PROMPT, "max_output_tokens": MAX_TOKENS},
+                provider,
+                alias,
+            ),
             "extract": extract_responses,
         }
     # Azure OpenAI: same schemas as openai, but the client-facing paths carry the
@@ -262,28 +315,40 @@ def route_for(alias: str, provider: str) -> dict:
             return {
                 "suffix": "/openai/v1/responses",
                 "fmt": "responses",
-                "body": {"model": alias, "input": PROMPT, "max_output_tokens": MAX_TOKENS},
+                "body": tag_end_user(
+                    {"model": alias, "input": PROMPT, "max_output_tokens": MAX_TOKENS},
+                    provider,
+                    alias,
+                ),
                 "extract": extract_responses,
             }
         return {
             "suffix": "/openai/v1/chat/completions",
             "fmt": "chat",
-            "body": {
-                "model": alias,
-                "max_tokens": MAX_TOKENS,
-                "messages": [{"role": "user", "content": PROMPT}],
-            },
+            "body": tag_end_user(
+                {
+                    "model": alias,
+                    "max_tokens": MAX_TOKENS,
+                    "messages": [{"role": "user", "content": PROMPT}],
+                },
+                provider,
+                alias,
+            ),
             "extract": extract_chat,
         }
     # openai (non-5.x) and google -> Chat Completions
     return {
         "suffix": "/v1/chat/completions",
         "fmt": "chat",
-        "body": {
-            "model": alias,
-            "max_tokens": MAX_TOKENS,
-            "messages": [{"role": "user", "content": PROMPT}],
-        },
+        "body": tag_end_user(
+            {
+                "model": alias,
+                "max_tokens": MAX_TOKENS,
+                "messages": [{"role": "user", "content": PROMPT}],
+            },
+            provider,
+            alias,
+        ),
         "extract": extract_chat,
     }
 
