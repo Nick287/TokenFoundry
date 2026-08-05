@@ -24,7 +24,7 @@ flowchart TB
     subgraph dataplane[Data plane — APIM gateway]
         API[Per-provider APIs<br/>llm-openai / llm-anthropic / llm-google]
         POOL[Backend pools<br/>session affinity + circuit breaker]
-        POL[Policies<br/>token-limit · emit-metric · Cosmos write]
+        POL[Policies<br/>token-limit · emit-metric · inject caller identity]
     end
 
     subgraph hubs[GitModel hubs — one per GitHub account]
@@ -37,72 +37,104 @@ flowchart TB
         APISRV[FastAPI: tenants / keys / routes /<br/>github-accounts / deploy-config]
         PROV[ApimProvisioner]
         TRUN[terraform_runner<br/>方案 A trigger/poll]
+        IMP[usage import job<br/>decode Avro · price · upsert]
     end
 
     subgraph stores[Stores]
         KV[(Key Vault<br/>all secrets)]
         PG[(PostgreSQL<br/>metadata, refs only)]
-        COS[(Cosmos DB<br/>usage records)]
+        EH[[Event Hub<br/>usage]]
+        CAP[(Capture blobs<br/>Avro, flushed every 300s)]
+        COS[(Cosmos DB<br/>usage + cost)]
         INS[App Insights<br/>latency telemetry]
     end
 
     SDK -->|virtual key| API --> POOL --> H1 & H2
-    POL -.usage doc.-> COS
+    H1 & H2 -->|one event per call<br/>upstream copilot_usage verbatim| EH --> CAP
+    CAP -->|list blobs| IMP --> COS
     PORTAL --> APISRV --> PROV -->|ARM REST| API & POOL
     APISRV --> TRUN -->|workflow_dispatch| GHA[GitHub Action<br/>deploy-hub.yml]
     GHA -->|SP + terraform| H1 & H2
     APISRV -->|refs only| PG
     APISRV -->|set/get| KV
-    APISRV -->|read usage| COS
+    APISRV -->|read usage + cost| COS
     APISRV -->|read latency| INS
     TRUN -->|read state blob| TFSTATE[(tfstate storage)]
 ```
 
 > **The one invariant:** the control plane configures the gateway (management
 > plane) and **never sits in the request path**. LLM traffic goes client → APIM
-> → hub, metered by APIM policy. There is **one** Cosmos DB — APIM *writes* a
-> usage record on every call (outbound policy), and FastAPI *reads* that same
-> store for the usage page. The full system diagram, the 方案 A onboarding
-> sequence, and the entity model live in
+> → hub. Usage is reported by the **hub**: one event per call into Event Hub,
+> flushed to Avro blobs by Capture, then batch-imported into Cosmos by the
+> control plane; the portal reads that same store. Prices come from **GitHub
+> Copilot's own `copilot_usage`** (unit prices and total, returned on every
+> response), not from a table we maintain. The full system diagram, the 方案 A
+> onboarding sequence, and the entity model live in
 > **[docs/architecture.md](docs/architecture.md)** ([中文](docs/architecture.zh.md)).
 
 ![Token Foundry architecture](docs/architecture.png)
 
 - **APIM = data plane** — auth, token-limiting, routing, load-balance + circuit
-  breaker, and the **outbound policy that writes one usage record per call
-  directly to Cosmos** (managed-identity auth, `send-one-way-request` so the LLM
-  response is never blocked).
-- **FastAPI = control plane** — provisioning + accounting + enforcement; reads
-  usage back from Cosmos and latency from App Insights; also serves the built
-  SPA (one image, one Container App, no nginx).
+  breaker, and injecting the caller's identity as headers (`x-tf-subscription` /
+  `x-tf-api` / `x-tf-request-id`), which is what chargeback keys off. **It does
+  not write the usage store** — the hub reports usage.
+- **FastAPI = control plane** — provisioning + accounting + enforcement; imports
+  Event Hub Capture blobs into Cosmos, then reads usage and cost back from
+  Cosmos and latency from App Insights; also serves the built SPA (one image,
+  one Container App, no nginx).
 - **React = human layer** — operator console (admin) + customer portal.
 
 ### How usage is captured (the billing path)
 
-The portal's usage numbers were `0` until this path existed — there was no
-writer. It now works as a single direct write:
+Prices come from **upstream itself**: GitHub Copilot returns a `copilot_usage`
+object on every response carrying per-type token counts, unit prices, and the
+total. We no longer keep our own price table — that would mean chasing every
+upstream price change by hand, and two tables inevitably drift apart.
 
-1. A client calls a provider API through APIM with its virtual key.
-2. On a successful response, APIM's **outbound policy**
-   (`apim/policies/outbound-cosmos-write.xml`) POSTs one document to the Cosmos
-   `usage` container — the **raw provider response JSON** plus metadata (request
-   id, subscription/virtual-key id, timestamp, API name, partition key). Tokens
-   are *not* parsed at write time; they live inside `raw_response`.
-3. The control plane parses tokens at **read** time (`app/api/usage.py`),
-   handling each provider's shape (`prompt_tokens`/`completion_tokens`,
-   Anthropic + OpenAI-Responses `input_tokens`/`output_tokens`, cached-token
-   variants), and resolves a record's tenant by matching its virtual-key id
-   against PostgreSQL (`virtual key → project → tenant`).
+```text
+client → APIM → hub → GitHub Copilot
+          │       │
+          │       └→ Event Hub → Capture (Avro) → import job → Cosmos → portal
+          └ injects x-tf-subscription / x-tf-api / x-tf-request-id
+```
 
-This is a deliberate MVP trade-off: `send-one-way-request` is fire-and-forget,
-so a failed write is **not retried** (occasional loss is acceptable for trend
-usage). Billing-grade, replayable accounting is the **planned** Event Hub path
-(Phase 2 — the stream + consumer are not built yet).
+1. A client calls a provider API through APIM with its virtual key. APIM injects
+   the three identity headers with `exists-action="override"` — without that a
+   client could forge `x-tf-subscription` and be billed as somebody else.
+2. The hub forwards upstream and lifts `copilot_usage` out of the response
+   **verbatim** into the event, alongside the identity, model, streaming flag,
+   and the client's optional `metadata.user_id` / `user` (the end-user tag). The
+   hub does **no** cost arithmetic — pricing happens on the import side, so an
+   upstream change in how prices are expressed never requires replaying data.
+   Streaming is covered on equal terms: `copilot_usage` arrives on its own SSE
+   chunk, and the hub scans the whole stream to find it.
+3. The event goes to Event Hub (buffered producer, so it never blocks the
+   response path; a send failure loses the event and never the request), and
+   **Capture** flushes to Avro blobs every 300 seconds.
+4. The control plane's **import job** (`app/services/usage_capture_import.py`)
+   lists blobs past a watermark, decodes the Avro, prices each record
+   (`USD = total_nano_aiu / 1e11`), and **upserts** into Cosmos — the document id
+   is APIM's request id, which makes Capture's at-least-once delivery idempotent
+   for free.
+5. The portal reads Cosmos: grouped by model / API / virtual key / hub / end
+   user, each group carrying its token split and cost.
+
+**Latency:** 300s Capture + 300s import poll, so worst case ~10 minutes and
+typically ~5. Fine for billing; for near-real-time usage use the App Insights
+line instead.
+
+**The cost:** the hub keeps no local usage store — Event Hub is the only outlet.
+If Event Hub or the import job breaks, that window's billing data is
+unrecoverable. (The hub's SQLite lives in `/tmp` and is empty on every restart,
+so it was never a dependable fallback; this makes that explicit rather than new.)
 
 ### The usage page has two data sources, shown separately
 
-- **Usage & cost — from Cosmos** (the billing source): per-call log with model,
-  project/key, prompt/completion/cached tokens.
+- **Usage & cost — from Cosmos** (the billing source): per-call detail grouped by
+  model / API / virtual key / hub / end user, with input, cache_read,
+  cache_write and output token counts plus `cost_usd` / `billed_usd`. **Streaming
+  and non-streaming count equally** — something the App Insights line
+  structurally cannot do (it cannot read tokens out of a streamed body).
 - **Calls & latency — from App Insights** (telemetry, may be sampled): call
   counts, p50/p95, **gateway vs backend latency split** (APIM time vs LLM time),
   failures, and a calls-per-hour trend. Sampled data is fine for
@@ -144,36 +176,38 @@ building one. Concretely:
   carrying that provider's *native* subscription-key header (`x-api-key` for
   Anthropic, `api-key` for OpenAI/Azure/Google), so a client points its existing
   SDK at the gateway URL and changes nothing else.
-- **Usage capture costs zero app latency.** The **outbound policy** writes one
-  usage record per call straight to Cosmos via `send-one-way-request`
-  (fire-and-forget, managed-identity auth) — the LLM response is never blocked
-  on the write, and no app process sits in the response path.
+- **Usage capture costs zero app latency.** The hub emits one event per call to
+  Event Hub through a buffered producer, so the send is a memory write and the
+  LLM response is never blocked on it. Nothing in the response path can fail the
+  request: a broken Event Hub loses events, not calls.
 - **No upstream keys on the data path.** Real provider keys live in Key Vault
   and are attached to the APIM backend; clients only ever hold a per-tenant
   virtual key (an APIM subscription) that can be suspended/revoked
-  independently. The gateway authenticates to Azure resources (Cosmos, AOAI)
-  with its **managed identity** — secretless.
+  independently. The gateway authenticates to Azure resources with its
+  **managed identity** — secretless.
 
 ### Why the rest of the shape
 
 - **Control/data-plane split.** FastAPI only *provisions and reads* (creates
-  APIM products/subscriptions/backends via ARM, parses usage at read time); it
+  APIM products/subscriptions/backends via ARM, imports and serves usage); it
   is never in the per-request hot path, so a control-plane deploy can't take the
   gateway down.
 - **One image, one Container App.** The API and the built React SPA ship in a
   single image (no nginx sidecar), so an app change is one `az acr build` + one
   revision roll — exactly the path used to ship the streaming update.
 - **Two usage sources, kept apart.** Cosmos is the billing source (exact,
-  per-call); App Insights is the telemetry source (sampled — call counts,
-  p50/p95, gateway-vs-backend latency split). Sampled data never feeds billing.
+  per-call, priced by upstream); App Insights is the telemetry source (sampled —
+  call counts, p50/p95, gateway-vs-backend latency split). Sampled data never
+  feeds billing.
 - **Azure-native, secretless integration.** Managed identity + Key Vault
   references everywhere; Cosmos runs with `disableLocalAuth` (AAD-only). Fewer
   secrets to rotate, and Terraform (workspace-isolated per env) reproduces the
   whole stack.
 
-> Trade-off, stated honestly: the MVP usage write is fire-and-forget, so an
-> occasional dropped record is acceptable for *trend* usage. Billing-grade,
-> replayable accounting is the planned Event Hub path (Phase 2).
+> Trade-off, stated honestly: the loss window is whatever sits in the producer's
+> buffer — a graceful shutdown flushes it, so only a hard kill drops events.
+> Closing that entirely would mean giving the hub a persistent volume, which
+> contradicts the stateless-hub design the infra is built on.
 
 ## Layout
 
@@ -393,8 +427,9 @@ list of trade-offs — is documented in
   **Terraform for all PaaS** (workspace-isolated per env), token-limit +
   emit-token-metric policy, **per-key TPM + token-quota limits** (named-value
   driven), **方案 A cloud-automatic GitModel hub onboarding** (device flow →
-  GitHub Action → pool join), **APIM→Cosmos direct usage capture**, and the
-  **dual-source usage page** (Cosmos billing + App Insights latency).
-- **Phase 2 (planned):** Event Hub billing worker for replayable/retry-safe
-  accounting, semantic cache, BYO credential isolation, budget $-enforcement via
-  the stream, chargeback.
+  GitHub Action → pool join), the **hub → Event Hub → Capture → Cosmos billing
+  pipeline** priced from upstream's own `copilot_usage`, **chargeback by
+  subscription / hub / end user**, and the **dual-source usage page** (Cosmos
+  billing + App Insights latency).
+- **Phase 2 (planned):** semantic cache, BYO credential isolation, budget
+  $-enforcement driven off the usage stream.

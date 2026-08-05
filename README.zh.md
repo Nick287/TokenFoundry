@@ -22,7 +22,7 @@ flowchart TB
     subgraph dataplane[数据平面 — APIM 网关]
         API[按供应商的 API<br/>llm-openai / llm-anthropic / llm-google]
         POOL[后端池<br/>会话粘性 + 熔断]
-        POL[策略<br/>token 限流 · 计量 · 写 Cosmos]
+        POL[策略<br/>token 限流 · 计量 · 注入调用方身份]
     end
 
     subgraph hubs[GitModel hub — 每个 GitHub 账号一个]
@@ -35,66 +35,89 @@ flowchart TB
         APISRV[FastAPI: 租户 / 密钥 / 路由 /<br/>github-accounts / deploy-config]
         PROV[ApimProvisioner]
         TRUN[terraform_runner<br/>方案 A 触发/轮询]
+        IMP[用量导入作业<br/>解 Avro · 算成本 · upsert]
     end
 
     subgraph stores[存储]
         KV[(Key Vault<br/>所有密钥)]
         PG[(PostgreSQL<br/>元数据,仅引用)]
-        COS[(Cosmos DB<br/>用量记录)]
+        EH[[Event Hub<br/>usage]]
+        CAP[(Capture Blob<br/>Avro,300s 一刷)]
+        COS[(Cosmos DB<br/>用量 + 成本)]
         INS[App Insights<br/>延迟遥测]
     end
 
     SDK -->|虚拟密钥| API --> POOL --> H1 & H2
-    POL -.用量文档.-> COS
+    H1 & H2 -->|每次调用一个事件<br/>含上游 copilot_usage| EH --> CAP
+    CAP -->|列 blob| IMP --> COS
     PORTAL --> APISRV --> PROV -->|ARM REST| API & POOL
     APISRV --> TRUN -->|workflow_dispatch| GHA[GitHub Action<br/>deploy-hub.yml]
     GHA -->|SP + terraform| H1 & H2
     APISRV -->|仅引用| PG
     APISRV -->|set/get| KV
-    APISRV -->|读用量| COS
+    APISRV -->|读用量/成本| COS
     APISRV -->|读延迟| INS
     TRUN -->|读 state blob| TFSTATE[(tfstate 存储)]
 ```
 
 > **唯一不变量:** 控制平面配置网关(管理平面),**绝不介入请求路径**。LLM 流量走
-> 客户端 → APIM → hub,由 APIM 策略计量。全系统只有**一个** Cosmos DB —— APIM 每次
-> 调用写一条用量记录(出站策略),FastAPI 从同一个库读出来给用量页。完整的系统图、
-> 方案 A 接入时序、实体模型见
+> 客户端 → APIM → hub。用量由 **hub** 上报:每次调用发一个事件到 Event Hub,经
+> Capture 落成 Avro blob,再由控制平面的导入作业批量写进 Cosmos;门户从同一个库
+> 读出来。计费口径来自**上游 GitHub Copilot 自己返回的 `copilot_usage`**(含单价
+> 与总价),不是我们维护的价目表。完整的系统图、方案 A 接入时序、实体模型见
 > **[docs/architecture.md](docs/architecture.md)** ([中文](docs/architecture.zh.md))。
 
 ![Token Foundry 架构](docs/architecture.png)
 
-- **APIM = 数据平面** —— 鉴权、token 限流、路由、负载均衡 + 熔断,以及那条
-  **每次调用直接把一条用量记录写进 Cosmos 的出站策略**(托管身份鉴权、
-  `send-one-way-request`,所以绝不阻塞 LLM 响应)。
-- **FastAPI = 控制平面** —— 只负责开通、计量、强制策略;从 Cosmos 读回用量、
-  从 App Insights 读延迟;同时托管构建好的 SPA(一个镜像、一个 Container App、
-  无需 nginx)。
+- **APIM = 数据平面** —— 鉴权、token 限流、路由、负载均衡 + 熔断,以及把调用方
+  身份注入请求头(`x-tf-subscription` / `x-tf-api` / `x-tf-request-id`),这是分账
+  的依据。**它不写用量存储** —— 用量由 hub 上报。
+- **FastAPI = 控制平面** —— 只负责开通、计量、强制策略;把 Event Hub Capture 的
+  blob 导入 Cosmos,再从 Cosmos 读回用量与成本、从 App Insights 读延迟;同时托管
+  构建好的 SPA(一个镜像、一个 Container App、无需 nginx)。
 - **React = 人机层** —— 运营控制台(管理端)+ 客户门户(客户端)。
 
 ### 用量是怎么采集的(计费链路)
 
-在这条链路存在之前,门户的用量数字一直是 `0` —— 因为根本没有写入方。现在它是
-一次直写就搞定:
+计费口径来自**上游自己**:GitHub Copilot 在每个响应里返回 `copilot_usage`,里面
+有各类 token 的数量、单价和总价。我们不再维护自己的价目表 —— 那意味着每次上游调价
+都要人工跟进,而两张表迟早会漂移。
 
-1. 客户端带着虚拟密钥通过 APIM 调用某个供应商 API。
-2. 响应成功时,APIM 的**出站策略**(`apim/policies/outbound-cosmos-write.xml`)
-   往 Cosmos `usage` 容器 POST 一条文档 —— **供应商的原始响应 JSON** 加上元数据
-   (请求 id、订阅/虚拟密钥 id、时间戳、API 名称、分区键)。写入时**不**解析 token,
-   token 就留在 `raw_response` 里。
-3. 控制平面在**读取**时才解析 token(`app/api/usage.py`),按各家格式处理
-   (`prompt_tokens`/`completion_tokens`、Anthropic 与 OpenAI-Responses 的
-   `input_tokens`/`output_tokens`、各种缓存 token 变体),并通过把记录里的
-   虚拟密钥 id 与 PostgreSQL 比对(`虚拟密钥 → 项目 → 租户`)来确定该记录归属的租户。
+```text
+客户端 → APIM → hub → GitHub Copilot
+           │       │
+           │       └→ Event Hub → Capture(Avro) → 导入作业 → Cosmos → 门户
+           └ 注入 x-tf-subscription / x-tf-api / x-tf-request-id
+```
 
-这是一个有意为之的 MVP 取舍:`send-one-way-request` 是即发即忘,写入失败**不会重试**
-(对趋势性用量来说偶尔丢失可以接受)。计费级、可重放的精确记账走**计划中的** Event Hub
-链路(第二阶段 —— 流和消费者都尚未构建)。
+1. 客户端带着虚拟密钥通过 APIM 调用某个供应商 API。APIM 注入三个身份头,并带
+   `exists-action="override"` —— 否则客户端可以伪造 `x-tf-subscription`,把账算到
+   别人头上。
+2. hub 转发给上游,并从响应里取出 `copilot_usage` **原样**放进事件体,连同身份、
+   模型、是否流式、以及客户端可选的 `metadata.user_id`/`user`(终端用户标签)。
+   hub **不做任何成本换算** —— 算钱是导入侧的事,这样上游改口径时不用重放数据。
+   流式响应也一样采集:`copilot_usage` 在 SSE 流里单独占一个 chunk,hub 扫描全流
+   取出它。
+3. 事件进 Event Hub(SDK buffered 模式,不阻塞响应路径;发送失败只丢事件、绝不影响
+   请求成败),由 **Capture** 每 300 秒刷成 Avro blob 落到存储。
+4. 控制平面的**导入作业**(`app/services/usage_capture_import.py`)按水位线列出新
+   blob、解 Avro、算成本(`USD = total_nano_aiu / 1e11`)、**upsert** 进 Cosmos ——
+   文档 id 就是 APIM 的 request id,所以 Capture 的 at-least-once 重复投递天然幂等。
+5. 门户从 Cosmos 读:按模型/API/虚拟密钥/hub/终端用户分组,每组带 token 明细和成本。
+
+**延迟**:Capture 300s + 导入轮询 300s,所以最坏约 10 分钟、平均约 5 分钟可见。计费
+场景可接受;要看近实时用量走 App Insights 那条线。
+
+**代价**:hub 本地不再存用量,唯一出口是 Event Hub。Event Hub 或导入作业出问题时,
+那段时间的计费数据无处找回(hub 的 SQLite 本就在 `/tmp`、重启即空,留着也不是可靠
+退路,所以这是显性化而非新增的风险)。
 
 ### 用量页有两个数据源,分开展示
 
-- **用量与成本 —— 来自 Cosmos**(计费源):每次调用的明细日志,含模型、项目/密钥、
-  输入/输出/缓存 token。
+- **用量与成本 —— 来自 Cosmos**(计费源):每次调用的明细,按模型 / API / 虚拟密钥 /
+  hub / 终端用户分组,含 input、cache_read、cache_write、output 各类 token 与
+  `cost_usd`/`billed_usd`。**流式与非流式一视同仁** —— 这是 App Insights 那条线做
+  不到的(它读不到流式响应体里的 token)。
 - **调用与延迟 —— 来自 App Insights**(遥测,可能被采样):调用次数、p50/p95、
   **网关 vs 后端延迟拆分**(APIM 耗时 vs LLM 耗时)、失败数,以及每小时调用趋势。
   被采样的数据用于健康度/性能没问题,但**绝不能**用于计费 —— 这正是两个数据源
@@ -126,9 +149,9 @@ flowchart TB
 - **供应商自家的 SDK 直接可用。** 每家供应商有自己独立的 APIM API,沿用该供应商
   *原生*的订阅密钥请求头(Anthropic 用 `x-api-key`,OpenAI/Azure/Google 用
   `api-key`),客户端只需把现有 SDK 指向网关 URL,其它一律不改。
-- **用量采集零应用延迟。** **出站策略**通过 `send-one-way-request`(发完即走、
-  托管身份鉴权)把每次调用的一条用量记录直接写进 Cosmos —— LLM 响应绝不因这次写入
-  而阻塞,也没有任何应用进程挡在响应路径上。
+- **用量采集零应用延迟。** hub 用 buffered producer 把每次调用的一个事件发往
+  Event Hub —— 发送只是一次内存写入,LLM 响应不会因它阻塞。响应路径上没有任何
+  一环能让请求失败:Event Hub 挂了只丢事件,不丢调用。
 - **数据路径上没有上游密钥。** 真实的供应商密钥存在 Key Vault 里、绑定到 APIM
   后端;客户端始终只持有一个按租户隔离的虚拟密钥(一个 APIM 订阅),可以被独立
   挂起/吊销。网关用自己的**托管身份**访问 Azure 资源(Cosmos、AOAI)—— 全程无密钥。
@@ -148,8 +171,9 @@ flowchart TB
   `disableLocalAuth`(仅 AAD)运行。要轮换的密钥更少,而且 Terraform
   (按环境用 workspace 隔离)能复现整套环境。
 
-> 诚实地说明取舍:MVP 的用量写入是发完即走的,所以偶尔丢一条记录、对*趋势*用量
-> 是可接受的。计费级、可重放的精确记账走计划中的 Event Hub 那条路(第二阶段)。
+> 诚实地说明取舍:丢失窗口就是 producer 缓冲区里的那几秒 —— 正常关闭会 flush,
+> 只有实例被强杀才会丢。要彻底消除,得给 hub 挂持久卷,那会推翻 infra 里
+> 「hub 无状态」的既定设计。
 
 ## 目录结构
 
@@ -185,7 +209,7 @@ Key Vault / APIM 残留都不会撞。
 | `postgres` | PostgreSQL Flexible Server 16 | `Standard_B1ms` 突发型。防火墙规则 `AllowAzureServices` 让 Container Apps 能连上 —— 生产环境应收紧为 VNet。 |
 | `cosmos` | Cosmos DB for NoSQL | **Serverless**,`disableLocalAuth: true`(仅 AAD)。库 `tokenfoundry`,容器 `usage`,分区键 `/pk`(`subscriptionId_yyyymm`),**90 天 TTL**。 |
 | `acr` | 容器注册表(Basic) | `adminUserEnabled: false` —— 拉取走 Container App 的托管身份(AcrPull)。同时存 `tokenfoundry:<tag>` **和** `gitmodel:<tag>`(hub 镜像)。 |
-| `apim` | API Management(Developer SKU) | 系统分配身份。配置 App Insights 的 logger + diagnostic,并给自己的身份授予 **Cosmos Data Contributor**,使出站策略能写用量。 |
+| `apim` | API Management(Developer SKU) | 系统分配身份。配置 App Insights 的 logger + diagnostic。**注:身份上还留着 Cosmos Data Contributor,是已废弃的出站直写策略的遗留 —— 现在用不到了,应当移除。** |
 | `apim-backends` | 后端池 + 熔断器 | 经 `azapi` 使用**预览版** API 版本。占位池;真正的每供应商池 + 每账号 hub 后端由 FastAPI provisioner 在**运行时**创建。 |
 | `deployer` | tfstate 存储账户 | **方案 A** 的 GitHub Action 读写每账号 hub state(`hubs/<id>.tfstate`)的远程 state blob 容器;控制平面从中读输出。 |
 | `appsecrets` | Key Vault 密钥 | 拼装 Postgres 连接串,并写入 `tf-database-url` / `tf-jwt-secret` / `tf-admin-password`。 |
@@ -203,7 +227,8 @@ Container App 有意使用**两个**身份:
   (写订阅密钥 + BYO 密钥)、**Cosmos DB Data Contributor**(读用量 —— 数据平面
   RBAC,区别于控制平面),以及 App Insights 上的 **Monitoring Reader**(KQL 遥测)。
 
-APIM 的系统身份另外被单独授予 **Cosmos DB Data Contributor**,用于出站策略的写入链路。
+APIM 的系统身份上还留着 **Cosmos DB Data Contributor** —— 那是已废弃的出站直写策略
+的遗留;用量现在由 hub 经 Event Hub 上报,APIM 不再需要写 Cosmos,这条授权应当移除。
 
 **方案 A 的部署服务主体**(由 `scripts/create-deployer-sp.sh` 创建)是一个独立身份 ——
 订阅级 **Contributor** + **User Access Administrator**,外加 tfstate 存储账户上的
@@ -355,7 +380,7 @@ URL 和一个虚拟密钥;所需变量见脚本头部。
   (按环境用 workspace 隔离)、token 限流 + emit-token-metric 策略、
   **每 key 的 TPM + token-quota 限额**(named-value 驱动)、
   **方案 A 云端自动 GitModel hub 接入**(设备流 → GitHub Action → 入池)、
-  **APIM→Cosmos 直写用量采集**,以及**双数据源用量页**
+  **hub → Event Hub → Capture → Cosmos 的计费管线**(成本取自上游自己的
+  `copilot_usage`)、**按订阅 / hub / 终端用户的成本分摊**,以及**双数据源用量页**
   (Cosmos 计费 + App Insights 延迟)。
-- **第二阶段(计划中):** 用于可重放/可重试记账的 Event Hub 计费 worker、
-  语义缓存、BYO 凭据隔离、经由流的预算 $ 强制、成本分摊(chargeback)。
+- **第二阶段(计划中):** 语义缓存、BYO 凭据隔离、基于用量流的预算 $ 强制。
