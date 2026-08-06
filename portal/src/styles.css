@@ -166,6 +166,19 @@ section > h2 {
   flex-wrap: wrap;
 }
 
+/* Time-window picker sits beside the tenant dropdown. `margin-left: auto`
+   pushes it to the right edge so it reads as a page-level control rather than a
+   second thing to pick before the page works. */
+.window-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+  font-size: 0.88rem;
+  color: #5a4030;
+  white-space: nowrap;
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

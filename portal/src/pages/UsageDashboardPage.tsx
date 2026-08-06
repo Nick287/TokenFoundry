@@ -2,9 +2,26 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { api, type TokenGroup, type UsageBreakdown, type UsageTelemetry } from "../api/client";
+import {
+  api,
+  type TokenGroup,
+  type TrendBucket,
+  type UsageBreakdown,
+  type UsageTelemetry,
+} from "../api/client";
 import { usePrincipal } from "../auth/AuthProvider";
 import { UsageCard } from "./UsageCard";
+
+// Selectable time windows, in hours. Capped at 30d because Cosmos expires usage
+// documents at 90d and App Insights retention is shorter still — offering a year
+// would promise data that no longer exists.
+//
+// The default is 7 days, not 24 hours. A 24h default is the conventional choice
+// and it is wrong here: this dashboard is read for billing, traffic is bursty,
+// and a window that goes empty overnight makes a working page look broken. That
+// is not hypothetical — it is exactly how this control came to be added.
+const WINDOWS = [1, 6, 24, 72, 168, 720] as const;
+const DEFAULT_WINDOW = 168;
 
 // The per-type token columns, declared once and rendered by both the stat row
 // and the table. Adding a token type upstream should be one edit here, not two
@@ -19,6 +36,15 @@ const TOKEN_COLS = [
   { key: "completion_tok", label: "usage.tokCompletion" },
 ] as const satisfies ReadonlyArray<{ key: keyof TokenGroup; label: string }>;
 
+// Axis label for one trend point. Hourly buckets get a time, daily buckets get a
+// date — showing "00" for every point of a 30-day series would be unreadable.
+function fmtBucket(ts: string, bucket: TrendBucket): string {
+  const d = new Date(ts);
+  return bucket === "day"
+    ? d.toLocaleDateString([], { month: "numeric", day: "numeric" })
+    : d.toLocaleTimeString([], { hour: "2-digit", hour12: false });
+}
+
 // Costs run small — a cheap model's hourly spend is fractions of a cent — so a
 // fixed 2dp would render most real rows as "$0.00" and look broken. Show enough
 // significant digits that a non-zero cost never displays as zero.
@@ -28,19 +54,23 @@ function fmtUsd(v: number): string {
   return `$${v.toFixed(4)}`;
 }
 
-// Calls-per-hour mini time series. CSS-only (no chart lib). The backend zero-
-// fills every hour in the window, so bars are evenly spaced across a continuous
-// 24h timeline; non-zero bars carry their count above, zero hours show a faint
-// baseline stub, and the x-axis labels every 4th hour for a time reference.
-function TrendBars({ data }: { data: UsageTelemetry["by_hour"] }) {
-  // Trim leading empty hours so a single late spike isn't crushed against 20
-  // blank bars; keep from the first hour with traffic onward (min 6 cols).
+// Calls-per-bucket mini time series. CSS-only (no chart lib). The backend zero-
+// fills every bucket in the window, so bars are evenly spaced across a
+// continuous timeline; non-zero bars carry their count above, zero buckets show
+// a faint baseline stub, and the x-axis labels every 4th bucket for reference.
+function TrendBars({
+  data,
+  bucket,
+}: {
+  data: UsageTelemetry["by_hour"];
+  bucket: TrendBucket;
+}) {
+  // Trim leading empty buckets so a single late spike isn't crushed against 20
+  // blank bars; keep from the first bucket with traffic onward (min 6 cols).
   const first = data.findIndex((d) => d.calls > 0);
   const start = first < 0 ? Math.max(0, data.length - 6) : Math.max(0, Math.min(first - 1, data.length - 6));
   const shown = data.slice(start);
   const max = Math.max(1, ...shown.map((d) => d.calls));
-  const fmtHour = (ts: string) =>
-    new Date(ts).toLocaleTimeString([], { hour: "2-digit", hour12: false });
   return (
     <div className="trend card">
       <div className="trend-plot">
@@ -65,7 +95,7 @@ function TrendBars({ data }: { data: UsageTelemetry["by_hour"] }) {
       <div className="trend-axis">
         {shown.map((d, i) => (
           <span className="trend-tick" key={d.ts}>
-            {i % 4 === 0 ? fmtHour(d.ts) : ""}
+            {i % 4 === 0 ? fmtBucket(d.ts, bucket) : ""}
           </span>
         ))}
       </div>
@@ -79,8 +109,10 @@ function TrendBars({ data }: { data: UsageTelemetry["by_hour"] }) {
 // same customMetrics buckets so they're aligned. Trims leading empty buckets.
 function DualLineChart({
   data,
+  bucket,
 }: {
   data: Array<{ ts: string; tokens: number; calls: number }>;
+  bucket: TrendBucket;
 }) {
   const { t } = useTranslation();
   const firstTok = data.findIndex((d) => d.tokens > 0 || d.calls > 0);
@@ -100,8 +132,6 @@ function DualLineChart({
   const yCall = (v: number) => H - (v / maxCall) * (H - 4) - 2;
   const line = (accessor: (d: (typeof shown)[number]) => number) =>
     shown.map((d, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${accessor(d).toFixed(1)}`).join(" ");
-  const fmtHour = (ts: string) =>
-    new Date(ts).toLocaleTimeString([], { hour: "2-digit", hour12: false });
   const fmtK = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : `${v}`);
   return (
     <div className="dual-chart card">
@@ -123,7 +153,7 @@ function DualLineChart({
       <div className="dual-axis">
         {shown.map((d, i) => (
           <span className="dual-tick" key={d.ts}>
-            {i % 4 === 0 ? fmtHour(d.ts) : ""}
+            {i % 4 === 0 ? fmtBucket(d.ts, bucket) : ""}
           </span>
         ))}
       </div>
@@ -146,6 +176,11 @@ export function UsageDashboardPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(15);
   const [groupBy, setGroupBy] = useState<UsageBreakdown["by"]>("model");
+  // One window governs every block on the page. Splitting it was the previous
+  // behaviour and it produced a contradiction: an unfiltered call log sat above
+  // a 24h-windowed breakdown, so a page could show 96 calls and "no usage in
+  // this window" at the same time.
+  const [hours, setHours] = useState<number>(DEFAULT_WINDOW);
   const PAGE_SIZE_OPTIONS = [10, 15, 20];
 
   const tenants = useQuery({
@@ -154,26 +189,27 @@ export function UsageDashboardPage() {
   });
 
   const usage = useQuery({
-    queryKey: ["admin-usage", tenantId],
-    queryFn: () => api.tenantUsage(principal.token, tenantId),
+    queryKey: ["admin-usage", tenantId, hours],
+    queryFn: () => api.tenantUsage(principal.token, tenantId, hours),
     enabled: tenantId.length > 0,
   });
 
   const records = useQuery({
-    queryKey: ["admin-usage-records", tenantId, page, pageSize],
-    queryFn: () => api.tenantUsageRecords(principal.token, tenantId, page, pageSize),
+    queryKey: ["admin-usage-records", tenantId, page, pageSize, hours],
+    queryFn: () =>
+      api.tenantUsageRecords(principal.token, tenantId, page, pageSize, hours),
     enabled: tenantId.length > 0,
     placeholderData: keepPreviousData,
   });
 
   const telemetry = useQuery({
-    queryKey: ["admin-usage-telemetry"],
-    queryFn: () => api.usageTelemetry(principal.token),
+    queryKey: ["admin-usage-telemetry", hours],
+    queryFn: () => api.usageTelemetry(principal.token, hours),
   });
 
   const breakdown = useQuery({
-    queryKey: ["admin-usage-breakdown", tenantId, groupBy],
-    queryFn: () => api.usageBreakdown(principal.token, tenantId, 24, groupBy),
+    queryKey: ["admin-usage-breakdown", tenantId, groupBy, hours],
+    queryFn: () => api.usageBreakdown(principal.token, tenantId, hours, groupBy),
     enabled: tenantId.length > 0,
     placeholderData: keepPreviousData,
   });
@@ -191,6 +227,24 @@ export function UsageDashboardPage() {
             </option>
           ))}
         </select>
+        <label className="window-picker">
+          {t("usage.window")}
+          <select
+            value={hours}
+            onChange={(e) => {
+              setHours(Number(e.target.value));
+              // A narrower window shrinks the result set, so page 4 of the old
+              // window is usually past the end of the new one.
+              setPage(1);
+            }}
+          >
+            {WINDOWS.map((h) => (
+              <option key={h} value={h}>
+                {t(`usage.window_${h}`)}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
       {!tenantId && <p className="hint">{t("usage.selectPrompt")}</p>}
 
@@ -289,7 +343,9 @@ export function UsageDashboardPage() {
             })()}
             </>
           ) : (
-            <p className="hint">{t("usage.noRecords")}</p>
+            <p className="hint">
+              {t("usage.noRecords")} {t("usage.windowHint")}
+            </p>
           )}
 
           {/* --- Token breakdown (App Insights metering): group by model /
@@ -385,12 +441,17 @@ export function UsageDashboardPage() {
               {breakdown.data.trend.some((d) => d.tokens > 0 || d.calls > 0) && (
                 <>
                   <h4>{t("usage.tokTrendSection")}</h4>
-                  <DualLineChart data={breakdown.data.trend} />
+                  <DualLineChart
+                    data={breakdown.data.trend}
+                    bucket={breakdown.data.bucket}
+                  />
                 </>
               )}
             </>
           ) : (
-            <p className="hint">{t("usage.noBreakdown")}</p>
+            <p className="hint">
+              {t("usage.noBreakdown")} {t("usage.windowHint")}
+            </p>
           )}
         </>
       )}
@@ -448,12 +509,14 @@ export function UsageDashboardPage() {
           {telemetry.data.by_hour.length > 0 && (
             <>
               <h4>{t("usage.trendSection")}</h4>
-              <TrendBars data={telemetry.data.by_hour} />
+              <TrendBars data={telemetry.data.by_hour} bucket={telemetry.data.bucket} />
             </>
           )}
         </>
       ) : (
-        <p className="hint">{t("usage.noTelemetry")}</p>
+        <p className="hint">
+          {t("usage.noTelemetry")} {t("usage.windowHint")}
+        </p>
       )}
     </section>
   );

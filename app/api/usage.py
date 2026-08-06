@@ -31,6 +31,25 @@ from app.services.usage_ingest import AppInsightsUsage, UsageStore
 
 router = APIRouter()
 
+# Cosmos keeps usage documents for 90 days (container TTL), so a window wider
+# than that can only ever return the same rows while scanning more partitions.
+# Clamped rather than rejected: a stale bookmark asking for 365d should show 90
+# days of data, not a 422.
+_MAX_WINDOW_HOURS = 24 * 90
+
+
+def _window_since(hours: int | None) -> str | None:
+    """Start of the requested window as an ISO-8601 UTC string, or None.
+
+    None means "all time" and is a deliberate option, not a missing value: the
+    per-call log is often read as a ledger ("show me everything this key ever
+    did") rather than as a dashboard slice.
+    """
+    if hours is None:
+        return None
+    hours = min(max(hours, 1), _MAX_WINDOW_HOURS)
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+
 
 def _tenant_key_ids(db: Session, tenant_id: str) -> list[str]:
     """Virtual-key ids belonging to a tenant (via its projects).
@@ -131,10 +150,13 @@ def _usage_breakdown_payload(
     `by` selects the grouping dimension: "model" (default), "api"/"endpoint",
     "subscription" (virtual key), "backend"/"hub", or "end_user".
 
-    Returns {"by", "hours", "groups", "trend", "totals"}. Each group carries
-    per-type token counts, `calls`, and — new with the Cosmos source —
+    Returns {"by", "hours", "bucket", "groups", "trend", "totals"}. Each group
+    carries per-type token counts, `calls`, and — new with the Cosmos source —
     `cost_usd`/`billed_usd`, so "which model spent the money" is answerable
     without leaving this payload.
+
+    `bucket` reports the trend granularity the window resolved to ("hour" or
+    "day") so the chart can label points correctly instead of inferring it.
 
     `totals` is queried independently rather than summed from `groups`: the group
     list can be truncated on a high-cardinality dimension, and the headline
@@ -145,10 +167,12 @@ def _usage_breakdown_payload(
     group_by = {"endpoint": "api", "hub": "backend"}.get(by, by)
     if group_by not in UsageStore._AGG_DIMS:
         group_by = "model"
-    since = (datetime.now(UTC) - timedelta(hours=max(hours, 1))).isoformat()
+    hours = min(max(hours, 1), _MAX_WINDOW_HOURS)
+    since = _window_since(hours)
     return {
         "by": group_by,
         "hours": hours,
+        "bucket": UsageStore.trend_bucket(hours),
         "groups": store.cost_breakdown(key_ids, since_iso=since, group_by=group_by),
         "trend": store.cost_trend(key_ids, since_iso=since, hours=hours),
         "totals": store.cost_totals(key_ids, since_iso=since),
@@ -174,24 +198,29 @@ def _key_project_map(db: Session, tenant_id: str) -> dict[str, dict]:
 
 @router.get("/usage", response_model=UsageSummary)
 def my_usage(
+    hours: int | None = None,
     tenant_id: str = Depends(tenant_scope),
     db: Session = Depends(get_db),
 ) -> UsageSummary:
-    """Customer self-service: usage for the CALLER's tenant only."""
+    """Customer self-service: usage for the CALLER's tenant only.
+
+    `hours` omitted = lifetime total, which is what this endpoint has always
+    returned and what the customer page shows."""
     key_ids = _tenant_key_ids(db, tenant_id)
-    rows = UsageStore().query_by_subscriptions(key_ids)
+    rows = UsageStore().query_by_subscriptions(key_ids, since_iso=_window_since(hours))
     return _summarize(tenant_id, rows)
 
 
 @router.get("/admin/usage/{tenant_id}", response_model=UsageSummary)
 def tenant_usage(
     tenant_id: str,
+    hours: int | None = None,
     _: Principal = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> UsageSummary:
-    """Platform admin: usage for an explicitly named tenant."""
+    """Platform admin: usage for an explicitly named tenant, optionally windowed."""
     key_ids = _tenant_key_ids(db, tenant_id)
-    rows = UsageStore().query_by_subscriptions(key_ids)
+    rows = UsageStore().query_by_subscriptions(key_ids, since_iso=_window_since(hours))
     return _summarize(tenant_id, rows)
 
 
@@ -200,6 +229,7 @@ def tenant_usage_records(
     tenant_id: str,
     page: int = 1,
     page_size: int = 25,
+    hours: int | None = None,
     _: Principal = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -207,21 +237,25 @@ def tenant_usage_records(
     server-side paginated.
 
     Resolves the tenant's virtual keys, then returns the matching page of call
-    records plus the total count so the portal can render page controls.
+    records plus the total count so the portal can render page controls. The
+    count applies the same window as the page query — otherwise the pager offers
+    pages that come back empty.
     """
     page = max(1, page)
     page_size = max(1, min(page_size, 200))
     key_ids = _tenant_key_ids(db, tenant_id)
+    since = _window_since(hours)
     store = UsageStore()
     rows = store.query_by_subscriptions(
-        key_ids, limit=page_size, skip=(page - 1) * page_size
+        key_ids, limit=page_size, skip=(page - 1) * page_size, since_iso=since
     )
     key_projects = _key_project_map(db, tenant_id)
     return {
         "items": [_to_record_view(r, key_projects) for r in rows],
-        "total": store.count_by_subscriptions(key_ids),
+        "total": store.count_by_subscriptions(key_ids, since_iso=since),
         "page": page,
         "page_size": page_size,
+        "hours": hours,
     }
 
 
@@ -233,7 +267,9 @@ def usage_telemetry(
     """Platform admin: call counts + latency from App Insights (separate data
     source from Cosmos usage). Best-effort — returns an empty summary if App
     Insights isn't configured."""
-    return AppInsightsUsage().request_telemetry(hours=hours)
+    return AppInsightsUsage().request_telemetry(
+        hours=min(max(hours, 1), _MAX_WINDOW_HOURS)
+    )
 
 
 @router.get("/usage/breakdown")

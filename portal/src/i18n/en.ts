@@ -265,7 +265,7 @@ export const en = {
     colGateway: "Gateway p50",
     colBackend: "Backend p50",
     colFailures: "Failures",
-    trendSection: "Calls per hour",
+    trendSection: "Calls over time",
     noTelemetry: "No telemetry (App Insights not configured or no calls yet).",
     breakdownSection: "Tokens & cost — billing source",
     breakdownHint:
@@ -291,6 +291,17 @@ export const en = {
     tokTrendSeries: "Tokens",
     callTrendSeries: "Calls",
     noBreakdown: "No usage recorded for this tenant in this window yet.",
+    // Time-window picker. One window governs the whole page — the call log used
+    // to be unfiltered while the breakdown below it was pinned to 24h, so a page
+    // could show 96 records and "nothing in this window" at the same time.
+    window: "Window",
+    window_1: "Last 1 hour",
+    window_6: "Last 6 hours",
+    window_24: "Last 24 hours",
+    window_72: "Last 3 days",
+    window_168: "Last 7 days",
+    window_720: "Last 30 days",
+    windowHint: "Try widening the window above.",
   },
   users: {
     title: "Users",

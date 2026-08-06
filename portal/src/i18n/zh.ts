@@ -262,7 +262,7 @@ export const zh: TranslationShape = {
     colGateway: "网关耗时 p50",
     colBackend: "后端耗时 p50",
     colFailures: "失败数",
-    trendSection: "每小时调用数",
+    trendSection: "调用数趋势",
     noTelemetry: "暂无遥测（App Insights 未配置或还没有调用）。",
     breakdownSection: "Token 与成本 —— 计费口径",
     breakdownHint:
@@ -288,6 +288,16 @@ export const zh: TranslationShape = {
     tokTrendSeries: "Token",
     callTrendSeries: "调用数",
     noBreakdown: "该租户在此时间窗内暂无用量记录。",
+    // 时间窗选择器。整页共用一个窗口 —— 之前调用日志不限时间、下方分组固定
+    // 24 小时，同一页会出现「有 96 条记录」和「此窗口无数据」并存的矛盾。
+    window: "时间窗",
+    window_1: "最近 1 小时",
+    window_6: "最近 6 小时",
+    window_24: "最近 24 小时",
+    window_72: "最近 3 天",
+    window_168: "最近 7 天",
+    window_720: "最近 30 天",
+    windowHint: "试试把上方的时间窗调大。",
   },
   users: {
     title: "账号",

@@ -194,7 +194,11 @@ class UsageStore:
         )
 
     def query_by_subscriptions(
-        self, subscription_ids: list[str], limit: int = 1000, skip: int = 0
+        self,
+        subscription_ids: list[str],
+        limit: int = 1000,
+        skip: int = 0,
+        since_iso: str | None = None,
     ) -> list[dict]:
         """Usage records whose `subscription` (virtual key id) is in the given
         set. This is how a tenant's usage is resolved: the caller maps tenant ->
@@ -203,19 +207,21 @@ class UsageStore:
         plane yet), so the virtual key is the reliable tenant linkage.
 
         `skip`/`limit` give server-side pagination (OFFSET/LIMIT) for the portal
-        call log; pair with count_by_subscriptions for total pages."""
+        call log; pair with count_by_subscriptions for total pages.
+
+        `since_iso=None` means all time. It exists because the call log and the
+        breakdown below it used to disagree: this query had no time filter while
+        the breakdown hard-coded 24h, so a page could show a full call log above
+        "no usage in this window" — which reads as a broken dashboard, not as two
+        different questions."""
         if not self._endpoint or not subscription_ids:
             return []
-        # Cosmos supports ARRAY_CONTAINS(@ids, c.subscription) for an IN-style
-        # filter against a parameterized list.
+        where, params = self._agg_where(subscription_ids, since_iso)
         return list(
             self._container.query_items(
-                query=(
-                    "SELECT * FROM c WHERE ARRAY_CONTAINS(@ids, c.subscription) "
-                    "ORDER BY c.ts DESC OFFSET @skip LIMIT @n"
-                ),
+                query=f"SELECT * FROM c{where} ORDER BY c.ts DESC OFFSET @skip LIMIT @n",
                 parameters=[
-                    {"name": "@ids", "value": subscription_ids},
+                    *params,
                     {"name": "@skip", "value": skip},
                     {"name": "@n", "value": limit},
                 ],
@@ -223,19 +229,22 @@ class UsageStore:
             )
         )
 
-    def count_by_subscriptions(self, subscription_ids: list[str]) -> int:
+    def count_by_subscriptions(
+        self, subscription_ids: list[str], since_iso: str | None = None
+    ) -> int:
         """Total number of usage records for the given virtual keys — used to
-        compute page count for the paginated call log. Returns 0 when Cosmos is
-        not configured or the key set is empty."""
+        compute page count for the paginated call log. Must apply the SAME window
+        as query_by_subscriptions or the pager offers pages that come back empty.
+        Returns 0 when Cosmos is not configured or the key set is empty."""
         if not self._endpoint or not subscription_ids:
             return 0
+        where, _params = self._agg_where(subscription_ids, since_iso)
+        # A bare `SELECT VALUE COUNT(1)` is the only aggregate shape Cosmos
+        # accepts cross-partition (see the note above _MAX_ROWS).
         rows = list(
             self._container.query_items(
-                query=(
-                    "SELECT VALUE COUNT(1) FROM c "
-                    "WHERE ARRAY_CONTAINS(@ids, c.subscription)"
-                ),
-                parameters=[{"name": "@ids", "value": subscription_ids}],
+                query=f"SELECT VALUE COUNT(1) FROM c{where}",
+                parameters=_params,
                 enable_cross_partition_query=True,
             )
         )
@@ -440,22 +449,42 @@ class UsageStore:
             self._accumulate(totals, r)
         return totals
 
+    # Hourly buckets stop being readable long before the window stops being
+    # useful: 30 days is 720 points, which renders as noise and asks the x-axis
+    # for 720 slots. The threshold sits just past 48h so the common "yesterday
+    # and today" window keeps hour resolution.
+    _HOURLY_MAX_HOURS = 48
+
+    @classmethod
+    def trend_bucket(cls, hours: int) -> str:
+        """Granularity `cost_trend` will use for a window of `hours`: hour|day.
+
+        Exposed so the API can tell the portal which one it got — the chart
+        labels a daily point as a date and an hourly one as a time, and guessing
+        from the spacing would break on a window with a single bucket.
+        """
+        return "hour" if hours <= cls._HOURLY_MAX_HOURS else "day"
+
     def cost_trend(
         self,
         subscription_ids: list[str] | None = None,
         since_iso: str | None = None,
         hours: int = 24,
     ) -> list[dict]:
-        """Hourly tokens/calls/cost series, zero-filled, oldest first.
+        """Tokens/calls/cost series over the window, zero-filled, oldest first.
 
-        Buckets on the first 13 characters of the stored timestamp
-        ("2026-08-04T10"), which IS the UTC hour because every ts is normalized
-        to UTC at import. The zero-fill matters: without it a quiet hour vanishes
-        and the chart draws a straight line across the gap, implying traffic that
-        never happened.
+        Buckets on a prefix of the stored timestamp — 13 chars for an hour
+        ("2026-08-04T10"), 10 for a day ("2026-08-04") — which IS the UTC bucket
+        because every ts is normalized to UTC at import. The zero-fill matters:
+        without it a quiet bucket vanishes and the chart draws a straight line
+        across the gap, implying traffic that never happened.
         """
         if not self._endpoint or subscription_ids == []:
             return []
+
+        bucket = self.trend_bucket(hours)
+        hourly = bucket == "hour"
+        width, fmt = (13, "%Y-%m-%dT%H") if hourly else (10, "%Y-%m-%d")
 
         rows = self._fetch_agg_rows(subscription_ids, since_iso, extra_fields=("ts",))
         by_bucket: dict[str, dict] = {}
@@ -463,19 +492,26 @@ class UsageStore:
             ts = r.get("ts")
             if not isinstance(ts, str):
                 continue
-            bucket = by_bucket.setdefault(ts[:13], self._blank(self._TOKEN_FIELDS))
-            self._accumulate(bucket, r)
+            slot = by_bucket.setdefault(ts[:width], self._blank(self._TOKEN_FIELDS))
+            self._accumulate(slot, r)
 
         now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        if not hourly:
+            now = now.replace(hour=0)
+        step = timedelta(hours=1) if hourly else timedelta(days=1)
+        # Round up: a 72h window is 3 days, a 70h window still spans 3 day
+        # buckets. Under-counting would clip the oldest bucket off the chart.
+        count = max(hours, 1) if hourly else max(-(-max(hours, 1) // 24), 1)
+
         out: list[dict] = []
-        for i in range(max(hours, 1) - 1, -1, -1):
-            hour = now - timedelta(hours=i)
-            got = by_bucket.get(hour.strftime("%Y-%m-%dT%H"))
+        for i in range(count - 1, -1, -1):
+            slot_start = now - step * i
+            got = by_bucket.get(slot_start.strftime(fmt))
             out.append(
                 {
-                    "ts": hour.isoformat(),
+                    "ts": slot_start.isoformat(),
                     # Every token type, cache_write included — omitting it would
-                    # make cache-heavy hours read as a dip in the chart.
+                    # make cache-heavy buckets read as a dip in the chart.
                     "tokens": (
                         sum(got[f] for f in self._TOKEN_FIELDS) if got else 0
                     ),
@@ -505,13 +541,20 @@ class AppInsightsUsage:
           * base  — calls / p50 / p95 / failures, by API (the "which model most"
                     answer: rows are ordered by call count)
           * split — gateway vs backend duration, by API (requests↔dependencies)
-          * trend — calls per hour (time trend)
+          * trend — calls per bucket over the window (hourly, or daily once the
+                    window is long enough that hourly points stop being legible)
         Each query degrades independently: if the fragile dependency join yields
         nothing, the base latency table still renders and the split columns show
         as null. App Insights telemetry is best-effort, separate from Cosmos
         usage which is the billing source.
         """
-        empty: dict = {"by_api": [], "total_calls": 0, "by_hour": []}
+        empty: dict = {
+            "by_api": [],
+            "total_calls": 0,
+            "by_hour": [],
+            "bucket": UsageStore.trend_bucket(hours),
+            "hours": hours,
+        }
         if not self._client or not self._resource_id:
             return empty
 
@@ -553,15 +596,24 @@ class AppInsightsUsage:
             row["gateway_p50"] = split.get("gateway_p50") if split else None
             row["backend_p50"] = split.get("backend_p50") if split else None
 
-        # 3) Trend: calls per hour, oldest→newest. make-series zero-fills the
-        #    gaps so the chart shows a continuous 24h timeline (a plain summarize
-        #    by bin() only emits hours that had calls — producing a few isolated
+        # 3) Trend: calls per bucket, oldest→newest. make-series zero-fills the
+        #    gaps so the chart shows a continuous timeline (a plain summarize
+        #    by bin() only emits buckets that had calls — producing a few isolated
         #    spikes with empty space between, not a real time series).
-        trend_kql = """
+        #
+        #    The range and step track `hours` rather than being fixed at 24h/1h:
+        #    they used to be hard-coded, so a 7-day window rendered a 7-day table
+        #    above a 24-hour chart with no indication the two disagreed. Step
+        #    switches to daily on the same threshold Cosmos uses, so both charts
+        #    on the page share a granularity.
+        #    `hours` is an int clamped by the caller, so interpolating it here is
+        #    not a KQL-injection surface; int() makes that guarantee local.
+        step = "1h" if hours <= UsageStore._HOURLY_MAX_HOURS else "1d"
+        trend_kql = f"""
         requests
         | where name startswith 'POST /llm-'
         | make-series calls = count() default = 0
-            on timestamp from ago(24h) to now() step 1h
+            on timestamp from ago({int(hours)}h) to now() step {step}
         | mv-expand timestamp to typeof(datetime), calls to typeof(long)
         | order by timestamp asc
         """
@@ -571,7 +623,13 @@ class AppInsightsUsage:
         ]
 
         total = sum(int(r.get("calls", 0) or 0) for r in by_api)
-        return {"by_api": by_api, "total_calls": total, "by_hour": by_hour}
+        return {
+            "by_api": by_api,
+            "total_calls": total,
+            "by_hour": by_hour,
+            "bucket": UsageStore.trend_bucket(hours),
+            "hours": hours,
+        }
 
     def _run_kql(self, kql: str, hours: int) -> list[dict]:
         """Run one KQL query over the App Insights resource; [] on any failure.

@@ -157,6 +157,8 @@ export interface UsageRecordPage {
 }
 
 // App Insights-sourced call counts + latency (separate data source).
+export type TrendBucket = "hour" | "day";
+
 export interface UsageTelemetry {
   total_calls: number;
   by_api: Array<{
@@ -169,6 +171,11 @@ export interface UsageTelemetry {
     backend_p50: number | null;
   }>;
   by_hour: Array<{ ts: string; calls: number }>;
+  // Granularity `by_hour` actually came back at. Long windows switch to daily
+  // points, and a date label on an hourly point (or vice versa) is misleading —
+  // so the server states it rather than the chart guessing from the spacing.
+  bucket: TrendBucket;
+  hours: number;
 }
 
 // Per-model (or per-endpoint / per-subscription / per-hub / per-end-user) token
@@ -207,6 +214,7 @@ export interface UsageTotals {
 export interface UsageBreakdown {
   by: "model" | "api" | "subscription" | "backend" | "end_user";
   hours: number;
+  bucket: TrendBucket;
   groups: TokenGroup[];
   trend: Array<{ ts: string; tokens: number; calls: number; cost_usd: number }>;
   // Queried independently of `groups`, not summed from it: the group list can be
@@ -339,20 +347,25 @@ export const api = {
   deleteKey: (token: string, id: string) =>
     requestNoContent(`/keys/${id}`, token, { method: "DELETE" }),
   myUsage: (token: string) => request<UsageSummary>("/usage", token),
-  tenantUsage: (token: string, tenantId: string) =>
-    request<UsageSummary>(`/admin/usage/${tenantId}`, token),
+  tenantUsage: (token: string, tenantId: string, hours?: number) =>
+    request<UsageSummary>(
+      `/admin/usage/${tenantId}${hours ? `?hours=${hours}` : ""}`,
+      token,
+    ),
   tenantUsageRecords: (
     token: string,
     tenantId: string,
     page = 1,
     pageSize = 25,
+    hours?: number,
   ) =>
     request<UsageRecordPage>(
-      `/admin/usage/${tenantId}/records?page=${page}&page_size=${pageSize}`,
+      `/admin/usage/${tenantId}/records?page=${page}&page_size=${pageSize}` +
+        (hours ? `&hours=${hours}` : ""),
       token,
     ),
-  usageTelemetry: (token: string) =>
-    request<UsageTelemetry>("/admin/usage-telemetry", token),
+  usageTelemetry: (token: string, hours = 24) =>
+    request<UsageTelemetry>(`/admin/usage-telemetry?hours=${hours}`, token),
   usageBreakdown: (
     token: string,
     tenantId: string,

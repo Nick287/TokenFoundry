@@ -332,3 +332,95 @@ def test_trend_ignores_rows_with_unusable_timestamps() -> None:
     store, _ = _store([{"ts": None, "prompt_tok": 5, "cost_usd": 1.0}])
     out = store.cost_trend(["vk_a"], hours=3)
     assert all(p["calls"] == 0 for p in out)
+
+
+# --------------------------------------------------------------------------- #
+# Time window                                                                  #
+# --------------------------------------------------------------------------- #
+# The window is the reason this section exists. The call log had NO time filter
+# while the breakdown under it was pinned to 24h, so on a tenant whose last
+# traffic was 39 hours old the page rendered a full 96-row call log directly
+# above "no usage recorded in this window". Both were telling the truth; the
+# page was not. These tests pin the two halves to the same filter.
+def test_call_log_applies_the_window_when_given() -> None:
+    store, fake = _store([])
+    store.query_by_subscriptions(["vk_a"], since_iso="2026-08-04T00:00:00+00:00")
+    assert "c.ts >= @since" in fake.last_query
+    assert fake.last_params["@since"] == "2026-08-04T00:00:00+00:00"
+
+
+def test_call_log_without_a_window_is_unfiltered_by_time() -> None:
+    """`since_iso=None` means all time, and that is a real option — the log is
+    also read as a ledger, not only as a dashboard slice."""
+    store, fake = _store([])
+    store.query_by_subscriptions(["vk_a"])
+    # Check the WHERE clause specifically: `c.ts` also appears in the ORDER BY,
+    # which is present either way.
+    where = fake.last_query.split("WHERE", 1)[1].split("ORDER BY")[0]
+    assert "c.ts" not in where
+    assert "@since" not in fake.last_params
+
+
+def test_count_applies_the_same_window_as_the_page_query() -> None:
+    """If the count ignores the window it reports more pages than exist, and the
+    pager hands the user pages that come back empty."""
+    since = "2026-08-04T00:00:00+00:00"
+    store, fake = _store([7])
+    store.query_by_subscriptions(["vk_a"], since_iso=since)
+    page_query = fake.last_query
+    store.count_by_subscriptions(["vk_a"], since_iso=since)
+    count_query = fake.last_query
+
+    def where_of(q: str) -> str:
+        return q.split("WHERE", 1)[1].split("ORDER BY")[0].strip()
+
+    assert where_of(page_query) == where_of(count_query)
+    assert fake.last_params["@since"] == since
+
+
+def test_count_still_uses_the_only_cross_partition_aggregate_cosmos_accepts() -> None:
+    """Adding the window must not turn this into `SELECT COUNT(1) AS n`, which
+    Cosmos rejects cross-partition (see the module docstring)."""
+    store, fake = _store([3])
+    store.count_by_subscriptions(["vk_a"], since_iso="2026-08-04T00:00:00+00:00")
+    assert fake.last_query.startswith("SELECT VALUE COUNT(1) FROM c WHERE ")
+
+
+# --------------------------------------------------------------------------- #
+# Trend granularity                                                            #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("hours", "expected"),
+    [(1, "hour"), (24, "hour"), (48, "hour"), (49, "day"), (168, "day"), (720, "day")],
+)
+def test_trend_bucket_switches_to_days_past_two_days(hours: int, expected: str) -> None:
+    assert UsageStore.trend_bucket(hours) == expected
+
+
+def test_long_window_returns_daily_buckets_not_hundreds_of_hourly_ones() -> None:
+    """30 days of hourly points is 720 marks on a chart that has room for ~30."""
+    store, _ = _store([])
+    out = store.cost_trend(["vk_a"], hours=720)
+    assert len(out) == 30
+
+
+def test_daily_bucket_count_rounds_up_so_the_oldest_day_is_not_clipped() -> None:
+    """A 70h window still spans 3 calendar days; flooring would drop one."""
+    store, _ = _store([])
+    assert len(store.cost_trend(["vk_a"], hours=70)) == 3
+
+
+def test_daily_buckets_fold_rows_from_different_hours_of_the_same_day() -> None:
+    from datetime import UTC, datetime
+
+    day = datetime.now(UTC).strftime("%Y-%m-%d")
+    store, _ = _store(
+        [
+            {"ts": f"{day}T01:05:00+00:00", "prompt_tok": 4, "cost_usd": 0.1},
+            {"ts": f"{day}T22:47:00+00:00", "prompt_tok": 6, "cost_usd": 0.2},
+        ]
+    )
+    filled = [p for p in store.cost_trend(["vk_a"], hours=168) if p["calls"]]
+    assert len(filled) == 1
+    assert filled[0]["calls"] == 2
+    assert filled[0]["tokens"] == 10
