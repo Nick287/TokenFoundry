@@ -549,17 +549,34 @@ def _deploy_account(account_id: str) -> None:
 
 
 def _teardown_account(account_id: str) -> None:
-    """Remove from pools, terraform destroy, clean KV + DB. Best-effort/idempotent."""
+    """Remove from pools, terraform destroy, clean KV + DB. Best-effort/idempotent.
+
+    Ordering is load-bearing and the first step is a GATE, not a best effort:
+    pool member -> per-account backend -> Azure resources -> KV + DB row.
+    """
     db = SessionLocal()
     try:
         acct = db.get(GitHubAccount, account_id)
         if not acct:
             return
-        # 1) remove from pools + delete per-account backends
+        # 1) remove from pools + delete per-account backends.
+        #
+        # This must SUCCEED before anything below runs. It used to be swallowed,
+        # and the consequence was not a stale entry that self-heals: teardown
+        # went on to destroy the hub and delete the account row, leaving a
+        # backend still wired into a live pool but pointing at a Container App
+        # that no longer existed — and no record left for a retry to work from.
+        # Removing it took hand-editing ARM. Meanwhile a third of gateway
+        # traffic round-robined into the dead hub.
+        #
+        # Failing here leaves EVERY resource intact and the account marked
+        # FAILED, so pressing delete again is a clean retry.
         try:
             ApimProvisioner().remove_hub_from_pools(account_id, acct.backend_ids or [])
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("_teardown_account: pool removal failed for %s", account_id)
+            _fail(db, acct, f"APIM cleanup failed; nothing was destroyed — retry delete. {exc}")
+            return
         # 2) terraform destroy the resource group
         token = None
         if acct.oauth_token_kv_ref:

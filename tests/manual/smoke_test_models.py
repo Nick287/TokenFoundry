@@ -68,6 +68,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Models reply with emoji, em dashes and CJK. On Windows the console defaults to
+# a legacy codepage (GBK here), so printing a reply raised UnicodeEncodeError and
+# killed the run *in the print loop* — after every request had already been paid
+# for, discarding the whole result table. Force UTF-8 on our own streams rather
+# than sanitising each reply: the replies are the evidence, and mangling them to
+# fit the terminal would hide exactly the multilingual output worth checking.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # --- Static fallback model list (verified against the live gateway 2026-06-27).
 # Auto-discovery from the control plane overrides this when credentials are set.
 # Each entry: (alias, provider). The endpoint + format are derived from the

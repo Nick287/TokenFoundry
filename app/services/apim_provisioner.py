@@ -1121,7 +1121,7 @@ class ApimProvisioner:
                 if etag:
                     put_headers["If-Match"] = etag
                 pr = hc.put(url, headers=put_headers, json={"properties": props})
-                pr.raise_for_status()
+                self._raise_for_arm(pr)
             elif r.status_code == 404:
                 # First account: create the pool with this one member + affinity.
                 props = {
@@ -1135,13 +1135,50 @@ class ApimProvisioner:
                     },
                 }
                 pr = hc.put(url, headers=headers, json={"properties": props})
-                pr.raise_for_status()
+                self._raise_for_arm(pr)
             else:
-                r.raise_for_status()
+                self._raise_for_arm(r)
+
+    @staticmethod
+    def _raise_for_arm(resp: httpx.Response) -> None:
+        """raise_for_status(), but keep ARM's explanation.
+
+        httpx's own message is the status line and URL and nothing else. ARM
+        always sends a JSON body naming the offending field, and discarding it
+        turns a self-describing failure into a guessing game: the empty-pool
+        ValidationError below sat behind a bare "400 Bad Request" in the logs
+        and cost a live reproduction to recover a message the service had
+        already sent us.
+        """
+        if not resp.is_error:
+            return
+        raise httpx.HTTPStatusError(
+            f"{resp.request.method} {resp.request.url} -> {resp.status_code}: "
+            f"{resp.text[:1000]}",
+            request=resp.request,
+            response=resp,
+        )
 
     def _pool_remove_service(self, pool_id: str, backend_id: str) -> None:
         """GET pool -> drop backend from services[] -> PUT. No-op if pool or
-        member is absent."""
+        member is absent.
+
+        Removing the LAST member DELETES the pool rather than writing an empty
+        services list, because ARM refuses the latter:
+
+            ValidationError: At least 1 service and at most 30 services should
+            be identified for the backend pool.
+
+        (Reproduced against the deployed APIM, not inferred from the docs.)
+        That 400 used to propagate out of account teardown, which carried on
+        regardless — terraform destroyed the hub and the account row was
+        deleted, leaving a backend wired into a pool that pointed at a Container
+        App which no longer existed, and no record left for a retry to work
+        from. One request in three then hit the dead hub.
+
+        Deleting the pool is the exact inverse of _pool_add_service, which
+        recreates it from a 404 when the next account arrives.
+        """
         # Match on the lowercased `/backends/<id>` suffix — same normalization as
         # _pool_add_service. ARM stores the service id as a RELATIVE path with
         # potentially different casing than we'd construct, so a case-sensitive
@@ -1154,7 +1191,7 @@ class ApimProvisioner:
             r = hc.get(url, headers=headers)
             if r.status_code == 404:
                 return
-            r.raise_for_status()
+            self._raise_for_arm(r)
             body = r.json()
             props = body.get("properties", {})
             pool = props.get("pool") or {}
@@ -1164,11 +1201,16 @@ class ApimProvisioner:
             ]
             if len(kept) == len(services):
                 return  # not a member — idempotent
+            etag = r.headers.get("ETag") or "*"
+            if not kept:
+                dr = hc.delete(url, headers={**headers, "If-Match": etag})
+                # 404 = someone else got there first; still the desired end state.
+                if dr.status_code != 404:
+                    self._raise_for_arm(dr)
+                return
             pool["services"] = kept
             props["pool"] = pool
-            etag = r.headers.get("ETag")
-            put_headers = dict(headers)
-            if etag:
-                put_headers["If-Match"] = etag
-            pr = hc.put(url, headers=put_headers, json={"properties": props})
-            pr.raise_for_status()
+            pr = hc.put(
+                url, headers={**headers, "If-Match": etag}, json={"properties": props}
+            )
+            self._raise_for_arm(pr)
