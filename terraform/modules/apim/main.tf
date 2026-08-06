@@ -1,6 +1,6 @@
 # API Management — the GenAI gateway (data plane).
 # Developer SKU for MVP; system-assigned identity used to reach AI backends and
-# to be granted Cosmos data-plane write on the usage container.
+# to publish custom token metrics to Application Insights.
 
 terraform {
   required_providers {
@@ -24,9 +24,6 @@ variable "app_insights_connection_string" {
   type      = string
   sensitive = true
 }
-# Cosmos DB — APIM writes usage records directly (outbound policy, MI auth).
-variable "cosmos_account_name" { type = string }
-variable "cosmos_account_id" { type = string }
 # APIM SKU. Default Developer_1 (classic, MVP/dev). Set to a v2 tier
 # (e.g. "StandardV2_1", "BasicV2_1") for native Anthropic Messages API token
 # metering — llm-emit-token-metric only understands the Anthropic response
@@ -154,19 +151,12 @@ resource "azurerm_monitor_diagnostic_setting" "apim_llm_logs" {
   }
 }
 
-# Grant APIM's system identity Cosmos DB data-plane write access. The outbound
-# policy uses this identity to write a usage record per LLM call directly to the
-# `usage` container via the Cosmos REST API. The account sets
-# local_authentication_enabled=false, so this data-plane RBAC assignment is
-# required — control-plane roles do NOT grant it. Built-in "Cosmos DB Data
-# Contributor" (...0002) covers item create/upsert.
-resource "azurerm_cosmosdb_sql_role_assignment" "apim_cosmos_writer" {
-  resource_group_name = var.resource_group_name
-  account_name        = var.cosmos_account_name
-  role_definition_id  = "${var.cosmos_account_id}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002"
-  principal_id        = azurerm_api_management.apim.identity[0].principal_id
-  scope               = var.cosmos_account_id
-}
+# NOTE: APIM's identity deliberately has NO Cosmos role. It held "Cosmos DB Data
+# Contributor" for an outbound policy that wrote one usage document per call.
+# That policy is gone — usage now travels hub -> Event Hub -> Capture -> import
+# job -> Cosmos, and the gateway never touches the billing store. The grant was
+# standing write access to every tenant's billing data held by a component with
+# no reason to reach it, so it is removed rather than left as "harmless".
 
 # Let APIM's managed identity PUBLISH custom metrics to Application Insights.
 # llm-emit-token-metric writes per-call token counts (incl. the Prompt Cached

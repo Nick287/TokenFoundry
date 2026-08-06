@@ -65,7 +65,12 @@ trap '[[ "${TOKEN_REFRESH_PID:-}" ]] && kill "$TOKEN_REFRESH_PID" 2>/dev/null ||
 # long done and the tag is present in ACR. Key Vault access is granted inside
 # Terraform (keyvault module), so no manual role assignment here.
 log "terraform apply START — provisioning all infrastructure (APIM is the long pole)"
-terraform apply -input=false -auto-approve -var "image_tag=${TAG}" &
+# Both tags are passed explicitly and both are the SAME here, because step 5
+# below builds tokenfoundry:$TAG and gitmodel:$TAG together. They are separate
+# variables because update-app.sh later advances only the app one; see the
+# comment on image_tag in terraform/variables.tf.
+terraform apply -input=false -auto-approve \
+  -var "image_tag=${TAG}" -var "hub_image_tag=${TAG}" &
 APPLY_PID=$!
 
 # --- 4. Wait for ACR to come up (it only depends on the RG, so ~seconds) ---

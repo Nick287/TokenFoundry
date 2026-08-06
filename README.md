@@ -289,7 +289,7 @@ as Key Vault references:
 | `TF_APP_INSIGHTS_RESOURCE_ID` | monitor module | Resource the usage-telemetry KQL runs against. Without it the App Insights block degrades to empty. |
 | `TF_RESOURCE_GROUP` / `TF_AZURE_SUBSCRIPTION_ID` | deployment | ARM scope for the provisioner. |
 | `TF_ACR_NAME` / `TF_KEYVAULT_NAME` / `TF_ACR_LOGIN_SERVER` / `TF_AZURE_LOCATION` | terraform | Pure values the Portal's deploy-config flow publishes as `HUB_*` GitHub Actions variables. |
-| `TF_HUB_IMAGE_TAG` | terraform (`image_tag`) | The `gitmodel:<tag>` the hub deploy pulls — set to the tag `deploy.sh` actually built (never a hard-coded `:latest`). |
+| `TF_HUB_IMAGE_TAG` | terraform (`hub_image_tag`) | The `gitmodel:<tag>` the hub deploy pulls. A separate variable from `image_tag`: `deploy.sh` builds both images together, but `update-app.sh` rebuilds only the app, so reusing the app tag here would name a hub image that was never built. Neither accepts `latest` — this repo pushes no such tag. |
 | `TF_TFSTATE_STORAGE_ACCOUNT` / `TF_TFSTATE_CONTAINER` | deployer module | 方案 A remote-state location. |
 | `TF_EVENTHUB_NAMESPACE_ID` / `TF_EVENTHUB_FQDN` / `TF_EVENTHUB_NAME` | eventhub module | Pass-through only: the control plane never produces to the Event Hub, it republishes these as `HUB_EVENTHUB_*` Actions variables so each hub's producer knows where to send. |
 | `TF_USAGE_CAPTURE_STORAGE_ACCOUNT` / `TF_USAGE_CAPTURE_CONTAINER` / `TF_USAGE_CAPTURE_INTERVAL_SECONDS` | eventhub module | Where the import job reads Capture's Avro blobs. The interval is also the floor on its schedule — running faster only re-lists the same blobs. |

@@ -129,8 +129,6 @@ module "apim" {
   publisher_name                 = var.publisher_name
   app_insights_id                = module.monitor.app_insights_id
   app_insights_connection_string = module.monitor.app_insights_connection_string
-  cosmos_account_name            = module.cosmos.account_name
-  cosmos_account_id              = module.cosmos.account_id
   sku_name                       = var.apim_sku
   log_analytics_workspace_id     = module.monitor.log_analytics_id
 }
@@ -177,6 +175,7 @@ module "containerapps" {
   log_analytics_workspace_id = module.monitor.log_analytics_id
   log_analytics_customer_id  = module.monitor.log_analytics_customer_id
   image_tag                  = var.image_tag
+  hub_image_tag              = var.hub_image_tag
   key_vault_uri              = module.keyvault.vault_uri
   keyvault_name              = module.keyvault.vault_name
   vault_id                   = module.keyvault.vault_id

@@ -98,7 +98,6 @@ module apim 'modules/apim.bicep' = {
     tags: tags
     appInsightsId: monitor.outputs.appInsightsId
     appInsightsConnectionString: monitor.outputs.appInsightsConnectionString
-    cosmosAccountName: cosmos.outputs.accountName
   }
 }
 

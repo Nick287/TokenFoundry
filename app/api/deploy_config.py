@@ -83,8 +83,24 @@ def _compute_status(kv: KeyVaultService, detail: str | None = None) -> DeployCon
 def _repo_variables() -> dict[str, str]:
     """The HUB_* / TFSTATE_* Actions variables the workflow reads. Every value is
     injected by terraform (see terraform/modules/containerapps) — the app does no
-    string parsing or az query."""
+    string parsing or az query.
+
+    Raises HTTPException if the hub image tag is missing, rather than publishing
+    the ref `gitmodel:` and letting a hub deploy fail minutes later on a pull
+    error that names nothing useful. The tag is only ever empty when terraform
+    did not inject TF_HUB_IMAGE_TAG, which the operator can fix immediately —
+    but only if told here, at the moment they pressed the button.
+    """
     s = get_settings()
+    if not s.hub_image_tag:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "TF_HUB_IMAGE_TAG is not set on the control plane, so hub deploys "
+                "would pull `gitmodel:` and fail. Redeploy with deploy.sh, or set "
+                "the env var to a gitmodel tag that exists in ACR."
+            ),
+        )
     return {
         "HUB_ACR_NAME": s.acr_name,
         "HUB_ACR_RG": s.resource_group,

@@ -50,11 +50,40 @@ variable "admin_password" {
   sensitive   = true
 }
 
+# Two tags, not one, because the two images are built by different scripts at
+# different times: deploy.sh builds BOTH tokenfoundry:<tag> and gitmodel:<tag>,
+# while update-app.sh rebuilds only the app. Driving both from a single variable
+# meant no value was ever correct once they diverged — pointing it at the newest
+# app tag named a gitmodel image that had never been built.
+#
+# Neither has a default. The old default was "latest", which reads like "newest"
+# but is just an ordinary tag name that nothing in this repo ever pushes:
+#
+#   $ az acr manifest show -r <acr> -n tokenfoundry:latest
+#   ERROR: manifest tagged by "latest" is not found.
+#
+# So a bare `terraform apply` silently assembled an image ref that could not be
+# pulled. Failing with "No value for required variable" is the better outcome.
 variable "image_tag" {
-  description = "Tag of the app image in ACR (the deploy script builds & pushes tokenfoundry:<tag>). The Container App image ref is assembled as <acr-login-server>/tokenfoundry:<tag>."
+  description = "Tag of the app image in ACR (deploy.sh / update-app.sh build & push tokenfoundry:<tag>). The Container App image ref is assembled as <acr-login-server>/tokenfoundry:<tag>. Only applied when the app is FIRST created — see the lifecycle block in modules/containerapps."
   type        = string
-  default     = "latest"
+
+  validation {
+    condition     = var.image_tag != "latest"
+    error_message = "This repo never pushes a 'latest' tag, so it resolves to no image. Pass the timestamped tag deploy.sh printed, e.g. v20260806142705."
+  }
 }
+
+variable "hub_image_tag" {
+  description = "Tag of the GitModel hub image in ACR (gitmodel:<tag>), published to the Container App as TF_HUB_IMAGE_TAG so hub deploys pull an image that exists. Changes only when deploy.sh rebuilds the hub, which is also the only time it runs terraform."
+  type        = string
+
+  validation {
+    condition     = var.hub_image_tag != "latest"
+    error_message = "This repo never pushes a 'latest' tag, so it resolves to no image. Pass the timestamped tag deploy.sh printed for gitmodel."
+  }
+}
+
 variable "publisher_email" {
   description = "Publisher email for APIM"
   type        = string

@@ -8,9 +8,6 @@ param tags object
 param appInsightsId string
 param appInsightsConnectionString string
 
-@description('Cosmos DB account name — APIM writes usage records to it directly (outbound policy, MI auth)')
-param cosmosAccountName string
-
 @description('Publisher email for APIM')
 param publisherEmail string = 'admin@tokenfoundry.local'
 
@@ -80,26 +77,9 @@ output apimName string = apim.name
 output gatewayUrl string = apim.properties.gatewayUrl
 output principalId string = apim.identity.principalId
 
-// Grant APIM's system identity Cosmos DB data-plane write access. The outbound
-// policy (apim/policies/outbound-cosmos-write.xml) uses this identity to write a
-// usage record per LLM call directly to the `usage` container via the Cosmos
-// REST API (type=aad auth). The account sets disableLocalAuth=true, so this
-// data-plane RBAC assignment is required — control-plane roles do NOT grant it.
-// Built-in "Cosmos DB Data Contributor" (…0002) covers item create/upsert.
-resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2024-11-15' existing = {
-  name: cosmosAccountName
-}
-
-resource apimCosmosWriter 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = {
-  parent: cosmosAccount
-  name: guid(cosmosAccount.id, apim.id, '00000000-0000-0000-0000-000000000002')
-  properties: {
-    principalId: apim.identity.principalId
-    roleDefinitionId: resourceId(
-      'Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions',
-      cosmosAccountName,
-      '00000000-0000-0000-0000-000000000002'
-    )
-    scope: cosmosAccount.id
-  }
-}
+// NOTE: APIM's identity deliberately has NO Cosmos role. It held "Cosmos DB Data
+// Contributor" for an outbound policy that wrote one usage document per call.
+// That policy is gone — usage now travels hub -> Event Hub -> Capture -> import
+// job -> Cosmos, and the gateway never touches the billing store. The grant was
+// standing write access to every tenant's billing data held by a component with
+// no reason to reach it, so it is removed rather than left as "harmless".

@@ -251,7 +251,7 @@ Key Vault 引用形式注入:
 | `TF_APP_INSIGHTS_RESOURCE_ID` | monitor 模块 | 用量遥测 KQL 查询的目标资源。没有它,App Insights 区块会退化为空。 |
 | `TF_RESOURCE_GROUP` / `TF_AZURE_SUBSCRIPTION_ID` | 部署时 | provisioner 的 ARM 作用域。 |
 | `TF_ACR_NAME` / `TF_KEYVAULT_NAME` / `TF_ACR_LOGIN_SERVER` / `TF_AZURE_LOCATION` | terraform | 门户 deploy-config 流程发布成 `HUB_*` GitHub Actions 变量的纯值。 |
-| `TF_HUB_IMAGE_TAG` | terraform(`image_tag`) | hub 部署要拉的 `gitmodel:<tag>` —— 设为 `deploy.sh` 实际构建的 tag(绝非写死的 `:latest`)。 |
+| `TF_HUB_IMAGE_TAG` | terraform(`hub_image_tag`) | hub 部署要拉的 `gitmodel:<tag>`。与 `image_tag` 是**两个独立变量**：`deploy.sh` 同时构建两个镜像，但 `update-app.sh` 只重建 app，若复用 app 的 tag 就会指向一个从未构建过的 hub 镜像。两者都拒绝 `latest` —— 本仓库从不推送该标签。 |
 | `TF_TFSTATE_STORAGE_ACCOUNT` / `TF_TFSTATE_CONTAINER` | deployer 模块 | 方案 A 远程 state 位置。 |
 | `TF_EVENTHUB_NAMESPACE_ID` / `TF_EVENTHUB_FQDN` / `TF_EVENTHUB_NAME` | eventhub 模块 | 纯透传:控制平面自己不往 Event Hub 写,只把这三个值发布成 `HUB_EVENTHUB_*` Actions 变量,让每个 hub 的 producer 知道往哪发。 |
 | `TF_USAGE_CAPTURE_STORAGE_ACCOUNT` / `TF_USAGE_CAPTURE_CONTAINER` / `TF_USAGE_CAPTURE_INTERVAL_SECONDS` | eventhub 模块 | 导入作业读 Capture 落的 Avro blob 的位置;interval 同时是作业调度的下限(跑得比它快只是重复列同一批 blob)。 |

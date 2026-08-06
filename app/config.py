@@ -42,16 +42,22 @@ class Settings(BaseSettings):
     acr_name: str = ""
     azure_location: str = ""
     keyvault_name: str = ""
-    # Image tag deploy.sh built (gitmodel:<tag> / tokenfoundry:<tag>). The Portal
-    # publishes gitmodel:<hub_image_tag> as HUB_IMAGE_REF so the hub deploy pulls a
-    # tag that actually exists in ACR (never a hard-coded :latest).
+    # Tag of the HUB image (gitmodel:<tag>). The Portal publishes
+    # gitmodel:<hub_image_tag> as HUB_IMAGE_REF so hub deploys pull a tag that
+    # actually exists in ACR.
     #
-    # NOTE: this is the tag of the deploy that built BOTH images together, so
-    # rebuilding only the hub (az acr build -t gitmodel:<new>) leaves this value
-    # behind, and the next "push SP creds" would republish the older hub image to
-    # new accounts. Either rebuild via deploy.sh, or set TF_HUB_IMAGE_TAG on the
-    # control plane to match the hub image you actually want new accounts to get.
-    hub_image_tag: str = "latest"
+    # Terraform injects this from its own `hub_image_tag` variable, which is
+    # deliberately separate from the app's `image_tag`: deploy.sh builds both
+    # images together, but update-app.sh rebuilds only the app, so the newest
+    # tokenfoundry tag routinely names a gitmodel image that was never built.
+    #
+    # The default is empty, not "latest". "latest" reads like "newest" but is
+    # just an ordinary tag name, and nothing in this repo ever pushes it —
+    # `gitmodel:latest` resolves to no image at all (verified against ACR:
+    # "manifest tagged by 'latest' is not found"). An empty value fails visibly
+    # at the point of use instead of producing a plausible-looking ref that
+    # cannot be pulled.
+    hub_image_tag: str = ""
 
     # --- Metadata DB (PostgreSQL Flexible Server) ---
     # Full SQLAlchemy URL, e.g. postgresql+psycopg://user:pass@host:5432/tokenfoundry

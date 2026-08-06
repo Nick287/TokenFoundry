@@ -21,6 +21,10 @@ variable "log_analytics_workspace_id" { type = string }
 variable "log_analytics_customer_id" { type = string }
 
 variable "image_tag" { type = string }
+# Separate from image_tag: deploy.sh builds both images with the same tag, but
+# update-app.sh rebuilds only the app, so after any app-only update the newest
+# tokenfoundry tag names a gitmodel image that was never built.
+variable "hub_image_tag" { type = string }
 variable "key_vault_uri" { type = string }
 variable "vault_id" { type = string }
 variable "cosmos_endpoint" { type = string }
@@ -327,11 +331,13 @@ resource "azurerm_container_app" "app" {
       }
       env {
         # Image TAG the hub deploy references. deploy.sh builds gitmodel:<tag>
-        # with this SAME tag (never "latest"), so the Portal's deploy-config
-        # flow must publish gitmodel:<this-tag> as HUB_IMAGE_REF — not a
-        # hard-coded :latest that doesn't exist in ACR.
+        # (never "latest" — this repo pushes no such tag), so the Portal's
+        # deploy-config flow publishes gitmodel:<this-tag> as HUB_IMAGE_REF.
+        # Deliberately NOT var.image_tag: update-app.sh advances the app tag
+        # without building a hub image, so reusing it here would point hub
+        # deploys at an image that does not exist.
         name  = "TF_HUB_IMAGE_TAG"
-        value = var.image_tag
+        value = var.hub_image_tag
       }
 
       # --- Usage pipeline ---
@@ -399,6 +405,21 @@ resource "azurerm_container_app" "app" {
     azurerm_role_assignment.acr_pull,
     azurerm_role_assignment.kv_secrets_user,
   ]
+
+  lifecycle {
+    # The APP IMAGE is owned by the deploy scripts, not by terraform.
+    # update-app.sh rolls a new revision with `az containerapp update --image`,
+    # which terraform sees as drift and "corrects" on the next apply — quietly
+    # reverting the running app to whatever tag that apply was given. Observed:
+    # a plan taken to delete one role assignment also proposed rewriting the
+    # live image from v20260806142705 back to a tag that does not exist.
+    #
+    # var.image_tag still applies at CREATE (a new environment needs a first
+    # image); after that the scripts are authoritative. TF_HUB_IMAGE_TAG is NOT
+    # ignored — nothing changes it out of band, so terraform stays its source of
+    # truth.
+    ignore_changes = [template[0].container[0].image]
+  }
 }
 
 # --- Post-app role assignments on the app's SYSTEM identity ---
