@@ -74,6 +74,7 @@ module "cosmos" {
 
   resource_group_name = azurerm_resource_group.this.name
   suffix              = local.suffix
+  throughput_rus      = var.cosmos_throughput_rus
 }
 
 # --- Usage transport (Event Hub + Capture to Blob) ---

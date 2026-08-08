@@ -10,6 +10,20 @@ output "app_fqdn" {
   value       = module.containerapps.app_fqdn
 }
 
+# Both consumed by deploy.sh, which rolls the Container App onto the image it
+# just built. Terraform sets the image only at CREATE (the field is under
+# ignore_changes so update-app.sh's revisions survive an apply), so on a re-run
+# the script has to do it — and needs these two to address the resource.
+output "app_name" {
+  description = "Container App name."
+  value       = module.containerapps.app_name
+}
+
+output "resource_group" {
+  description = "Resource group holding the environment."
+  value       = azurerm_resource_group.this.name
+}
+
 output "key_vault_uri" {
   description = "Key Vault URI."
   value       = module.keyvault.vault_uri

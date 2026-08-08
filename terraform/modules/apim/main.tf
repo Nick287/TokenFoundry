@@ -134,18 +134,33 @@ resource "azapi_update_resource" "diagnostic_metrics" {
 # logAnalyticsDestinationType = "Dedicated" gives the typed ApiManagementGatewayLlmLog
 # table (vs the generic AzureDiagnostics catch-all).
 #
-# NOTE: the GatewayLlmLogs category REQUIRES an APIM v2 tier (a05 = StandardV2). On
-# the default Developer_1 SKU this category does not exist and apply will fail —
-# billing/prod environments must set sku_name to a v2 tier.
+# Gateway request logs -> Log Analytics.
+#
+# GatewayLlmLogs is deliberately NOT collected. That category populates
+# ApiManagementGatewayLlmLog, and measuring it against Cosmos on dev-15
+# (1180 requests, per-model) showed its token counts are not usable:
+#
+#   * the prompt-token basis varies BY PROVIDER — for claude-opus-4.8 it
+#     reported 1,381 against an actual 21,953 including cache reads (94% low),
+#     while for gpt-5.4-mini it reported 19,169, which is exactly prompt+cached.
+#     Same table, opposite conventions, and no column says which one a row uses.
+#   * streamed calls carry no message content at all (0 of 114 rows), because
+#     SSE has no response body for the gateway to parse.
+#
+# So it cannot be billed from, and the content it does capture is a liability:
+# full prompts and completions for non-streamed calls, unconditionally and for
+# every tenant, which is not what docs/AUDIT.zh.md promises. Billing comes from
+# the hub's own copilot_usage via Event Hub; latency comes from GatewayLogs and
+# App Insights `requests`. Nothing reads this table.
+#
+# Dropping it also removes the v2-tier constraint: GatewayLlmLogs does not exist
+# on Developer_1, so this resource used to fail apply on the default SKU.
 resource "azurerm_monitor_diagnostic_setting" "apim_llm_logs" {
   name                           = "apim-gateway-llm-logs"
   target_resource_id             = azurerm_api_management.apim.id
   log_analytics_workspace_id     = var.log_analytics_workspace_id
   log_analytics_destination_type = "Dedicated"
 
-  enabled_log {
-    category = "GatewayLlmLogs"
-  }
   enabled_log {
     category = "GatewayLogs"
   }

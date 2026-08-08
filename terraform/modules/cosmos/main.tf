@@ -7,6 +7,47 @@ variable "tags" { type = map(string) }
 variable "resource_group_name" { type = string }
 variable "suffix" { type = string }
 
+variable "throughput_rus" {
+  description = <<-EOT
+    Manual provisioned RU/s on the `usage` container. 0 = serverless.
+
+    WHICH TO PICK is a utilisation question, not a preference. Provisioned works
+    out to $0.0222 per million RU (`$0.008/hour per 100 RU/s`, southeastasia);
+    serverless is $0.285 per million RU — 12.8x more. So provisioned wins above
+    roughly 8% utilisation of whatever you provision, and loses below it.
+
+    At 400 RU/s (the per-container minimum) that break-even is about 8M calls
+    per month. Below that, serverless is both cheaper AND has no capacity to
+    manage; above it, provisioned pulls ahead and keeps pulling.
+
+    WARNING: this is NOT a live switch, and terraform's plan does NOT say so.
+
+    `EnableServerless` is an account-level capability fixed at creation —
+    Azure's own words are "when you create an Azure Cosmos DB account, you
+    choose between provisioned throughput and serverless". Worse, azurerm
+    treats `capabilities` as computed, so REMOVING the block produces no diff
+    at all: flipping this variable on a live serverless environment plans a
+    single benign-looking "container updated in-place, + throughput = 400" and
+    then FAILS at apply, because Azure rejects throughput on a serverless
+    container. (Verified against dev-17: the account appears in the plan only
+    as "Refreshing state", with zero planned changes.)
+
+    The failure is safe — nothing is destroyed — but the switch cannot be made
+    this way. Set this at CREATION time on a new environment, or migrate the
+    documents to a new account.
+  EOT
+  type        = number
+  default     = 400
+
+  validation {
+    # 400 RU/s is the Azure minimum for a container with manual throughput;
+    # anything between 1 and 399 is silently invalid at apply time, which is a
+    # worse place to find out.
+    condition     = var.throughput_rus == 0 || var.throughput_rus >= 400
+    error_message = "throughput_rus must be 0 (serverless) or at least 400 RU/s."
+  }
+}
+
 resource "azurerm_cosmosdb_account" "account" {
   name                = substr("${var.name_prefix}-cosmos-${var.suffix}", 0, 44)
   location            = var.location
@@ -25,8 +66,13 @@ resource "azurerm_cosmosdb_account" "account" {
     consistency_level = "Session"
   }
 
-  capabilities {
-    name = "EnableServerless"
+  # Present only in serverless mode. The capability cannot be added to or
+  # removed from a live account, so toggling `throughput_rus` forces a replace.
+  dynamic "capabilities" {
+    for_each = var.throughput_rus > 0 ? [] : [1]
+    content {
+      name = "EnableServerless"
+    }
   }
 
   geo_location {
@@ -49,4 +95,7 @@ resource "azurerm_cosmosdb_sql_container" "usage" {
   partition_key_paths = ["/pk"]
   # 90-day TTL on raw records; aggregates are rolled up to PostgreSQL.
   default_ttl = 7776000
+  # null in serverless mode — passing any throughput to a serverless container
+  # is an error, not a no-op.
+  throughput = var.throughput_rus > 0 ? var.throughput_rus : null
 }

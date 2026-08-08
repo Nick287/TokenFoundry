@@ -106,6 +106,29 @@ variable "apim_sku" {
 # The control plane pushes the deployer SP creds into THIS repo's Actions
 # secrets and triggers its deploy-hub.yml. Override in terraform.tfvars to
 # point a different fork/org at the same control plane.
+variable "cosmos_throughput_rus" {
+  description = <<-EOT
+    Manual provisioned RU/s on the Cosmos `usage` container. 0 = serverless.
+
+    Break-even is utilisation, not volume-for-its-own-sake: provisioned is
+    $0.0222 per million RU vs serverless $0.285 — 12.8x — so provisioned wins
+    above roughly 8% utilisation. At the 400 RU/s minimum that is about 8M
+    calls/month. See docs/PRICING.zh.md.
+
+    Changing this on a LIVE environment does not work and terraform will not
+    warn you: azurerm treats the account's `capabilities` as computed, so
+    removing `EnableServerless` produces no diff, the plan shows only a benign
+    container update, and the apply then fails on Azure's side. Set it at
+    environment-creation time. (Verified on dev-17.)
+
+    The default is 400 (provisioned) so that the NEXT environment is built the
+    way a production one should be. An environment that already exists as
+    serverless must pin `cosmos_throughput_rus = 0` in its tfvars — dev-17 does.
+  EOT
+  type        = number
+  default     = 400
+}
+
 variable "github_repo_owner" {
   description = "Owner (user/org) of the repo hosting deploy-hub.yml."
   type        = string
