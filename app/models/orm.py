@@ -236,6 +236,28 @@ class GitHubAccount(Base, TimestampMixin):
     # remove them from the pools on delete.
     backend_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
 
+    # --- Hub-reported health (polled from the hub's /api/status) ---
+    #
+    # Deliberately NOT folded into `status`: that is a DEPLOY state machine, and
+    # a hub can be perfectly deployed while quietly failing to report usage.
+    # Conflating them would make a billing-feed outage look like a deploy
+    # problem, and would move a state machine that other code asserts is stable.
+    #
+    # `usage_events_lost` is the one to alert on: it counts EVENTS given up on
+    # for good, each once. `usage_events_dropped` counts failed hand-offs, so a
+    # single event retried twice contributes 3 — useful as a turbulence gauge,
+    # wrong as a loss figure. See vendored/gitmodel-hub/hub/eventhub.py.
+    usage_events_dropped: Mapped[int] = mapped_column(Integer, default=0)
+    usage_events_lost: Mapped[int] = mapped_column(Integer, default=0)
+    audit_payloads_dropped: Mapped[int] = mapped_column(Integer, default=0)
+    # Last successful poll. NULL means never reached — which reads very
+    # differently from "reached, and everything was zero".
+    hub_status_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Most recent drop reason, as the hub reported it: an exception CLASS NAME,
+    # never a message (the hub's /api/status is unauthenticated and Azure error
+    # strings carry namespace FQDNs and identity ids).
+    hub_drop_reason: Mapped[str | None] = mapped_column(String(256))
+
 
 class ImportWatermark(Base, TimestampMixin):
     """How far a batch importer has read its source. One row per source.

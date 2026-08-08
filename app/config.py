@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     usage_capture_container: str = "usage-capture"
     usage_capture_interval_seconds: int = 300
 
+    # How often to ask every deployed hub for its /api/status. This is the only
+    # reader of the hubs' usage-event drop counters — before it existed, a hub
+    # could silently stop reporting billing events and the sole evidence was a
+    # counter nobody fetched (dev-15 lost 21 records that way). Longer than the
+    # capture interval on purpose: the counters move slowly and each pass costs
+    # one HTTP round-trip per hub.
+    hub_status_interval_seconds: int = 300
+
     # --- Audit archive (raw bodies, opt-in per tenant) ---
     # Pass-through only, and it stays that way on purpose: these are republished
     # as HUB_AUDIT_* Actions variables so each hub can write payloads, and the
