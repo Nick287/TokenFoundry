@@ -129,10 +129,79 @@ def one_call(url: str, headers: dict, body: dict, timeout: int) -> dict:
                 "err": type(e).__name__}
 
 
-def run_level(url, headers, body, conc: int, n: int, timeout: int) -> dict:
+def one_call_stream(url: str, headers: dict, body: dict, timeout: int) -> dict:
+    """Same contract as one_call, but over SSE.
+
+    Streaming is the path most likely to lose a usage event: the hub emits from
+    inside an async generator's `finally`, so a client disconnect or a truncated
+    stream exercises code that a buffered request never touches. Every load test
+    in this repo was non-streaming, which left that path unmeasured under load.
+
+    `ttft` (time to first token) is recorded separately because the streaming
+    contract is about latency-to-first-byte, and a stream can start promptly and
+    still finish slowly — averaging that into one number would hide both.
+    """
+    t0 = time.perf_counter()
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    ttft = None
+    tot = 0
+    chunks = 0
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            for raw in r:  # HTTPResponse iterates line-by-line
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                if ttft is None:
+                    ttft = time.perf_counter() - t0
+                chunks += 1
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                # Usage rides a late chunk; on Responses-shaped streams it is
+                # nested under .response. Last one wins.
+                for cand in (obj, obj.get("response") if isinstance(obj, dict) else None):
+                    if not isinstance(cand, dict):
+                        continue
+                    u = cand.get("usage")
+                    if isinstance(u, dict):
+                        t = int(u.get("total_tokens", 0) or 0)
+                        if not t:
+                            t = (int(u.get("input_tokens", 0) or 0)
+                                 + int(u.get("output_tokens", 0) or 0))
+                        if t:
+                            tot = t
+            dt = time.perf_counter() - t0
+            # A 200 that produced no SSE event is a failure, not a fast success:
+            # counting it as ok would let a broken stream inflate the RPS column.
+            status = r.status if chunks else 0
+            return {"status": status, "sec": dt, "tokens": tot,
+                    "ttft": ttft, "chunks": chunks,
+                    **({} if chunks else {"err": "no SSE events"})}
+    except urllib.error.HTTPError as e:
+        dt = time.perf_counter() - t0
+        body_txt = ""
+        try:
+            body_txt = e.read()[:120].decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": e.code, "sec": dt, "tokens": 0, "err": body_txt}
+    except Exception as e:  # noqa: BLE001
+        return {"status": 0, "sec": time.perf_counter() - t0, "tokens": 0,
+                "err": type(e).__name__}
+
+
+def run_level(url, headers, body, conc: int, n: int, timeout: int,
+              stream: bool = False) -> dict:
+    caller = one_call_stream if stream else one_call
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=conc) as ex:
-        results = list(ex.map(lambda _: one_call(url, headers, body, timeout), range(n)))
+        results = list(ex.map(lambda _: caller(url, headers, body, timeout), range(n)))
     wall = time.perf_counter() - t0
 
     ok = [r for r in results if r["status"] == 200]
@@ -140,6 +209,7 @@ def run_level(url, headers, body, conc: int, n: int, timeout: int) -> dict:
     c503 = [r for r in results if r["status"] == 503]
     other = [r for r in results if r["status"] not in (200, 429, 503)]
     lat = sorted(r["sec"] for r in ok)
+    ttfts = sorted(r["ttft"] for r in ok if r.get("ttft") is not None)
     tokens = sum(r["tokens"] for r in ok)
     return {
         "conc": conc, "n": n, "wall": wall,
@@ -149,6 +219,7 @@ def run_level(url, headers, body, conc: int, n: int, timeout: int) -> dict:
         "tokens": tokens,
         "p50": statistics.median(lat) if lat else 0,
         "p95": (lat[int(len(lat) * 0.95)] if len(lat) > 1 else (lat[0] if lat else 0)),
+        "ttft50": statistics.median(ttfts) if ttfts else 0,
         "sample_err": next((r.get("err", "") for r in results if r.get("err")), ""),
     }
 
@@ -170,6 +241,11 @@ def main() -> int:
     ap.add_argument("--stop-error-rate", type=float, default=STOP_ERROR_RATE,
                     help=f"stop ramping once error rate exceeds this, 0-1 "
                          f"(default {STOP_ERROR_RATE})")
+    ap.add_argument("--stream", action="store_true",
+                    help="drive SSE instead of buffered responses. The hub emits "
+                         "its usage event from inside a generator's finally on "
+                         "this path, so it is the one most likely to lose events "
+                         "under load — and the one no load test covered.")
     args = ap.parse_args()
 
     gw = require("TF_GATEWAY_URL").rstrip("/")
@@ -184,21 +260,35 @@ def main() -> int:
         headers["anthropic-version"] = "2023-06-01"
     body = {"model": model, "max_tokens": args.max_tokens,
             "messages": [{"role": "user", "content": PROMPT}]}
+    if args.stream:
+        body["stream"] = True
+        headers["Accept"] = "text/event-stream"
+        if "messages" not in path:
+            # Chat Completions omits usage on streams unless asked. Without it
+            # the TPM column reads 0 and the run looks free.
+            body["stream_options"] = {"include_usage": True}
 
     print(f"target : {url}")
-    print(f"model  : {model}   max_tokens={args.max_tokens}")
+    print(f"model  : {model}   max_tokens={args.max_tokens}   "
+          f"mode={'STREAM' if args.stream else 'direct'}")
     print(f"levels : {args.levels}   requests/level={args.per_level}\n")
+    ttft_col = f" {'ttft s':>7}" if args.stream else ""
     hdr = (f"{'conc':>4} {'ok':>4} {'429':>4} {'503':>4} {'err':>4} "
-           f"{'RPS':>7} {'TPM':>9} {'p50 s':>7} {'p95 s':>7}")
+           f"{'RPS':>7} {'TPM':>9} {'p50 s':>7} {'p95 s':>7}{ttft_col}")
     print(hdr)
     print("-" * len(hdr))
 
     rows = []
     for lvl in [int(x) for x in args.levels.split(",")]:
-        r = run_level(url, headers, body, lvl, args.per_level, args.timeout)
+        r = run_level(url, headers, body, lvl, args.per_level, args.timeout,
+                      stream=args.stream)
         rows.append(r)
-        print(f"{r['conc']:>4} {r['ok']:>4} {r['c429']:>4} {r['c503']:>4} {r['other']:>4} "
-              f"{r['rps']:>7.2f} {r['tpm']:>9.0f} {r['p50']:>7.2f} {r['p95']:>7.2f}")
+        line = (f"{r['conc']:>4} {r['ok']:>4} {r['c429']:>4} {r['c503']:>4} "
+                f"{r['other']:>4} {r['rps']:>7.2f} {r['tpm']:>9.0f} "
+                f"{r['p50']:>7.2f} {r['p95']:>7.2f}")
+        if args.stream:
+            line += f" {r['ttft50']:>7.2f}"
+        print(line)
         if r["sample_err"]:
             print(f"     err sample: {r['sample_err'][:110]}")
         err_rate = 1 - (r["ok"] / r["n"] if r["n"] else 0)
