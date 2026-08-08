@@ -128,6 +128,7 @@ def _to_record_view(r: dict, key_projects: dict[str, dict] | None = None) -> dic
     prompt, completion, cached = _extract_tokens(r)
     sub = r.get("subscription") or r.get("subscription_id")
     proj = (key_projects or {}).get(sub or "")
+    status = r.get("status")
     return {
         "ts": r.get("ts"),
         "subscription": sub,
@@ -135,6 +136,12 @@ def _to_record_view(r: dict, key_projects: dict[str, dict] | None = None) -> dic
         "project_name": proj.get("project_name") if proj else None,
         "route": r.get("route", "unknown"),
         "api": r.get("api"),
+        # Surfaced so a rejected call is distinguishable from a served one. An
+        # upstream 429 produces a zero-token document; without this the log
+        # shows it as a successful call that happened to use no tokens.
+        # Documents written before `status` existed carry None — passed through
+        # as null rather than defaulted, so the portal can show "—".
+        "status": int(status) if isinstance(status, int) else None,
         "prompt_tok": prompt,
         "completion_tok": completion,
         "cached_tok": cached,

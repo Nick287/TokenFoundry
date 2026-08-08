@@ -143,6 +143,9 @@ export interface UsageRecordView {
   project_name: string | null;
   route: string;
   api: string | null;
+  // HTTP status the gateway returned. Null on documents written before the
+  // field existed — render a dash, not a success.
+  status: number | null;
   prompt_tok: number;
   completion_tok: number;
   cached_tok: number;
@@ -161,6 +164,12 @@ export type TrendBucket = "hour" | "day";
 
 export interface UsageTelemetry {
   total_calls: number;
+  total_ok: number;
+  total_failures: number;
+  // One entry per HTTP status the gateway returned. This is the half of the
+  // reconciliation Cosmos cannot supply: a request the circuit breaker sheds
+  // never reaches a hub, so it leaves no usage document.
+  by_status: Array<{ status: string; calls: number }>;
   by_api: Array<{
     name: string;
     calls: number;
@@ -201,6 +210,12 @@ export interface TokenGroup {
   cost_usd: number;
   billed_usd: number;
   calls: number;
+  // `calls` split by outcome. An upstream rejection costs $0, so a bare call
+  // count reads as healthy traffic while the customer saw errors.
+  ok_calls: number;
+  failed_calls: number;
+  // Per-status-code counts, e.g. {"429": 67}. Absent codes simply have no key.
+  failed_by_status: Record<string, number>;
 }
 export interface UsageTotals {
   prompt_tok: number;
@@ -210,6 +225,9 @@ export interface UsageTotals {
   cost_usd: number;
   billed_usd: number;
   calls: number;
+  ok_calls: number;
+  failed_calls: number;
+  failed_by_status: Record<string, number>;
 }
 export interface UsageBreakdown {
   by: "model" | "api" | "subscription" | "backend" | "end_user";

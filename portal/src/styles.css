@@ -369,6 +369,39 @@ tbody tr:hover {
   font-variant-numeric: tabular-nums;
 }
 
+/* Per-status-code breakdown under a failure count. Sits inside a .stat card, so
+   it inherits the column layout and just needs to wrap and stay small — the
+   count is the headline, the codes are the explanation. */
+.status-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.15rem;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.3rem;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  background: var(--bg);
+}
+
+.status-chip code {
+  font-size: 0.72rem;
+  color: var(--muted);
+  background: none;
+  padding: 0;
+}
+
+.status-chip-n {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Segmented toggle for the breakdown grouping (model / endpoint / key). */
 .seg-toggle {
   display: inline-flex;

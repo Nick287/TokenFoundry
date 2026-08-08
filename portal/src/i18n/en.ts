@@ -242,12 +242,12 @@ export const en = {
     completionTokens: "Completion tokens",
     cost: "Cost (USD)",
     billed: "Billed (USD)",
-    cosmosSection: "Usage & cost — from Cosmos",
     telemetrySection: "Calls & latency — from App Insights",
     callLog: "Call log",
     colTime: "Time",
     colModel: "Model",
     colKey: "Project / Key",
+    colStatus: "Status",
     colPromptTok: "Prompt tok",
     colCompletionTok: "Completion tok",
     colCachedTok: "Cached tok",
@@ -257,7 +257,6 @@ export const en = {
     pageNext: "Next",
     pageIndicator: "Page {{page}} of {{pages}}",
     pageSize: "Per page",
-    totalCalls: "Total calls",
     colApi: "API",
     colCalls: "Calls",
     colP50: "p50",
@@ -287,6 +286,17 @@ export const en = {
     colCost: "Cost (USD)",
     colBilled: "Billed (USD)",
     callsLabel: "Calls",
+    okCallsLabel: "Succeeded",
+    failedCallsLabel: "Failed",
+    failedHint:
+      "Failures here are calls that reached a hub and were rejected upstream — " +
+      "they cost nothing but did not serve the customer. Requests the gateway " +
+      "shed itself (circuit-breaker 503, unmatched 404) never reach a hub and " +
+      "so appear only in the App Insights block below.",
+    telemetryReconcileHint:
+      "Gateway-side counts, covering every request that hit APIM. Expect more " +
+      "failures than the billing block above: 429 should match code-for-code, " +
+      "while 503/404 exist only here because those requests never reached a hub.",
     tokTrendSection: "Tokens & calls over time",
     tokTrendSeries: "Tokens",
     callTrendSeries: "Calls",

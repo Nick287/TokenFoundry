@@ -339,7 +339,17 @@ class UsageStore:
         particular is not.
         """
         cols = ", ".join(
-            f"c.{f}" for f in (*self._TOKEN_FIELDS, "cost_usd", "billed_usd", *extra_fields)
+            f"c.{f}"
+            for f in (
+                *self._TOKEN_FIELDS,
+                "cost_usd",
+                "billed_usd",
+                # `status` is what separates a served call from one upstream
+                # refused. Every aggregate needs it, so it is projected here
+                # rather than passed in as an extra_field by each caller.
+                "status",
+                *extra_fields,
+            )
         )
         where, params = self._agg_where(subscription_ids, since_iso)
         params = [*params, {"name": "@n", "value": self._MAX_ROWS}]
@@ -364,6 +374,19 @@ class UsageStore:
     def _blank(fields: tuple[str, ...]) -> dict:
         return {
             "calls": 0,
+            # Split out of `calls` because "1188 calls" hid 46 upstream
+            # rejections during the dev-16 campaign: they cost nothing, so the
+            # money was right, but the customer-facing call count was not. The
+            # split reads off the `status` the hub already records — it was in
+            # every document from the start and simply never projected.
+            "ok_calls": 0,
+            "failed_calls": 0,
+            # Per-status-code counts, e.g. {"429": 67}. A bare failure total
+            # cannot be reconciled against the gateway: an upstream throttle and
+            # a malformed request are both "failed" here, and only the former
+            # has a counterpart in the App Insights `requests` table. A fresh
+            # dict per bucket — sharing one would merge every group's errors.
+            "failed_by_status": {},
             **dict.fromkeys(fields, 0),
             "cost_usd": 0.0,
             "billed_usd": 0.0,
@@ -378,6 +401,21 @@ class UsageStore:
         legacy rows have `cache_write_tok: null`), and `null + int` raises.
         """
         bucket["calls"] += 1
+        # A document written before `status` existed has None here. Treating
+        # that as a failure would retroactively invent errors in historical
+        # data, so an unknown status counts as OK — the same way it read before
+        # this split existed.
+        status = row.get("status")
+        if isinstance(status, int) and status >= 400:
+            bucket["failed_calls"] += 1
+            # Keyed by string: this dict is JSON, and JSON object keys are
+            # strings anyway — doing it here keeps the portal from having to
+            # handle both forms.
+            by_status = bucket["failed_by_status"]
+            key = str(status)
+            by_status[key] = by_status.get(key, 0) + 1
+        else:
+            bucket["ok_calls"] += 1
         for f in cls._TOKEN_FIELDS:
             bucket[f] += int(row.get(f) or 0)
         bucket["cost_usd"] += float(row.get("cost_usd") or 0.0)
@@ -541,6 +579,9 @@ class AppInsightsUsage:
           * base  — calls / p50 / p95 / failures, by API (the "which model most"
                     answer: rows are ordered by call count)
           * split — gateway vs backend duration, by API (requests↔dependencies)
+          * codes — calls per HTTP status code, so a failure total can be
+                    reconciled against the Cosmos one instead of merely
+                    disagreeing with it
           * trend — calls per bucket over the window (hourly, or daily once the
                     window is long enough that hourly points stop being legible)
         Each query degrades independently: if the fragile dependency join yields
@@ -551,6 +592,9 @@ class AppInsightsUsage:
         empty: dict = {
             "by_api": [],
             "total_calls": 0,
+            "total_ok": 0,
+            "total_failures": 0,
+            "by_status": [],
             "by_hour": [],
             "bucket": UsageStore.trend_bucket(hours),
             "hours": hours,
@@ -596,7 +640,24 @@ class AppInsightsUsage:
             row["gateway_p50"] = split.get("gateway_p50") if split else None
             row["backend_p50"] = split.get("backend_p50") if split else None
 
-        # 3) Trend: calls per bucket, oldest→newest. make-series zero-fills the
+        # 3) Codes: one row per HTTP status the gateway returned. This is the
+        #    half of the reconciliation Cosmos cannot supply — a request the
+        #    circuit breaker sheds never reaches a hub, so it produces no usage
+        #    document at all. Without this table the two failure totals simply
+        #    disagree with no way to see why.
+        codes_kql = """
+        requests
+        | where name startswith 'POST /llm-'
+        | summarize calls = count() by resultCode
+        | order by calls desc
+        """
+        by_status = [
+            {"status": str(r.get("resultCode") or "?"),
+             "calls": int(r.get("calls", 0) or 0)}
+            for r in self._run_kql(codes_kql, hours)
+        ]
+
+        # 4) Trend: calls per bucket, oldest→newest. make-series zero-fills the
         #    gaps so the chart shows a continuous timeline (a plain summarize
         #    by bin() only emits buckets that had calls — producing a few isolated
         #    spikes with empty space between, not a real time series).
@@ -623,9 +684,18 @@ class AppInsightsUsage:
         ]
 
         total = sum(int(r.get("calls", 0) or 0) for r in by_api)
+        # Derived from the per-API `failures` column rather than from
+        # `by_status`, so the headline still holds if the codes query is the one
+        # that degrades. A status that won't parse as an int (App Insights
+        # records client-side aborts as "0" and occasionally as text) counts as
+        # a failure — it is certainly not a served 200.
+        failures = sum(int(r.get("failures", 0) or 0) for r in by_api)
         return {
             "by_api": by_api,
             "total_calls": total,
+            "total_ok": total - failures,
+            "total_failures": failures,
+            "by_status": by_status,
             "by_hour": by_hour,
             "bucket": UsageStore.trend_bucket(hours),
             "hours": hours,

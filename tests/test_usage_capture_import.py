@@ -280,3 +280,25 @@ def test_hub_id_absent_is_null_not_a_guess():
     """
     assert event_to_document(_event(), {})["hub_id"] is None  # type: ignore[index]
     assert event_to_document(_event(hub_id=""), {})["hub_id"] is None  # type: ignore[index]
+
+
+# --------------------------------------------------------------------------- #
+# The read projection: status has to survive the trip to the portal            #
+# --------------------------------------------------------------------------- #
+def test_record_view_exposes_the_gateway_status() -> None:
+    """Cosmos has stored `status` on every document since the importer was
+    written, but the call log dropped it — so a 429 (zero tokens, zero cost)
+    rendered identically to a served call that happened to be free.
+    """
+    from app.api.usage import _to_record_view
+
+    assert _to_record_view({"status": 429})["status"] == 429
+    assert _to_record_view({"status": 200})["status"] == 200
+
+
+def test_record_view_reports_a_missing_status_as_null_not_zero() -> None:
+    """Documents predating the field have no status. 0 would render as a real
+    status code in the log; null renders as a dash."""
+    from app.api.usage import _to_record_view
+
+    assert _to_record_view({})["status"] is None

@@ -239,12 +239,12 @@ export const zh: TranslationShape = {
     completionTokens: "输出 token",
     cost: "成本（USD）",
     billed: "计费（USD）",
-    cosmosSection: "用量与成本 — 来自 Cosmos",
     telemetrySection: "调用与延迟 — 来自 App Insights",
     callLog: "调用记录",
     colTime: "时间",
     colModel: "模型",
     colKey: "项目 / 密钥",
+    colStatus: "状态码",
     colPromptTok: "输入 token",
     colCompletionTok: "输出 token",
     colCachedTok: "缓存命中",
@@ -254,7 +254,6 @@ export const zh: TranslationShape = {
     pageNext: "下一页",
     pageIndicator: "第 {{page}} / {{pages}} 页",
     pageSize: "每页",
-    totalCalls: "总调用次数",
     colApi: "API",
     colCalls: "调用数",
     colP50: "p50",
@@ -284,6 +283,15 @@ export const zh: TranslationShape = {
     colCost: "成本（USD）",
     colBilled: "计费（USD）",
     callsLabel: "调用数",
+    okCallsLabel: "成功",
+    failedCallsLabel: "失败",
+    failedHint:
+      "这里的失败是「到达了 hub、但被上游拒绝」的调用——不产生费用，但也没有服务到客户。" +
+      "被网关自己挡掉的请求（熔断 503、未匹配 404）根本没到 hub，只会出现在下方的 " +
+      "App Insights 区块里。",
+    telemetryReconcileHint:
+      "网关侧口径，涵盖所有打到 APIM 的请求。失败数应当多于上方计费区块：429 两边逐码相等，" +
+      "而 503 / 404 只在这里有——那些请求从未到达 hub。",
     tokTrendSection: "Token 与调用数随时间变化",
     tokTrendSeries: "Token",
     callTrendSeries: "调用数",

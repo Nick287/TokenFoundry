@@ -38,6 +38,9 @@ from app.services.usage_ingest import UsageStore
 
 _EMPTY_TOTALS = {
     "calls": 0,
+    "ok_calls": 0,
+    "failed_calls": 0,
+    "failed_by_status": {},
     "prompt_tok": 0,
     "cached_tok": 0,
     "cache_write_tok": 0,
@@ -270,6 +273,109 @@ def test_null_dimension_becomes_unknown() -> None:
     out = store.cost_breakdown(["vk_a"], group_by="end_user")
     assert out[0]["end_user"] == "unknown"
     assert out[0]["prompt_tok"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Succeeded vs failed — a $0 call is not necessarily a served call             #
+# --------------------------------------------------------------------------- #
+def test_status_splits_calls_into_succeeded_and_failed() -> None:
+    """The dev-16 campaign produced 46 upstream 429s. They cost nothing, so the
+    money column was right while `calls` reported them as ordinary traffic."""
+    store, _ = _store(
+        [
+            {"route": "gpt-4o-mini", "status": 200, "prompt_tok": 10, "completion_tok": 5},
+            {"route": "gpt-4o-mini", "status": 429, "prompt_tok": 0, "completion_tok": 0},
+            {"route": "gpt-4o-mini", "status": 500, "prompt_tok": 0, "completion_tok": 0},
+        ]
+    )
+    out = store.cost_breakdown(["vk_a"], group_by="model")
+    assert out[0]["calls"] == 3
+    assert out[0]["ok_calls"] == 1
+    assert out[0]["failed_calls"] == 2
+
+
+def test_status_is_projected_so_the_split_has_something_to_read() -> None:
+    """The split is silent if the column never leaves Cosmos — every row would
+    carry `status: None` and count as OK, which looks exactly like success."""
+    store, fake = _store([{"route": "gpt-4o-mini", "status": 429}])
+    store.cost_breakdown(["vk_a"], group_by="model")
+    assert "c.status" in fake.last_query
+
+
+def test_missing_status_counts_as_succeeded_not_failed() -> None:
+    """Documents predating the field carry no status. Counting them as failures
+    would retroactively invent errors across the whole history."""
+    store, _ = _store([{"route": "gpt-4o", "prompt_tok": 13}])
+    out = store.cost_breakdown(["vk_a"], group_by="model")
+    assert (out[0]["ok_calls"], out[0]["failed_calls"]) == (1, 0)
+
+
+def test_totals_carry_the_same_split_as_the_groups() -> None:
+    """Totals are queried independently of the group list, so the split has to be
+    computed twice — a headline that disagreed with its own table is worse than
+    no headline."""
+    store, _ = _store(
+        [
+            {"status": 200, "cost_usd": 1.0},
+            {"status": 200, "cost_usd": 1.0},
+            {"status": 400, "cost_usd": 0.0},
+        ]
+    )
+    totals = store.cost_totals(["vk_a"])
+    assert (totals["calls"], totals["ok_calls"], totals["failed_calls"]) == (3, 2, 1)
+
+
+def test_empty_totals_expose_the_split_keys() -> None:
+    """A quiet window must still return the keys the portal indexes, or the
+    dashboard renders `undefined` instead of a zero."""
+    store, _ = _store([])
+    totals = store.cost_totals(["vk_a"])
+    assert totals["ok_calls"] == 0
+    assert totals["failed_calls"] == 0
+    assert totals["failed_by_status"] == {}
+
+
+def test_failures_are_broken_out_per_status_code() -> None:
+    """A bare failure total can't be reconciled against the gateway: only some
+    failure kinds have a counterpart there. The per-code split is what makes the
+    two sources comparable."""
+    store, _ = _store(
+        [
+            {"route": "gpt-4o-mini", "status": 200},
+            {"route": "gpt-4o-mini", "status": 429},
+            {"route": "gpt-4o-mini", "status": 429},
+            {"route": "gpt-4o-mini", "status": 400},
+        ]
+    )
+    out = store.cost_breakdown(["vk_a"], group_by="model")
+    assert out[0]["failed_by_status"] == {"429": 2, "400": 1}
+    # The per-code counts must sum to the headline, or the card contradicts the
+    # chips printed directly beneath it.
+    assert sum(out[0]["failed_by_status"].values()) == out[0]["failed_calls"]
+
+
+def test_each_group_gets_its_own_status_dict() -> None:
+    """A dict built once and reused would merge every group's errors — every row
+    would show every other row's failures."""
+    store, _ = _store(
+        [
+            {"route": "gpt-4o-mini", "status": 429},
+            {"route": "claude-opus-5", "status": 400},
+        ]
+    )
+    out = {
+        g["model"]: g["failed_by_status"]
+        for g in store.cost_breakdown(["vk_a"], group_by="model")
+    }
+    assert out["gpt-4o-mini"] == {"429": 1}
+    assert out["claude-opus-5"] == {"400": 1}
+
+
+def test_successful_calls_never_enter_the_status_breakdown() -> None:
+    """200 is not an error. Listing it as a chip under "failed" would be worse
+    than showing nothing."""
+    store, _ = _store([{"route": "gpt-4o", "status": 200}, {"route": "gpt-4o"}])
+    assert store.cost_breakdown(["vk_a"], group_by="model")[0]["failed_by_status"] == {}
 
 
 def test_totals_cover_rows_a_truncated_group_list_would_drop() -> None:
