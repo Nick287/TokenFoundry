@@ -41,6 +41,23 @@ def _ensure_columns() -> None:
         "ALTER TABLE model_routes ADD COLUMN IF NOT EXISTS api_version varchar(64)",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS hub_key_kv_ref varchar(512)",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS admin_token_kv_ref varchar(512)",
+        # Hub-reported health, polled from each hub's /api/status. Separate from
+        # `status`, which is a DEPLOY state machine: a hub can be fully deployed
+        # and still be dropping usage events, which is how dev-15 lost 21 billing
+        # records with nothing on the page changing. Default 0 so an existing row
+        # reads as "nothing lost", and hub_status_at stays NULL until a poll
+        # actually succeeds — "never reached" and "reached, all zero" must not
+        # look the same.
+        "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS "
+        "usage_events_dropped integer NOT NULL DEFAULT 0",
+        "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS "
+        "usage_events_lost integer NOT NULL DEFAULT 0",
+        "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS "
+        "audit_payloads_dropped integer NOT NULL DEFAULT 0",
+        "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS "
+        "hub_status_at timestamptz",
+        "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS "
+        "hub_drop_reason varchar(256)",
         # Raw-body audit archival opt-in. Defaults false: an existing tenant must
         # never start archiving customer content because of a deploy.
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS audit_enabled boolean NOT NULL DEFAULT false",
@@ -54,6 +71,14 @@ def _ensure_columns() -> None:
         "ALTER TABLE virtual_keys DROP COLUMN IF EXISTS tpm_tier",
         "ALTER TABLE virtual_keys DROP COLUMN IF EXISTS monthly_budget_usd",
         "ALTER TABLE virtual_keys DROP COLUMN IF EXISTS budget_action",
+        # One platform-pooled route per model name. The application already
+        # dedupes, but `_register_hub_catalog` runs from a BackgroundTask and
+        # several accounts can register concurrently: dev-16 ended up with 108
+        # rows for 36 models because three deploys each read an empty catalog.
+        # PARTIAL on purpose — TENANT/BYO routes legitimately reuse a model name
+        # across tenants, so a whole-table unique index would break them.
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_model_routes_platform_name "
+        "ON model_routes (name) WHERE owner_scope = 'PLATFORM' AND tenant_id IS NULL",
     ]
     with engine.begin() as conn:
         for stmt in statements:

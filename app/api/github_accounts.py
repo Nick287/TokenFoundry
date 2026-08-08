@@ -28,6 +28,7 @@ import uuid
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.auth import Principal, require_admin
@@ -106,6 +107,17 @@ def _register_hub_catalog(
     (another account's hub may still serve a model this one dropped); only the
     manual resync action, which the operator invokes deliberately, prunes. TENANT
     (BYO) routes are never touched.
+
+    CONCURRENCY. `_deploy_account` runs this from a BackgroundTask, so adding
+    several accounts at once runs several copies at once. The dedupe read must
+    therefore sit as close to the insert as possible: an earlier version read
+    the catalog at the top of the function and only then made the per-provider
+    ARM calls, leaving a read-to-commit window tens of seconds wide. Three
+    accounts added together on dev-16 each read an empty catalog and each
+    inserted all 36 models — 108 rows for 36 distinct names, in three bursts
+    26s/1.1s apart. The ARM calls now happen FIRST and the names are re-read
+    immediately before inserting; a partial unique index in init_db is the
+    backstop for the window that remains.
     """
     model_ids = _fetch_hub_models(fqdn, admin_token)
     by_provider: dict[str, list[str]] = {}
@@ -117,14 +129,31 @@ def _register_hub_catalog(
         logger.warning("hub catalog empty/unmappable; no model routes registered")
         return
 
-    all_routes = db.query(ModelRoute).all()
-    existing = {r.name for r in all_routes}
+    # ARM work first, OUTSIDE the read-modify-write window. Wiring each
+    # provider's API to its pool is idempotent and has nothing to do with the
+    # route rows; doing it between the read and the insert is what made the
+    # window wide enough to lose a race.
     provisioner = ApimProvisioner()
+    pool_ids = {
+        provider: provisioner.ensure_pooled_provider_api(provider)
+        for provider in by_provider
+    }
+
+    all_routes = db.query(ModelRoute).all()
+    # Scope the dedupe to PLATFORM routes. Matching on every route regardless of
+    # scope meant a tenant's BYO route silently suppressed the platform one for
+    # the same model name: the platform route was never created, so pooled
+    # traffic for that model had nowhere to go, and nothing logged a reason.
+    # The two are different objects with different backends and are allowed to
+    # coexist — which is also why the unique index in init_db is partial.
+    existing = {
+        r.name
+        for r in all_routes
+        if r.owner_scope == OwnerScope.PLATFORM and r.tenant_id is None
+    }
     created = 0
     for provider, models in by_provider.items():
-        # Wire the provider's API -> its pool once (idempotent). This is what
-        # makes the APIs appear under APIM > APIs.
-        pool_id = provisioner.ensure_pooled_provider_api(provider)
+        pool_id = pool_ids[provider]
         for mid in models:
             if mid in existing:
                 continue
@@ -152,7 +181,19 @@ def _register_hub_catalog(
                 db.delete(r)
                 removed += 1
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # The partial unique index on (name) for PLATFORM routes fired: another
+        # account's registration inserted the same model between our re-read and
+        # this commit. That is the race working as intended — the row exists,
+        # which is all we wanted — so roll back and carry on rather than failing
+        # a deploy over a duplicate we did not need to create.
+        db.rollback()
+        logger.info(
+            "hub catalog: concurrent registration won the race; routes already present"
+        )
+        return
     logger.info(
         "hub catalog: +%d new / -%d pruned model routes across %d providers (%s)",
         created,
