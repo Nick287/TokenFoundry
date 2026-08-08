@@ -39,6 +39,27 @@ class NotAuthenticatedError(RuntimeError):
     """Raised when no Copilot OAuth token is configured."""
 
 
+class UpstreamStatusError(RuntimeError):
+    """Upstream answered a STREAMING request with a non-200.
+
+    Subclasses RuntimeError because that is what `stream()` used to raise, so
+    any caller written against the old behaviour still catches it.
+
+    The status lives on the instance rather than only in the message. On the
+    streaming path the response status has already gone out to the client as
+    200 — `StreamingResponse` sends headers before the generator body runs — so
+    the upstream code is the ONLY remaining evidence of what happened, and
+    scraping it back out of a formatted string is not a basis for a billing
+    record. Recording 200 for a throttled call is exactly the bug this exists
+    to fix.
+    """
+
+    def __init__(self, status: int, body: str) -> None:
+        super().__init__(f"{status}: {body}")
+        self.status = status
+        self.body = body
+
+
 def _client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None:
@@ -268,6 +289,8 @@ async def stream(
     ) as resp:
         if resp.status_code != 200:
             body = await resp.aread()
-            raise RuntimeError(f"{resp.status_code}: {body.decode('utf-8', 'replace')}")
+            raise UpstreamStatusError(
+                resp.status_code, body.decode("utf-8", "replace")
+            )
         async for chunk in resp.aiter_bytes():
             yield chunk

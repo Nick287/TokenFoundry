@@ -26,8 +26,10 @@ request is emitted to Azure Event Hub (see `hub.eventhub`) carrying upstream's
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import uuid
 from datetime import UTC, datetime
@@ -42,6 +44,8 @@ from . import audit, eventhub, store
 from . import copilot_client as cc
 from . import image_client as ic
 from .config import get_settings
+
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="GitModel Hub", version="0.1.0")
 
@@ -68,6 +72,10 @@ def _startup() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    # Usage events scheduled by a streaming response's `finally` are ordinary
+    # background tasks; a rolling update must not race them. They feed BOTH
+    # closers below, so they are awaited first.
+    await drain_emits()
     # Flush whatever is still sitting in the Event Hub producer's buffer, so a
     # graceful stop (Container Apps rolling update, SIGTERM) loses no usage.
     await eventhub.aclose()
@@ -314,6 +322,119 @@ def _scan_sse_copilot_usage(text: str) -> dict[str, Any] | None:
     return found
 
 
+def _usage_record(
+    *, tenant, end_user, model, served, endpoint, usage3, streamed, estimated,
+    ts, audit_blob, status=200, cached=0, usage=None, copilot_usage=None,
+) -> dict[str, Any]:
+    """Build the Event Hub payload. PURE — no I/O, no awaits.
+
+    This dict is the billing contract with
+    `app/services/usage_capture_import.py::event_to_document`. Splitting it out
+    of `_emit_usage` makes that contract directly testable, and — the reason it
+    exists — lets the streaming paths build the record synchronously so they can
+    schedule the send from inside a `finally` (see `_spawn_emit`).
+    """
+    i, o, t = usage3
+    return {
+        "request_id": tenant["request_id"],
+        "ts": ts.isoformat(),
+        "subscription": tenant["subscription"],
+        "api_id": tenant["api_id"],
+        "client_key_fp": tenant["client_key_fp"],
+        "via_apim": bool(tenant["via_apim"]),
+        "end_user": end_user,
+        "model": model,
+        "served_model": served,
+        "endpoint": endpoint,
+        "streamed": streamed,
+        "status": status,
+        # Normalized counts, kept so the import side does not have to know
+        # each vendor's usage shape. `estimated` flags the streaming case
+        # where upstream omitted prompt_tokens and we guessed.
+        "input_tokens": i,
+        "output_tokens": o,
+        "total_tokens": t,
+        "cached_tokens": cached,
+        "estimated": estimated,
+        # Raw upstream payloads — the billing source of truth.
+        "usage": usage,
+        "copilot_usage": copilot_usage,
+        # Pointer into the audit archive, or None when the tenant did not
+        # opt in. A promise, not a receipt: see audit.submit.
+        "audit_blob": audit_blob,
+    }
+
+
+def _archive(tenant, *, ts, end_user, model, endpoint, streamed, status,
+             req_body, resp_body) -> str | None:
+    """Trigger raw-body archival for tenants that opted in. Synchronous:
+    `audit.submit` returns the blob path without waiting for the upload."""
+    if not tenant.get("audit"):
+        return None
+    return audit.submit(
+        request_id=tenant["request_id"],
+        ts=ts,
+        subscription=tenant["subscription"],
+        api_id=tenant["api_id"],
+        end_user=end_user,
+        model=model,
+        endpoint=endpoint,
+        streamed=streamed,
+        status=status,
+        request_body=req_body,
+        response_body=resp_body,
+    )
+
+
+# Usage sends scheduled from a streaming response's `finally`. They are ordinary
+# background tasks, so a rolling update must await them — see `drain_emits`.
+_PENDING_EMITS: set[asyncio.Task[None]] = set()
+_MAX_PENDING_EMITS = 256
+
+
+def _spawn_emit(*, req_body=None, resp_body=None, **kw) -> None:
+    """Schedule one usage event WITHOUT awaiting. Never raises.
+
+    Safe to call from an async generator's `finally`, which is the entire point.
+    On client disconnect Starlette throws `GeneratorExit` at the `yield`; an
+    `await` in the `finally` then raises "async generator ignored
+    GeneratorExit", losing the billing event for exactly those requests that
+    were interrupted — silently, with no counter. Everything here is
+    synchronous: `audit.submit` already is, and `create_task` does not suspend.
+
+    `StreamingResponse(background=...)` looks like the obvious alternative and
+    is not: on the ASGI>=2.4 disconnect path Starlette raises `ClientDisconnect`
+    and never awaits the background task.
+
+    The record is built here rather than inside the task so a pending emit holds
+    ~1 KB instead of pinning the whole SSE transcript in memory.
+    """
+    try:
+        ts = datetime.now(UTC)  # stamped NOW, not whenever the task gets to run
+        audit_blob = _archive(
+            kw["tenant"], ts=ts, end_user=kw.get("end_user"), model=kw.get("model"),
+            endpoint=kw.get("endpoint"), streamed=kw.get("streamed", False),
+            status=kw.get("status", 200), req_body=req_body, resp_body=resp_body,
+        )
+        record = _usage_record(ts=ts, audit_blob=audit_blob, **kw)
+        if len(_PENDING_EMITS) >= _MAX_PENDING_EMITS:
+            eventhub.record_drop("saturated", f"{len(_PENDING_EMITS)} emits in flight")
+            log.warning("usage emit saturated (%d in flight); dropping", len(_PENDING_EMITS))
+            return
+        task = asyncio.create_task(eventhub.emit(record))
+        _PENDING_EMITS.add(task)
+        task.add_done_callback(_PENDING_EMITS.discard)
+    except Exception as exc:  # noqa: BLE001 — a raise here would propagate out of
+        eventhub.record_drop("schedule", exc)  # the finally and mask the real error
+        log.warning("could not schedule usage event: %s", exc)
+
+
+async def drain_emits() -> None:
+    """Await every scheduled emit. Called from shutdown; also the test seam."""
+    if _PENDING_EMITS:
+        await asyncio.gather(*list(_PENDING_EMITS), return_exceptions=True)
+
+
 async def _emit_usage(
     *, tenant, end_user, model, served, endpoint, usage3, streamed, estimated,
     status=200, cached=0, usage=None, copilot_usage=None,
@@ -321,58 +442,54 @@ async def _emit_usage(
 ) -> None:
     """Ship one completed request to Event Hub. Never raises (see `eventhub`).
 
-    Also the single place raw-body archival is triggered, so the six call sites
-    do not each have to remember it. `audit.submit` returns the blob path
-    without waiting for the upload, so the archive costs the request path
-    nothing but adds a pointer to the usage record.
+    Used by the NON-streaming call sites, which can safely await. The streaming
+    ones go through `_spawn_emit` instead.
     """
-    i, o, t = usage3
     ts = datetime.now(UTC)
-    audit_blob = None
-    if tenant.get("audit"):
-        audit_blob = audit.submit(
-            request_id=tenant["request_id"],
-            ts=ts,
-            subscription=tenant["subscription"],
-            api_id=tenant["api_id"],
-            end_user=end_user,
-            model=model,
-            endpoint=endpoint,
-            streamed=streamed,
-            status=status,
-            request_body=req_body,
-            response_body=resp_body,
-        )
-    await eventhub.emit(
-        {
-            "request_id": tenant["request_id"],
-            "ts": ts.isoformat(),
-            "subscription": tenant["subscription"],
-            "api_id": tenant["api_id"],
-            "client_key_fp": tenant["client_key_fp"],
-            "via_apim": bool(tenant["via_apim"]),
-            "end_user": end_user,
-            "model": model,
-            "served_model": served,
-            "endpoint": endpoint,
-            "streamed": streamed,
-            "status": status,
-            # Normalized counts, kept so the import side does not have to know
-            # each vendor's usage shape. `estimated` flags the streaming case
-            # where upstream omitted prompt_tokens and we guessed.
-            "input_tokens": i,
-            "output_tokens": o,
-            "total_tokens": t,
-            "cached_tokens": cached,
-            "estimated": estimated,
-            # Raw upstream payloads — the billing source of truth.
-            "usage": usage,
-            "copilot_usage": copilot_usage,
-            # Pointer into the audit archive, or None when the tenant did not
-            # opt in. A promise, not a receipt: see audit.submit.
-            "audit_blob": audit_blob,
-        }
+    audit_blob = _archive(
+        tenant, ts=ts, end_user=end_user, model=model, endpoint=endpoint,
+        streamed=streamed, status=status, req_body=req_body, resp_body=resp_body,
     )
+    await eventhub.emit(
+        _usage_record(
+            tenant=tenant, end_user=end_user, model=model, served=served,
+            endpoint=endpoint, usage3=usage3, streamed=streamed,
+            estimated=estimated, ts=ts, audit_blob=audit_blob, status=status,
+            cached=cached, usage=usage, copilot_usage=copilot_usage,
+        )
+    )
+
+
+def _sse_error(status: int, body: str) -> bytes:
+    """One SSE `error` event, for an upstream failure discovered mid-stream.
+
+    On the streaming path there is no status code left to fail with:
+    `StreamingResponse` puts `200 OK` and its headers on the wire before the
+    generator body runs, and the first call upstream happens inside that body.
+    When upstream then answers 429, the only honest thing still available is an
+    in-band event — which is also what the OpenAI API does.
+
+    Without this the client observes a 200 with an empty stream and no way to
+    distinguish "throttled, retry" from "the model produced nothing". During the
+    dev-17 campaign that happened 58 times and every dashboard read them as
+    successes.
+
+    The upstream body is truncated: it is an error payload, not content, and it
+    is going to a client that only needs to know what happened and whether to
+    retry.
+    """
+    payload = {
+        "error": {
+            "message": f"upstream returned {status}",
+            "type": "upstream_error",
+            "code": status,
+            "upstream": body[:500],
+        }
+    }
+    return (
+        f"data: {json.dumps(payload)}\n\n"
+        "data: [DONE]\n\n"
+    ).encode("utf-8")
 
 
 def _standardize_openai_usage_line(line: str) -> str:
@@ -461,14 +578,27 @@ def _parse_sse_usage(text: str, *, responses_shape: bool) -> dict[str, Any] | No
 
 
 def _parse_anthropic_sse_usage(text: str) -> dict[str, Any]:
-    """Collect the final usage from a native Anthropic SSE stream.
+    """Collect the final usage from a native Anthropic SSE stream, VERBATIM.
 
     Anthropic reports input_tokens on `message_start` and the final output_tokens
-    on `message_delta`, so we merge across events. Unlike the old OpenAI->Anthropic
-    conversion, this reads Copilot's NATIVE Anthropic usage — input_tokens is a
-    real value, not 0/estimate. Returns {input_tokens, output_tokens,
-    cache_read_input_tokens} (zeros if absent)."""
-    merged: dict[str, int] = {}
+    on `message_delta`, so the object has to be merged across events rather than
+    taken from the last one.
+
+    Merges EVERY key, not a three-key allowlist. The allowlist silently dropped
+    `cache_creation_input_tokens` — Anthropic's cache-WRITE count, billed at
+    1.25x input, the single most expensive token type on Opus — along with the
+    `cache_creation` 5m/1h split, `output_tokens_details` (thinking tokens),
+    `inference_geo` and `speed`. Verified on dev-15: 78/78 non-streamed
+    Anthropic rows carried those fields and 0/51 streamed ones did, so a
+    streamed call could not satisfy
+    `tests/test_usage_parse.py::test_anthropic_total_includes_cache_creation`.
+    Costs were unaffected (money comes from `copilot_usage`), but the raw
+    archive was lossy and those fields exist only in that one response.
+
+    The three canonical counters are guaranteed present because the call site
+    subscripts them; everything else rides along as upstream sent it.
+    """
+    merged: dict[str, Any] = {}
     for line in text.split("\n"):
         line = line.strip()
         if not line.startswith("data:"):
@@ -483,14 +613,19 @@ def _parse_anthropic_sse_usage(text: str) -> dict[str, Any]:
         # message_start carries usage under .message.usage; message_delta under .usage
         u = (obj.get("message") or {}).get("usage") or obj.get("usage")
         if isinstance(u, dict):
-            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
-                v = u.get(k)
-                if isinstance(v, int) and v:
-                    merged[k] = v
+            for k, v in u.items():
+                # A later 0/empty must not erase an earlier real value:
+                # message_delta re-reports some fields as 0. This preserves the
+                # old `if isinstance(v, int) and v` semantics while generalising
+                # it to non-numeric fields.
+                if k in merged and not v:
+                    continue
+                merged[k] = v
     return {
-        "input_tokens": merged.get("input_tokens", 0),
-        "output_tokens": merged.get("output_tokens", 0),
-        "cache_read_input_tokens": merged.get("cache_read_input_tokens", 0),
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        **merged,
     }
 
 
@@ -592,6 +727,11 @@ async def _passthrough(
 
     async def gen() -> AsyncIterator[bytes]:
         collected: list[str] = []
+        # The status this call is RECORDED under. Not the status the client saw
+        # — that went out as 200 before this generator started — but what
+        # actually happened, which is what the billing ledger and the portal's
+        # succeeded/failed split need.
+        upstream_status = 200
         # SSE events are line-delimited but cc.stream yields raw BYTE chunks that
         # may split a line mid-way; buffer text and only rewrite COMPLETE events
         # (terminated by a blank line) so _standardize_openai_usage_line always
@@ -616,21 +756,49 @@ async def _passthrough(
                 while "\n\n" in buf:
                     event, buf = buf.split("\n\n", 1)
                     yield _emit(event) + b"\n\n"
-        finally:
+            # NORMAL completion only. This tail flush used to live in the
+            # `finally`, where a `yield` during GeneratorExit raises "async
+            # generator ignored GeneratorExit" and kills the finally BEFORE the
+            # usage emit runs — losing the billing event for every interrupted
+            # request. Accounting is unaffected by the move: it reads
+            # `collected`, which already holds these bytes.
             if buf:
                 yield _emit(buf)
+        except cc.UpstreamStatusError as exc:
+            # Upstream refused AFTER we had already committed to 200. Yielding
+            # is legal here (an ordinary exception, unlike GeneratorExit), so
+            # the client gets a real signal instead of an empty stream. Not
+            # re-raised: a clean SSE error reads better at the client than an
+            # aborted connection, and the failure is recorded below either way.
+            upstream_status = exc.status
+            log.warning("upstream %s on streamed %s: %s",
+                        exc.status, endpoint, exc.body[:200])
+            yield _sse_error(exc.status, exc.body)
+        finally:
+            # Synchronous only — no await, no yield. See _spawn_emit.
             raw = "".join(collected)
             usage = _parse_sse_usage(raw, responses_shape=responses_shape)
             i, o, t, cached = _norm_usage(usage, responses_shape=responses_shape)
-            # Backend often omits prompt_tokens on streams — estimate input.
-            input_estimated = not i
+            # Estimate the prompt ONLY if the stream actually delivered
+            # something. When upstream refused, nothing was consumed and
+            # nothing should be billed — substituting `est_input` there
+            # manufactures billable input for a call that returned no content,
+            # which is what dev-17 recorded 58 times (status 200, in=10, out=0).
+            # The non-streaming path has always written (0, 0, 0) on a non-200;
+            # this makes streaming agree with it.
+            got_content = bool(collected)
+            input_estimated = got_content and not i
             if input_estimated:
                 i = est_input
                 t = i + o
-            await _emit_usage(
+            _spawn_emit(
                 tenant=tenant, end_user=end_user, model=model, served=None,
                 endpoint=endpoint, usage3=(i, o, t), streamed=True,
-                estimated=usage is None or input_estimated, cached=cached,
+                # (0, 0, 0) after an upstream refusal is a measurement, not an
+                # estimate — flagging it as estimated would hide a real failure
+                # behind "we guessed".
+                estimated=got_content and (usage is None or input_estimated),
+                cached=cached, status=upstream_status,
                 usage=usage, copilot_usage=_scan_sse_copilot_usage(raw),
                 req_body=body, resp_body=raw,
             )
@@ -823,18 +991,32 @@ async def v1_messages(request: Request) -> Any:
     # off the stream (input_tokens is real, on message_start) for accounting.
     async def gen() -> AsyncIterator[bytes]:
         collected: list[str] = []
+        upstream_status = 200
         try:
             async for chunk in cc.stream("/v1/messages", req, headers):
                 collected.append(chunk.decode("utf-8", "replace"))
                 yield chunk
+        except cc.UpstreamStatusError as exc:
+            # Same shape as the OpenAI generator: the 200 is already sent, so
+            # the refusal can only be delivered in-band, and it must be RECORDED
+            # as the upstream status rather than as a success.
+            upstream_status = exc.status
+            log.warning("upstream %s on streamed messages: %s",
+                        exc.status, exc.body[:200])
+            yield _sse_error(exc.status, exc.body)
         finally:
+            # Synchronous only — no await, no yield. See _spawn_emit: awaiting
+            # here loses the event whenever the client disconnects mid-stream.
             raw = "".join(collected)
             u = _parse_anthropic_sse_usage(raw)
             i, o = u["input_tokens"], u["output_tokens"]
-            await _emit_usage(
+            _spawn_emit(
                 tenant=tenant, end_user=end_user, model=model, served=None,
                 endpoint="messages", usage3=(i, o, i + o), streamed=True,
-                estimated=not i, cached=u["cache_read_input_tokens"],
+                # Nothing delivered means nothing measured, not something
+                # guessed — see the OpenAI generator for why this matters.
+                estimated=bool(collected) and not i,
+                cached=u["cache_read_input_tokens"], status=upstream_status,
                 usage=u, copilot_usage=_scan_sse_copilot_usage(raw),
                 req_body=req, resp_body=raw,
             )
@@ -894,14 +1076,22 @@ async def api_status() -> dict[str, Any]:
     return {
         "logged_in": cc.is_authenticated(),
         "require_auth": store.get_require_auth(get_settings().require_auth),
-        # Usage events the hub could not hand to Event Hub since process start.
-        # The billing feed fails silently by design (serving must not break), so
-        # this counter is the only signal that it is broken — alert on it.
+        # Failed HAND-OFFS since process start. An upper bound on loss, not the
+        # loss itself: one event that fails three times counts 3. Unchanged key
+        # and meaning so existing alerts keep working.
         "usage_events_dropped": eventhub.dropped_count(),
+        # Events given up on for good, counted once each. THIS is the
+        # billing-data-is-gone number and the one to alert on.
+        "usage_events_lost": eventhub.lost_count(),
         # Audit payloads that never reached the archive. A usage record can
         # carry an `audit_blob` pointer to a blob that failed to upload, so a
         # non-zero value here means some pointers dangle.
         "audit_payloads_dropped": audit.dropped_count(),
+        # Breakdown by cause + the last few failure reasons, so the NEXT
+        # incident says which path broke without needing log collection (the
+        # hub's Container App Environment has no log destination configured).
+        # Exception CLASS NAMES only — this route is unauthenticated.
+        "usage_events": eventhub.stats(),
     }
 
 

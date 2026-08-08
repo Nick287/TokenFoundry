@@ -63,6 +63,16 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    if v is None or not v.strip():
+        return default
+    try:
+        return float(v.strip())
+    except ValueError:
+        return default
+
+
 class Settings:
     """Hub settings resolved from the environment."""
 
@@ -142,11 +152,32 @@ class Settings:
         # Buffered-producer tuning. `max_wait_time` bounds how long an event
         # sits in the SDK buffer before being flushed — it is also the data-loss
         # window if the instance is killed ungracefully (a graceful shutdown
-        # flushes). `max_buffer_length` bounds memory; past it the SDK invokes
-        # the error callback and the event is dropped rather than blocking the
-        # request path.
+        # flushes). `max_buffer_length` bounds memory.
+        #
+        # CORRECTION: an earlier comment here claimed that past the buffer limit
+        # "the SDK invokes the error callback and the event is dropped rather
+        # than blocking the request path". That is not what buffered mode does —
+        # `send_event()` WAITS for buffer space. Without an explicit timeout a
+        # stalled namespace therefore blocks the request path, which is the
+        # opposite of the promise in eventhub.py's docstring. Hence
+        # `eventhub_send_timeout_seconds` below, which is passed on every send.
         self.eventhub_max_wait_seconds = _int("TF_EVENTHUB_MAX_WAIT_SECONDS", 5)
         self.eventhub_max_buffer = _int("TF_EVENTHUB_MAX_BUFFER", 5000)
+
+        # Retry of events the broker would not take. Kept in memory only: the
+        # hub is deliberately stateless (see infra/main.tf — SQLite lives in
+        # /tmp), so this buys recovery from a transient outage, not durability
+        # across an ungraceful kill.
+        #
+        # Sizing: a usage record carries `usage`/`copilot_usage` but NOT the
+        # request/response bodies (those go to hub.audit), so ~1-2 KB each;
+        # 1000 items is a couple of MB worst case. Six attempts with 2s
+        # exponential backoff capped at 60s covers roughly two minutes of
+        # outage, after which an event is given up on and counted as lost.
+        self.eventhub_send_timeout_seconds = _float("TF_EVENTHUB_SEND_TIMEOUT_SECONDS", 5.0)
+        self.eventhub_retry_max_queue = _int("TF_EVENTHUB_RETRY_MAX_QUEUE", 1000)
+        self.eventhub_retry_max_attempts = _int("TF_EVENTHUB_RETRY_MAX_ATTEMPTS", 6)
+        self.eventhub_retry_base_seconds = _float("TF_EVENTHUB_RETRY_BASE_SECONDS", 2.0)
 
         # Audit archive — raw request/response bodies for tenants that opted in
         # (APIM stamps `x-tf-audit`). Deliberately a DIFFERENT storage account
