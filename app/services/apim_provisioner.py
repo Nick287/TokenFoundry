@@ -473,12 +473,12 @@ class ApimProvisioner:
             except (ResourceNotFoundError, HttpResponseError) as exc:
                 logger.warning("link %s to product %s skipped: %s", cfg["api_id"], product_id, exc)
 
-        # Turn on API-level LLM logging so token + prompts/completions for THIS
-        # dynamically-created API land in ApiManagementGatewayLlmLog (the billing
-        # source of truth). This is the real switch — the APIM-level diagnostic
-        # setting (terraform) only routes the category to the workspace; without
-        # this per-API diagnostic no token rows are recorded (verified a05
-        # 2026-07-10). Best-effort: a diagnostic failure must not abort a deploy.
+        # Pin this API's diagnostic so custom metrics keep flowing. An API-level
+        # diagnostic overrides the service-level one, so an API created without
+        # it silently loses metrics=true and its customMetrics go empty
+        # (verified a05 2026-07-10). It no longer enables LLM message logging —
+        # see _ensure_api_llm_diagnostic for why that was removed. Best-effort:
+        # a diagnostic failure must not abort a deploy.
         self._ensure_api_llm_diagnostic(cfg["api_id"])
 
     @staticmethod
@@ -988,16 +988,32 @@ class ApimProvisioner:
         return DefaultAzureCredential().get_token("https://management.azure.com/.default").token
 
     def _ensure_api_llm_diagnostic(self, api_id: str) -> None:
-        """Enable API-level `largeLanguageModel` logging on this API's
-        applicationinsights diagnostic, so token counts + prompts/completions
-        for LLM calls land in the dedicated ApiManagementGatewayLlmLog table.
+        """Pin this API's applicationinsights diagnostic so custom metrics survive.
 
-        Uses raw ARM REST (the SDK DiagnosticContract lacks the preview
-        largeLanguageModel field). Idempotent plain PUT. loggerId hardcodes the
-        'appinsights' logger (matches the terraform/bicep logger name). The
-        diagnostic id 'applicationinsights' matches the existing service-level
-        diagnostic name — API scope and service scope are distinct, so same name
-        does not conflict. Best-effort: a failure here must not abort a deploy."""
+        This exists ONLY to keep `metrics: true` in force at API scope. It used
+        to also switch on `largeLanguageModel` message capture, which fed the
+        ApiManagementGatewayLlmLog table; that is gone — the table's token
+        counts turned out to use a different prompt basis per provider (claude
+        excluded cache reads, gpt-5.4-mini included them, with no column saying
+        which), so nothing could be billed from it, and the full prompts and
+        completions it stored for non-streamed calls were captured for every
+        tenant regardless of the per-tenant audit switch. The collector is off
+        in terraform too, so this would now write content nobody reads.
+
+        The remaining `metrics: true` is load-bearing and easy to delete by
+        mistake: an API-level diagnostic OVERRIDES the service-level one for
+        this API. The service diagnostic sets metrics=true, which is what lets
+        llm-emit-token-metric write token counts (incl. Prompt Cached Tokens) to
+        App Insights customMetrics. An API-level diagnostic that omits metrics
+        overrides that to off and SILENTLY KILLS customMetrics for this API.
+        Root-caused on dev-a05 (2026-07-10). If this method is ever deleted
+        outright, delete the API-level diagnostic with it — do not leave one
+        behind without metrics.
+
+        Uses raw ARM REST (the SDK DiagnosticContract lacks these preview
+        fields). Idempotent plain PUT. Best-effort: a failure must not abort a
+        deploy.
+        """
         base = (
             f"https://management.azure.com/subscriptions/{self._sub_id}"
             f"/resourceGroups/{self._rg}/providers/Microsoft.ApiManagement"
@@ -1011,24 +1027,7 @@ class ApimProvisioner:
         body = {
             "properties": {
                 "loggerId": logger_id,
-                # metrics=True is CRITICAL and easy to miss: an API-level diagnostic
-                # OVERRIDES the service-level one for this API. The service diagnostic
-                # sets metrics=true (so llm-emit-token-metric writes token counts —
-                # incl. the Prompt Cached Tokens dimension — to App Insights
-                # customMetrics). If this API-level diagnostic omits metrics, it
-                # overrides that to metrics=off and SILENTLY KILLS customMetrics for
-                # this API — while LlmLog keeps working, so it looks fine until you
-                # notice the customMetrics token breakdown (and cached) went empty.
-                # Root-caused on dev-a05 (2026-07-10): adding largeLanguageModel here
-                # without metrics stopped customMetrics the moment it was applied.
-                # Setting both lets emit-token-metric (customMetrics/cached) AND the
-                # LlmLog table coexist on the same API.
                 "metrics": True,
-                "largeLanguageModel": {
-                    "logs": "enabled",
-                    "requests": {"messages": "all", "maxSizeInBytes": 32768},
-                    "responses": {"messages": "all", "maxSizeInBytes": 32768},
-                },
             }
         }
         try:
@@ -1036,9 +1035,9 @@ class ApimProvisioner:
             with httpx.Client(timeout=30.0) as hc:
                 r = hc.put(url, headers=headers, json=body)
                 r.raise_for_status()
-            logger.info("LLM diagnostic enabled on API %s", api_id)
+            logger.info("API diagnostic pinned (metrics on, LLM logging off) on %s", api_id)
         except (httpx.HTTPError, HttpResponseError) as exc:
-            logger.warning("LLM diagnostic on API %s skipped: %s", api_id, exc)
+            logger.warning("API diagnostic on %s skipped: %s", api_id, exc)
 
     def _backend_base(self) -> str:
         return (
@@ -1078,12 +1077,48 @@ class ApimProvisioner:
         """Remove a hub's backends from the 3 pools and delete them. Idempotent."""
         for provider in ("openai", "anthropic", "google"):
             be_id = f"llm-{provider}-{account_id}"
-            self._pool_remove_service(f"llm-{provider}-pool", be_id)
+            self._pool_remove_service(f"llm-{provider}-pool", be_id, provider=provider)
             self.remove_backend(be_id)
         # Delete any extra recorded backends not covered by the naming scheme.
         for be_id in backend_ids or []:
             if not be_id.endswith(account_id):
                 self.remove_backend(be_id)
+
+    def _detach_api_policy(self, provider: str) -> None:
+        """Delete the provider API's inbound policy so its pool can be deleted.
+
+        ARM refuses to delete a backend that a policy references:
+
+            ValidationError: Backend 'llm-openai-pool' is used by the following
+            entities: /apis/llm-openai;rev=1/policies/policy
+
+        and the policy ALWAYS references the pool — `<set-backend-service
+        backend-id="llm-<provider>-pool"/>` is how routing works. So removing
+        the last hub of a provider could never succeed: pool-delete was the only
+        legal move (ARM rejects an empty services[]) and it was blocked.
+
+        This is the missing half of the inverse. Account creation does:
+            add_hub_to_pools        -> creates the pool
+            ensure_pooled_provider_api -> creates the API + policy -> pool
+        Teardown undid only the first. Undoing the second in the opposite order
+        (policy, then pool) is what makes the two symmetric.
+
+        Only the POLICY is deleted, not the API: it is the minimum that lifts the
+        ARM constraint, so a later failure destroys as little as possible. The
+        next account re-puts it via `_ensure_api_and_ops`, which is why leaving
+        the API in place is safe — and why a policy naming a not-yet-existing
+        pool is fine, since that is already the order on a fresh environment
+        (pool at step 3, policy at step 4).
+        """
+        cfg = PROVIDER_APIS.get(provider)
+        if not cfg:
+            return
+        try:
+            self.client.api_policy.delete(
+                self._rg, self._service, cfg["api_id"], "policy", if_match="*"
+            )
+        except ResourceNotFoundError:
+            pass  # already gone — the desired end state either way
 
     def _pool_add_service(self, pool_id: str, backend_id: str) -> None:
         """GET pool -> append backend to services[] (preserving sessionAffinity)
@@ -1159,7 +1194,9 @@ class ApimProvisioner:
             response=resp,
         )
 
-    def _pool_remove_service(self, pool_id: str, backend_id: str) -> None:
+    def _pool_remove_service(
+        self, pool_id: str, backend_id: str, provider: str | None = None
+    ) -> None:
         """GET pool -> drop backend from services[] -> PUT. No-op if pool or
         member is absent.
 
@@ -1203,6 +1240,12 @@ class ApimProvisioner:
                 return  # not a member — idempotent
             etag = r.headers.get("ETag") or "*"
             if not kept:
+                # The API policy references this pool, and ARM will not delete a
+                # referenced backend. Drop the policy first; the next account
+                # re-puts it. Without this the delete is a guaranteed 400 —
+                # which is exactly what dev-16 hit on its last hub.
+                if provider:
+                    self._detach_api_policy(provider)
                 dr = hc.delete(url, headers={**headers, "If-Match": etag})
                 # 404 = someone else got there first; still the desired end state.
                 if dr.status_code != 404:
