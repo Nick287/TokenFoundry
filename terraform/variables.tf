@@ -108,36 +108,49 @@ variable "apim_sku" {
 # point a different fork/org at the same control plane.
 variable "cosmos_throughput_rus" {
   description = <<-EOT
-    Manual provisioned RU/s on the Cosmos `usage` container. 0 = serverless.
+    Manual provisioned RU/s on the Cosmos `usage` container. 0 = serverless,
+    which is the default and is the right answer for anything short of very
+    high, very SMOOTH volume.
 
-    Break-even is utilisation, not volume-for-its-own-sake: provisioned is
-    $0.0222 per million RU vs serverless $0.285 — 12.8x — so provisioned wins
-    above roughly 8% utilisation. At the 400 RU/s minimum that is about 8M
-    calls/month. See docs/PRICING.zh.md.
+    The obvious arithmetic says otherwise and is wrong. Provisioned is $0.0222
+    per million RU against serverless's $0.285 — 12.8x cheaper per RU — so
+    provisioned looks like it wins above ~8% utilisation, about 8.2M calls/month
+    at the 400 RU/s minimum. dev-18 was built that way to test it, and the
+    figure collapses on contact:
 
-    WARNING: 400 is enough for STEADY-STATE writes only. dev-18 measured 8%
-    utilisation during a smoke test and 100% — saturated for 45+ minutes, 2,236
-    throttled requests — the moment a load test started. That break-even counts
-    writes (~10 RU per call) and misses three things: the importer writes in
-    300-second bursts rather than smoothly, a cross-partition aggregate costs up
-    to 5,000 RU (12.5 seconds of a 400 RU/s budget in ONE query), and the portal
-    polls. Serverless has no ceiling to hit, which is why four earlier campaigns
-    never surfaced this. Nothing was lost — the SDK retries 429 — but import
-    latency stretched badly. For load testing or heavy dashboard use, raise this
-    to 1000+ or switch to autoscale. See docs/CAPACITY.zh.md §7.6.
+      * 8.2M calls/month is ~32 RU/s on average.
+      * The dev-18 campaign averaged 33 RU/s — the same load — and Cosmos
+        throttled it 2,904 times, sitting at 100% of the 400 RU/s ceiling for
+        45 minutes straight.
 
-    Changing this on a LIVE environment does not work and terraform will not
-    warn you: azurerm treats the account's `capabilities` as computed, so
-    removing `EnableServerless` produces no diff, the plan shows only a benign
-    container update, and the apply then fails on Azure's side. Set it at
-    environment-creation time. (Verified on dev-17.)
+    So the volume at which provisioned-400 becomes cheaper is already the volume
+    at which provisioned-400 does not work. Clearing it means 1000+ RU/s, which
+    pushes break-even out past ~20M calls/month.
 
-    The default is 400 (provisioned) so that the NEXT environment is built the
-    way a production one should be. An environment that already exists as
-    serverless must pin `cosmos_throughput_rus = 0` in its tfvars — dev-17 does.
+    The cause is SHAPE, not size. Peak demand over a whole minute was 255 RU/s,
+    comfortably under 400 — but Cosmos enforces per second, and this workload is
+    spiky by construction: the importer flushes a whole Capture blob at once
+    every 300s, and one cross-partition aggregate costs up to 5,000 RU, i.e.
+    12.5 seconds of a 400 RU/s budget in a SINGLE query. Serverless has no
+    ceiling to hit, which is why four earlier campaigns never surfaced any of
+    this.
+
+    Nothing was lost either way — the importer only advances its watermark after
+    a whole blob is in, and the SDK retries 429 — so the cost of getting this
+    wrong is import latency, not billing gaps.
+
+    Set a value here only for genuinely high, genuinely steady traffic, and size
+    it for the spikes rather than the average.
+
+    NOTE: this is a CREATION-TIME choice and terraform will not warn you
+    otherwise. azurerm treats the account's `capabilities` as computed, so
+    removing `EnableServerless` produces no diff at all — the plan shows a
+    benign container update and the apply then fails on Azure's side (verified
+    on dev-17). An environment already built the other way must pin its value
+    here: dev-18 pins 400 because that is what it was created with.
   EOT
   type        = number
-  default     = 400
+  default     = 0
 }
 
 variable "github_repo_owner" {

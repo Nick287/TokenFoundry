@@ -9,16 +9,28 @@ variable "suffix" { type = string }
 
 variable "throughput_rus" {
   description = <<-EOT
-    Manual provisioned RU/s on the `usage` container. 0 = serverless.
+    Manual provisioned RU/s on the `usage` container. 0 = serverless (default).
 
-    WHICH TO PICK is a utilisation question, not a preference. Provisioned works
-    out to $0.0222 per million RU (`$0.008/hour per 100 RU/s`, southeastasia);
-    serverless is $0.285 per million RU — 12.8x more. So provisioned wins above
-    roughly 8% utilisation of whatever you provision, and loses below it.
+    WHICH TO PICK looks like a utilisation question and is really a burstiness
+    question. Provisioned works out to $0.0222 per million RU ($0.008/hour per
+    100 RU/s, southeastasia) against serverless's $0.285 — 12.8x cheaper per RU
+    — which suggests provisioned wins above ~8% utilisation, about 8.2M
+    calls/month at the 400 RU/s minimum.
 
-    At 400 RU/s (the per-container minimum) that break-even is about 8M calls
-    per month. Below that, serverless is both cheaper AND has no capacity to
-    manage; above it, provisioned pulls ahead and keeps pulling.
+    dev-18 was built provisioned to test that, and it does not hold. 8.2M
+    calls/month is ~32 RU/s averaged; the dev-18 campaign ran at 33 RU/s
+    averaged and was throttled 2,904 times, pinned at 100% of the ceiling for 45
+    minutes. The break-even volume is already past what 400 RU/s can serve.
+
+    Peak demand across a whole minute was only 255 RU/s — under the limit — but
+    Cosmos enforces per second and this workload is spiky by construction: the
+    importer flushes an entire Capture blob in one go every 300s, and a single
+    cross-partition aggregate can cost 5,000 RU, which is 12.5 seconds of a
+    400 RU/s budget in ONE query. Serverless has no ceiling to hit.
+
+    Nothing is lost when it throttles — the importer only advances its watermark
+    once a whole blob is in, and the SDK retries 429 — so the price of choosing
+    wrong is import latency, not a billing gap.
 
     WARNING: this is NOT a live switch, and terraform's plan does NOT say so.
 
@@ -37,7 +49,7 @@ variable "throughput_rus" {
     documents to a new account.
   EOT
   type        = number
-  default     = 400
+  default     = 0
 
   validation {
     # 400 RU/s is the Azure minimum for a container with manual throughput;
