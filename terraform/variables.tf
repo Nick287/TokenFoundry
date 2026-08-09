@@ -115,6 +115,17 @@ variable "cosmos_throughput_rus" {
     above roughly 8% utilisation. At the 400 RU/s minimum that is about 8M
     calls/month. See docs/PRICING.zh.md.
 
+    WARNING: 400 is enough for STEADY-STATE writes only. dev-18 measured 8%
+    utilisation during a smoke test and 100% — saturated for 45+ minutes, 2,236
+    throttled requests — the moment a load test started. That break-even counts
+    writes (~10 RU per call) and misses three things: the importer writes in
+    300-second bursts rather than smoothly, a cross-partition aggregate costs up
+    to 5,000 RU (12.5 seconds of a 400 RU/s budget in ONE query), and the portal
+    polls. Serverless has no ceiling to hit, which is why four earlier campaigns
+    never surfaced this. Nothing was lost — the SDK retries 429 — but import
+    latency stretched badly. For load testing or heavy dashboard use, raise this
+    to 1000+ or switch to autoscale. See docs/CAPACITY.zh.md §7.6.
+
     Changing this on a LIVE environment does not work and terraform will not
     warn you: azurerm treats the account's `capabilities` as computed, so
     removing `EnableServerless` produces no diff, the plan shows only a benign

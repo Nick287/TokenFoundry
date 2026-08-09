@@ -24,13 +24,24 @@ The four sources and what each can and cannot see:
 
 CLOSURE, and why it is not "all four numbers are equal":
 
-    gateway 200            == cosmos_with_tokens + Σ hub lost
-    cosmos zero-token docs == gateway 429 + gateway 4xx
+    gateway 200+429+4xx == cosmos documents + Σ hub lost
+    gateway 503         produce no document at all
 
 A 503 never reaches a hub (the breaker is in the gateway), so it produces no
-document at all. A 429 or an upstream 400 DOES reach a hub, which emits an event
-with no tokens and no cost. Treating those as errors in the ledger would be
-wrong twice over: the call happened, and it cost nothing.
+document. A 429 or an upstream 400 DOES reach a hub, which emits an event with
+no tokens and no cost. Treating those as errors in the ledger would be wrong
+twice over: the call happened, and it cost nothing.
+
+The earlier form paired `gateway 200` against `cosmos_with_tokens` and
+`cosmos zero-token` against `gateway 429+4xx`. That held only while every
+zero-token document had a matching gateway rejection — true before streaming
+refusals were recorded honestly. `StreamingResponse` commits 200 before the
+generator contacts upstream, so a refusal there is logged 200 by the gateway
+and stored with the upstream status and zero tokens by the hub. On dev-18 that
+made both old identities miss by exactly 34 in OPPOSITE directions while the
+total was exact — the signature of a stale model rather than of lost data.
+Closing on total documents is invariant to where in the request the refusal
+landed.
 
 WINDOWS. Both sides are pinned to the same absolute UTC bounds. Cosmos is paged
 and bucketed client-side rather than asked for `hours=N`, because `hours` is
@@ -364,25 +375,49 @@ def main() -> int:
         print("  SKIPPED — the gateway side is unavailable, so nothing can be closed.")
         print("  Set TF_APP_INSIGHTS_ID and run `az login` to make this meaningful.")
     else:
-        lhs = gw["ok"]
-        rhs = cos["with_tokens"] + total_lost
-        print(f"  gateway 200 ({lhs}) == cosmos with-tokens ({cos['with_tokens']}) "
-              f"+ Σ hub lost ({total_lost}) = {rhs}")
-        if lhs == rhs:
-            print("  ✅ billing ledger closes")
+        # The ledger closes on TOTAL documents, not on the served ones alone.
+        #
+        # The original form was `gateway 200 == cosmos with-tokens + hub lost`,
+        # which held only while every zero-token document came from a call the
+        # GATEWAY had also rejected. Streaming broke that symmetry: a refusal
+        # arriving after StreamingResponse has committed 200 is logged 200 by
+        # the gateway and recorded with the upstream status and zero tokens by
+        # the hub. dev-18 produced 34 such calls, and the two old identities
+        # then missed by 34 in opposite directions while the total was exact —
+        # which is the signature of a stale model, not of lost data.
+        served_or_refused = cos["with_tokens"] + cos["zero_tokens"]
+        lhs = gw["ok"] + gw["throttled"] + gw["client_err"]
+        print(f"  gateway 200+429+4xx ({lhs}) == cosmos documents "
+              f"({served_or_refused}) + Σ hub lost ({total_lost}) "
+              f"= {served_or_refused + total_lost}")
+        if lhs == served_or_refused + total_lost:
+            print("  ✅ billing ledger closes — every request that reached a hub "
+                  "has a document")
         else:
-            print(f"  ❌ UNEXPLAINED GAP: {rhs - lhs:+d}")
-            print("     (Cosmos lags ~90-180s behind a burst — re-run before concluding.)")
+            print(f"  ❌ UNEXPLAINED GAP: {served_or_refused + total_lost - lhs:+d}")
+            print("     (Cosmos lags ~90-180s behind a burst, and a settle check "
+                  "must outlast a full 300s import cycle — re-run before "
+                  "concluding.)")
             rc = 1
 
-        rejected = gw["throttled"] + gw["client_err"]
-        print(f"  cosmos zero-token ({cos['zero_tokens']}) == "
-              f"gateway 429+4xx ({rejected})")
-        if cos["zero_tokens"] == rejected:
-            print("  ✅ upstream-rejected calls accounted for")
+        # 503s are shed by the circuit breaker inside the gateway and never
+        # reach a hub, so they must produce no document at all. This is the one
+        # identity streaming did not disturb.
+        print(f"  gateway 503 ({gw['unavailable']}) produce no document: "
+              f"{gw['total']} total − {lhs} reached-a-hub = "
+              f"{gw['total'] - lhs}")
+        if gw["total"] - lhs == gw["unavailable"]:
+            print("  ✅ breaker-shed requests correctly absent from billing")
         else:
-            print(f"  ⚠️  differs by {cos['zero_tokens'] - rejected:+d} — 503s must NOT "
-                  "appear here (the breaker is in the gateway; they never reach a hub)")
+            print(f"  ⚠️  differs by {gw['total'] - lhs - gw['unavailable']:+d}")
+
+        # Informational: how many refusals arrived too late to change the status
+        # line. Non-zero here is the streaming path being honest, not an error.
+        late = cos["zero_tokens"] - (gw["throttled"] + gw["client_err"])
+        if late > 0:
+            print(f"  note: {late} refusal(s) recorded by the hub that the "
+                  "gateway logged as 200 — streaming refusals arrive after the "
+                  "headers are committed. Expected; see docs/CAPACITY.zh.md.")
 
     if args.json_out:
         payload = {

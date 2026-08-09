@@ -147,6 +147,7 @@ def one_call_stream(url: str, headers: dict, body: dict, timeout: int) -> dict:
     ttft = None
     tot = 0
     chunks = 0
+    upstream_err: dict | None = None
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             for raw in r:  # HTTPResponse iterates line-by-line
@@ -163,6 +164,15 @@ def one_call_stream(url: str, headers: dict, body: dict, timeout: int) -> dict:
                     obj = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
+                # An in-band error event. The hub emits one when upstream
+                # refuses AFTER the 200 and its headers have gone out, which on
+                # a streaming call is the only signal left. It is a well-formed
+                # SSE event, so counting events alone now reports a refused call
+                # as a success — dev-18 measured 288/288 "ok" at concurrency 96
+                # while Cosmos recorded 34 of them as upstream 429s.
+                if isinstance(obj, dict) and isinstance(obj.get("error"), dict):
+                    upstream_err = obj["error"]
+                    continue
                 # Usage rides a late chunk; on Responses-shaped streams it is
                 # nested under .response. Last one wins.
                 for cand in (obj, obj.get("response") if isinstance(obj, dict) else None):
@@ -177,8 +187,19 @@ def one_call_stream(url: str, headers: dict, body: dict, timeout: int) -> dict:
                         if t:
                             tot = t
             dt = time.perf_counter() - t0
-            # A 200 that produced no SSE event is a failure, not a fast success:
-            # counting it as ok would let a broken stream inflate the RPS column.
+            # Two ways a 200 is not a success on this path:
+            #   * no SSE event at all — a broken stream, which would otherwise
+            #     inflate the RPS column as a very fast success
+            #   * an in-band error event — upstream refused after the headers
+            #     were already committed, so the status line cannot say so
+            # The second is reported under the UPSTREAM code, which is what the
+            # billing record carries too, so the two sides line up.
+            if upstream_err is not None:
+                code = upstream_err.get("code")
+                return {"status": int(code) if isinstance(code, int) else 502,
+                        "sec": dt, "tokens": tot, "ttft": ttft, "chunks": chunks,
+                        "err": f"upstream {code}: "
+                               f"{str(upstream_err.get('message'))[:80]}"}
             status = r.status if chunks else 0
             return {"status": status, "sec": dt, "tokens": tot,
                     "ttft": ttft, "chunks": chunks,

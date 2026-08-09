@@ -130,6 +130,24 @@ million RU against serverless's $0.285 — **12.8× cheaper** — so it wins abo
 roughly **8% utilisation** (about 8M calls/month at 400 RU/s). At 10M/month
 utilisation is 10% (saves $7); at 20M/month it is 20% (saves $35).
 
+> ⚠️ **400 RU/s covers steady-state writes only — it does not survive a load
+> test or heavy dashboard use.** Measured on dev-18 (2026-08-09): 8% utilisation
+> during a smoke test, then **100% saturated for 45+ minutes** the moment a ramp
+> started, with **2,236 throttled requests** (23% of all Cosmos requests) in six
+> hours.
+>
+> That break-even counts **writes** (~10 RU per call) and misses three things:
+> the importer writes in 300-second bursts rather than smoothly, a
+> cross-partition aggregate costs up to 5,000 RU — **12.5 seconds of a 400 RU/s
+> budget in a single query** — and reconciliation/dashboards poll. Serverless
+> has no ceiling to hit, which is why four earlier campaigns never surfaced it.
+>
+> **Nothing was lost** (the SDK retries 429, and the final document count
+> matched prediction exactly) but import latency stretched badly. For load
+> testing or heavy dashboard use, raise to 1000+ RU/s or use autoscale
+> (`autoscale max 1000`, billed at 10% when idle). See
+> [CAPACITY.zh.md](CAPACITY.zh.md) §7.6.
+
 > ⚠️ **This switch only works at environment-creation time, and terraform's plan
 > will not tell you that.** `EnableServerless` is an account-level capability
 > fixed at creation, and azurerm treats `capabilities` as computed — so removing
