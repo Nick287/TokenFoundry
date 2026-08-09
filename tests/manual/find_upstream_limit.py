@@ -51,7 +51,13 @@ Usage:
     python tests/manual/find_upstream_limit.py --exp b        # cheap, fast
     python tests/manual/find_upstream_limit.py --exp a        # EXPENSIVE
     python tests/manual/find_upstream_limit.py --exp c
+    python tests/manual/find_upstream_limit.py --exp d        # EXPENSIVE
     python tests/manual/find_upstream_limit.py --exp all
+    python tests/manual/find_upstream_limit.py --exp a --dry-run   # cost only
+
+Experiments a, c and d move millions of tokens and cost real money. They print
+an estimate and pause for confirmation before spending anything; `--yes` skips
+the prompt for unattended runs, `--dry-run` prints the estimate and exits.
 """
 
 from __future__ import annotations
@@ -326,15 +332,118 @@ def exp_c(url, headers) -> None:
         print("    -> symmetric at this level (both clean or both tipped)")
 
 
+def exp_d(url, headers) -> None:
+    """Concurrency ceiling with a LARGE prompt — experiment B's missing half."""
+    print("\n" + "=" * 100)
+    print("EXPERIMENT D — concurrency ceiling at a 3,000-tok prompt")
+    print("=" * 100)
+    print("B measured the concurrency ceiling with tokens minimised and compared")
+    print("it against a 3,000-tok result that this script never actually ran —")
+    print("the number came from an earlier ad-hoc test. So the contradiction in")
+    print("§2.1 has only ever had one side measured here:")
+    print("    72 concurrency +   ~10 tok prompt -> clean")
+    print("    72 concurrency + 3,000 tok prompt -> 12x429")
+    print("    48 concurrency + 3,000 tok prompt -> clean")
+    print("This runs the large-prompt side on the same levels as B, so the two")
+    print("are directly comparable: an EARLIER tipping point here means prompt")
+    print("size contributes to the gate; the SAME point means it does not.\n")
+    print(HDR)
+    print("-" * len(HDR))
+    levels = [48, 72, 96, 120, 144]
+    first_429 = None
+    for i, c in enumerate(levels):
+        r = run_level(url, headers, conc=c, n=c * 3, prompt_tokens=3_000,
+                      max_tokens=200)
+        show(str(c), r)
+        if r["c429"] and first_429 is None:
+            first_429 = (c, r)
+            print(f"\n  first 429 at concurrency {c} "
+                  f"({r['prompt_avg']:.0f} prompt tok/req, TPM={r['tpm']:,.0f})")
+            # Deliberately NOT breaking: one clean level proves nothing here.
+            # Discipline 5 (§6.2) exists because 72 has come back 0% / 40% / 44%
+            # failed across identical runs — a single reading at the boundary is
+            # a coin toss, so the sweep continues and the whole shape is printed.
+        if i < len(levels) - 1:
+            time.sleep(COOLDOWN)
+    print("\n  VERDICT:")
+    if first_429:
+        c, r = first_429
+        print(f"    first 429 at concurrency {c} with a large prompt.")
+        print("    -> compare with EXPERIMENT B's tipping point at the same")
+        print("       levels. Earlier here = prompt size contributes.")
+    else:
+        print("    no 429 through concurrency 144 even at 3,000 tok/req")
+        print("    -> prompt size does NOT lower the concurrency ceiling, and")
+        print("       the §2.1 contradiction was an artefact of that one run")
+
+
+# Input tokens each experiment moves, from its own level definitions. Used only
+# to size the spend up front — the real number is whatever `copilot_usage`
+# reports afterwards.
+#
+# This exists because "run the script to check the arguments wired up correctly"
+# is not a safe thing to do here: with a .env present there is no dry step, and
+# an --exp that was meant as a syntax check starts spending immediately. That
+# happened, and cost about $12 before it was killed.
+_EXP_INPUT_TOKENS = {
+    # 4 levels x 48 requests, prompt ~1.67x nominal (3K/10K/30K/60K)
+    "a": 48 * (5_000 + 16_500 + 50_000 + 100_000),
+    "b": sum(c * 3 for c in (48, 72, 96, 120, 144)) * 10,     # minimal prompts
+    "c": 24 * 50_000 + 24 * 200,                              # in-heavy + out-heavy
+    "d": sum(c * 3 for c in (48, 72, 96, 120, 144)) * 5_000,  # 3K nominal
+}
+
+# Measured against dev-17 on 2026-08-09 by reading `copilot_usage.total_nano_aiu`
+# off a single small call: nano_aiu / 1e11 = USD. Rough by design — it prices
+# INPUT only, which dominates every experiment here except c's output half.
+_USD_PER_MTOK_INPUT = {
+    "claude-opus-4.8": 5.09,
+    "claude-opus-4-8": 5.09,
+    "claude-haiku-4.5": 1.03,
+}
+
+
+def confirm_spend(exps: list[str], model: str, *, assume_yes: bool,
+                  dry_run: bool) -> bool:
+    """Print what this run will cost and get a yes. False = do not proceed."""
+    rate = _USD_PER_MTOK_INPUT.get(model)
+    total_tok = sum(_EXP_INPUT_TOKENS.get(e, 0) for e in exps)
+    print(f"\n  about to run experiment(s) {', '.join(exps)} on {model}")
+    print(f"  input tokens to be sent : ~{total_tok / 1e6:.1f}M")
+    if rate:
+        print(f"  estimated cost          : ~${total_tok / 1e6 * rate:.2f} "
+              f"(at ${rate:.2f} / 1M input tok, measured)")
+    else:
+        print(f"  estimated cost          : UNKNOWN — no measured rate for "
+              f"{model}. Price it with one small call first.")
+    print("  (output tokens are extra; on Copilot they price ~5x input)")
+    if dry_run:
+        print("\n  --dry-run: stopping here, nothing sent.")
+        return False
+    if assume_yes:
+        return True
+    try:
+        return input("\n  proceed? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        # Non-interactive (CI, a background shell). Refuse rather than spend:
+        # an unattended run that cannot be asked has not been authorised.
+        print("\n  not a terminal and --yes not given — refusing to spend.")
+        return False
+
+
 def main() -> int:
     global COOLDOWN
     load_dotenv_if_present()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--probe", action="store_true",
                     help="just force a 429 and dump its headers (near-zero cost)")
-    ap.add_argument("--exp", choices=("a", "b", "c", "all"),
+    ap.add_argument("--exp", choices=("a", "b", "c", "d", "all"),
                     help="which experiment to run")
     ap.add_argument("--cooldown", type=int, default=COOLDOWN)
+    ap.add_argument("--yes", action="store_true",
+                    help="skip the cost confirmation (unattended runs)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the cost estimate and exit without spending")
     args = ap.parse_args()
 
     gw = require("TF_GATEWAY_URL").rstrip("/")
@@ -352,9 +461,23 @@ def main() -> int:
         probe_429(url, headers)
         return 0
     if not args.exp:
-        ap.error("pass --probe or --exp {a,b,c,all}")
+        ap.error("pass --probe or --exp {a,b,c,d,all}")
+
+    # Everything above this line is free. Nothing below it is.
+    selected = ["a", "b", "c", "d"] if args.exp == "all" else [args.exp]
+    if not confirm_spend(selected, os.environ.get("TF_MODEL", "claude-opus-4-8"),
+                         assume_yes=args.yes, dry_run=args.dry_run):
+        return 0
+
     if args.exp in ("b", "all"):
         exp_b(url, headers)
+        if args.exp == "all":
+            time.sleep(COOLDOWN)
+    # D runs right after B: same levels, same session, only the prompt differs,
+    # which is the whole basis of the comparison. Putting anything expensive
+    # between them would let upstream conditions drift.
+    if args.exp in ("d", "all"):
+        exp_d(url, headers)
         if args.exp == "all":
             time.sleep(COOLDOWN)
     if args.exp in ("a", "all"):
