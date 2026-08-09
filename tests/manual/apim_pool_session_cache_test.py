@@ -9,16 +9,37 @@ independent GitModel hubs:
     llm-anthropic-pool  = llm-anthropic + llm-anthropic-2
     llm-google-pool     = llm-google    + llm-google-2
 
-The two hubs were verified INDEPENDENT (a prefix warmed on the old hub does NOT
-hit on the new hub — cached=0), so this pool genuinely spreads load and each
-backend keeps its OWN prompt cache. That makes the round-robin-vs-affinity
-contrast meaningful here (unlike the azure pool, whose two endpoints turned out
-to share one underlying Global deployment).
+⚠️ THE PREMISE BELOW WAS OVERTURNED — read this before reading the results.
+
+This file used to assert that the hubs were verified INDEPENDENT ("a prefix
+warmed on the old hub does NOT hit on the new hub — cached=0"), and therefore
+that each backend keeps its OWN prompt cache. On dev-17 (three hubs, three
+DIFFERENT GitHub accounts, claude-opus-4.8, 2026-08-09) that is false:
+
+    ROUND-ROBIN, no cookie
+      turn 1  gha_ba4362e92df7   cached=0        cold
+      turn 2  gha_3a128e8b7002   cached=3123     98%   <- different hub, different
+      turn 3  gha_3a128e8b7002   cached=3123     97%      GitHub account, still hits
+      turn 4  gha_97005fc396f2   cached=3123     96%
+
+A prefix warmed through one account's hub was served from cache through
+another's on the very next turn. So the Anthropic prompt cache lives UPSTREAM
+and is keyed by content — not per hub, and apparently not even per account.
+
+The practical consequence is that the round-robin-vs-affinity contrast this
+script was built to measure has no cache signal to find: both phases hit 4/5 at
+96-98%. That matches CAPACITY.zh.md §4.3, which measured the same zero benefit
+(82.0% vs 82.0%, 240/240 vs 240/240) without being able to explain it. This is
+the explanation. Affinity remains a NEGATIVE-value setting: zero upside, and a
+real downside when pinning distributes badly (§4.3 recorded 126 disconnects and
+a 27s p95 from exactly that).
+
+Treat a difference between the two phases here as noise unless it reproduces.
 
 For each provider it runs the same growing multi-turn chat twice:
-  PHASE 1  no cookie   -> APIM round-robins turns across old/new hub
+  PHASE 1  no cookie   -> APIM round-robins turns across the pool
   PHASE 2  with cookie -> the first Set-Cookie: SessionId pins every later turn
-                          to the same hub, so the prompt cache stays warm.
+                          to the same hub
 
 The SessionId cookie value is base64(backend-name) on this gateway, so we print
 which backend each turn hit without touching App Insights. Each PHASE builds its
@@ -85,6 +106,13 @@ PROVIDERS = {
         "suffix": "/llm-anthropic/v1/messages",
         "fmt": "messages",
         "default": "claude-opus-4.8",
+        # Claude's cacheable-prefix floor is ~1991 tok, so the 1500 default
+        # would have produced cached=0 for reasons that have nothing to do with
+        # affinity — a zero indistinguishable from "the pool isn't sticking".
+        # Its sibling load_test_cache_tpm.py has carried this floor all along;
+        # this file did not. Measured on dev-17: below the floor Claude reports
+        # no cache columns at all, above it a 4,177-tok prefix caches cleanly.
+        "min_prefix": 2200,
     },
     "google": {
         "auth": "api-key",
@@ -394,9 +422,14 @@ def main() -> int:
         sa_be = sorted(sa["backends"])
         print(f"  {prov:<12} round-robin hit {rr['hits']}/{rr['turns']} (backends {rr_be})  |  "
               f"affinity hit {sa['hits']}/{sa['turns']} (backends {sa_be})")
-    print("\n  Note: caching is best-effort, so a single small run can be noisy — affinity's edge "
-          "shows over larger/repeated runs. Both hubs are independent, so pinning genuinely keeps "
-          "a warm cache on one backend.")
+    print("\n  Note: the two phases are EXPECTED to look the same. The Anthropic "
+          "prompt cache lives upstream and is keyed by content, so a prefix "
+          "warmed through one hub is served from cache through another — "
+          "measured on dev-17 across three different GitHub accounts. Pinning "
+          "therefore buys no cache benefit (CAPACITY.zh.md §4.3 measured the "
+          "same zero, 82.0% vs 82.0%), while still risking the uneven "
+          "distribution that section records. Treat any gap here as noise "
+          "unless it reproduces.")
     return 0
 
 
