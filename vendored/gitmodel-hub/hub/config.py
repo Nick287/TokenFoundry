@@ -121,6 +121,16 @@ class Settings:
         # cold start, but this one is re-injected every deploy.
         self.hub_api_key = os.environ.get("HUB_API_KEY", "").strip()
 
+        # `anthropic-version` sent upstream when the caller did not supply one.
+        # This is the API contract version, not a feature flag: 2023-06-01 has
+        # been the current value since the Messages API launched (2023-01-01 is
+        # the legacy predecessor), and unlike `anthropic-beta` it does not roll
+        # per feature. Configurable so a future bump is a redeploy rather than a
+        # code change; callers that send their own header are forwarded as-is.
+        self.anthropic_version = (
+            os.environ.get("HUB_ANTHROPIC_VERSION", "").strip() or "2023-06-01"
+        )
+
         # Admin login rate limiting (brute-force protection). After
         # `login_max_fails` consecutive failures from one client IP, that IP is
         # locked out for `login_lock_seconds`. Set max_fails <= 0 to disable.

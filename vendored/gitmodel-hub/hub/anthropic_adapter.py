@@ -73,6 +73,46 @@ def map_model(name: str | None) -> str | None:
     return name
 
 
+# --------------------------------------------------------------------------- #
+# Upstream field compatibility
+# --------------------------------------------------------------------------- #
+# Request fields the Anthropic API accepts but the Copilot backend rejects with
+# 400 "Extra inputs are not permitted".
+#
+# This matters only because /v1/messages passes the body through verbatim. The
+# old translation layer rebuilt the request from the fields it understood, so it
+# dropped these as a side effect; passthrough forwards them and the upstream
+# refuses the whole request.
+#
+# `context_management` is the one that actually bites: Claude Code sends it on
+# every turn, so leaving it in makes that client fail 100% of the time. The
+# others are included because they fail the same way if a client sends them.
+UNSUPPORTED_UPSTREAM_FIELDS = (
+    "context_management",
+    "fallbacks",
+    "container",
+    "mcp_servers",
+)
+
+
+def strip_unsupported(payload: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Drop request fields the Copilot backend cannot accept.
+
+    Returns ``(payload, dropped)``. The input is never mutated; when nothing
+    needs dropping the original object is returned unchanged so the common path
+    stays allocation-free.
+
+    Dropping is the right trade-off here: these fields tune behaviour (context
+    editing, server-side fallbacks, MCP) rather than determining the answer, so
+    a request that ignores them still returns a correct response -- whereas
+    forwarding them returns nothing at all.
+    """
+    dropped = [f for f in UNSUPPORTED_UPSTREAM_FIELDS if f in payload]
+    if not dropped:
+        return payload, []
+    return {k: v for k, v in payload.items() if k not in dropped}, dropped
+
+
 def has_image_content(openai_payload: dict[str, Any]) -> bool:
     """True if any message in an OpenAI-shaped payload carries an image part."""
     for msg in openai_payload.get("messages") or []:

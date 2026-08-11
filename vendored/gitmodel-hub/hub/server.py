@@ -87,31 +87,49 @@ async def _shutdown() -> None:
 # --------------------------------------------------------------------------- #
 # Auth helpers
 # --------------------------------------------------------------------------- #
-def _extract_client_key(request: Request) -> str | None:
+def _client_key_candidates(request: Request) -> list[str]:
+    """Credentials the caller presented, most authoritative first.
+
+    A request proxied by APIM carries two of them: the gateway overwrites
+    `x-api-key` with this hub's own credential, while the caller's
+    `Authorization` rides through untouched and holds whatever they configured
+    — against a pooled backend that is never this hub's key. Preferring
+    `x-api-key` and falling back to `Authorization` keeps direct callers, who
+    send only the latter, working unchanged.
+    """
+    keys: list[str] = []
+    xkey = (request.headers.get("x-api-key") or "").strip()
+    if xkey:
+        keys.append(xkey)
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    xkey = request.headers.get("x-api-key")
-    if xkey:
-        return xkey.strip()
-    return None
+        token = auth[7:].strip()
+        if token:
+            keys.append(token)
+    return keys
+
+
+def _extract_client_key(request: Request) -> str | None:
+    """The key a request is attributed to when no validation has run."""
+    keys = _client_key_candidates(request)
+    return keys[0] if keys else None
 
 
 def _check_client_auth(request: Request) -> str | None:
     """Return the client key (for usage attribution); enforce auth if required."""
-    key = _extract_client_key(request)
+    keys = _client_key_candidates(request)
     s = get_settings()
-    if store.get_require_auth(s.require_auth):
-        # A deploy-time HUB_API_KEY (env, Key Vault-backed) is accepted alongside
-        # portal-created keys. Since the hub is stateless (ephemeral SQLite), the
-        # env key is the durable credential the control plane / APIM authenticate
-        # with; portal-created keys (SQLite) remain valid as a fallback.
-        env_ok = bool(s.hub_api_key) and bool(key) and secrets.compare_digest(
-            key or "", s.hub_api_key
-        )
-        if not env_ok and (not key or not store.is_valid_api_key(key)):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return key
+    if not store.get_require_auth(s.require_auth):
+        return keys[0] if keys else None
+    # A deploy-time HUB_API_KEY (env, Key Vault-backed) is accepted alongside
+    # portal-created keys. Since the hub is stateless (ephemeral SQLite), the
+    # env key is the durable credential the control plane / APIM authenticate
+    # with; portal-created keys (SQLite) remain valid as a fallback.
+    for key in keys:
+        env_ok = bool(s.hub_api_key) and secrets.compare_digest(key, s.hub_api_key)
+        if env_ok or store.is_valid_api_key(key):
+            return key
+    raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 def _new_session() -> str:
@@ -630,14 +648,48 @@ def _parse_anthropic_sse_usage(text: str) -> dict[str, Any]:
 
 
 def _anthropic_has_image(req: dict[str, Any]) -> bool:
-    """True if an Anthropic-shaped request carries an image content block."""
+    """True if an Anthropic-shaped request carries an image block anywhere.
+
+    Images may sit directly in a message's content list, nested inside a
+    `tool_result` block's own content list, or in a structured `system` field,
+    so this recurses one level and scans all three. Used to set the
+    `Copilot-Vision-Request` header on passthrough, where the body is never
+    converted to the OpenAI shape — miss an image here and vision silently
+    fails for that request.
+    """
+
+    def _scan(blocks: Any) -> bool:
+        if not isinstance(blocks, list):
+            return False
+        for part in blocks:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image":
+                return True
+            # tool_result carries its own nested content list.
+            if part.get("type") == "tool_result" and _scan(part.get("content")):
+                return True
+        return False
+
     for msg in req.get("messages") or []:
-        content = msg.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "image":
-                    return True
-    return False
+        if isinstance(msg, dict) and _scan(msg.get("content")):
+            return True
+    return _scan(req.get("system"))
+
+
+def _upstream_version_header(request: Request) -> dict[str, str]:
+    """The `anthropic-version` to forward upstream.
+
+    Copilot's native endpoint expects the header. Prefer the caller's value so a
+    client pinned to a different contract version keeps working; fall back to
+    the configured default otherwise.
+    """
+    return {
+        "anthropic-version": (
+            request.headers.get("anthropic-version")
+            or get_settings().anthropic_version
+        )
+    }
 
 
 # =========================================================================== #
@@ -933,8 +985,46 @@ async def v1_images_edits(request: Request) -> Any:
 
 
 # =========================================================================== #
-# Anthropic-compatible endpoint
+# Anthropic-compatible endpoints
 # =========================================================================== #
+@app.post("/v1/messages/count_tokens")
+async def v1_messages_count_tokens(request: Request) -> Any:
+    """Anthropic token-counting endpoint — passed through to Copilot.
+
+    Claude Code calls this to size the context before a turn. It is optional:
+    with no route here the client falls back to estimating locally, which is how
+    this gateway ran until now and worked fine. Serving it replaces that
+    estimate with the upstream's own model-specific count.
+
+    Declared before /v1/messages purely for readability — Starlette matches on
+    the full path, so the more specific route does not need to come first.
+
+    No usage row is recorded: counting is free and billed nothing upstream, so
+    logging it would inflate the request count with rows that have no tokens.
+    """
+    _check_client_auth(request)
+    body = await request.json()
+    if not cc.is_authenticated():
+        raise HTTPException(status_code=503, detail="Hub not logged in to Copilot")
+
+    mapped = aa.map_model(body.get("model"))
+    if mapped != body.get("model"):
+        body = {**body, "model": mapped}
+    body, _ = aa.strip_unsupported(body)
+    try:
+        status, data = await cc.post_json(
+            "/v1/messages/count_tokens", body, _upstream_version_header(request)
+        )
+    except cc.NotAuthenticatedError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except RuntimeError as e:
+        # A failed token exchange raises rather than returning a status, and an
+        # unhandled one here becomes an opaque 500. Surface the upstream reason
+        # so a client sees "Bad credentials" instead of Internal Server Error.
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return JSONResponse(data, status_code=status)
+
+
 @app.post("/v1/messages")
 async def v1_messages(request: Request) -> Any:
     """Anthropic Messages API — passed THROUGH to Copilot's native /v1/messages.
@@ -948,6 +1038,11 @@ async def v1_messages(request: Request) -> Any:
     """
     _check_client_auth(request)
     req = await request.json()
+    # Passthrough forwards the body verbatim, so anything the Copilot backend
+    # does not recognise fails the whole request. Drop those fields first.
+    req, dropped = aa.strip_unsupported(req)
+    if dropped:
+        log.info("dropped unsupported fields for upstream: %s", ", ".join(dropped))
     tenant = _extract_tenant(request)
     end_user = _extract_end_user(req)
     model = req.get("model")
@@ -961,7 +1056,7 @@ async def v1_messages(request: Request) -> Any:
         {"Copilot-Vision-Request": "true"} if _anthropic_has_image(req) else None
     )
     # Copilot's native endpoint expects the Anthropic version header.
-    headers = {"anthropic-version": "2023-06-01", **(vision_headers or {})}
+    headers = {**_upstream_version_header(request), **(vision_headers or {})}
 
     if not stream:
         req.pop("stream", None)
