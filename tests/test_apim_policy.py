@@ -68,6 +68,40 @@ def test_outbound_no_longer_writes_cosmos():
         assert "/docs" not in xml
 
 
+def test_nothing_in_outbound_reads_the_response_body():
+    """Reading the response body at the gateway flattens streaming.
+
+    `context.Response.Body.As<JObject>()` has to have the WHOLE body before it
+    can parse, so APIM holds the response — headers included — until upstream
+    finishes. Measured on dev-18: first byte at the client was 0.94s straight to
+    the hub and 44.08s through APIM, with the entire body arriving in one burst.
+    Deleting the one metadata that did this brought it to 3.08s with bytes
+    spread over 71% of the elapsed time.
+
+    This is the second time the same mistake shipped: the outbound
+    send-one-way-request was removed for exactly this reason (see the test
+    above) while `_USAGE_TRACE` kept its own copy of the same call. Hence a test
+    on the WHOLE outbound section rather than on one element — the next thing to
+    reach for the body should fail here, whatever it is called.
+    """
+    p = _provisioner()
+    for provider in ("openai", "azure", "anthropic", "google"):
+        xml = p._build_provider_policy("be-1", provider)
+        outbound = xml.split("<outbound>", 1)[1].split("</outbound>", 1)[0]
+        assert "Response.Body" not in outbound, provider
+        assert "As&lt;Newtonsoft" not in outbound, provider
+
+
+def test_usage_trace_still_carries_the_identity_metadata():
+    """Guard against over-correcting. The trace is the real-time observability
+    line; only the body-reading field had to go, and the fields that identify
+    WHICH call this was must survive."""
+    p = _provisioner()
+    xml = p._build_provider_policy("be-1", "anthropic")
+    for field in ("requestId", "api", "subscription", "model", "hub"):
+        assert f'name="{field}"' in xml, field
+
+
 def test_provider_policy_is_provider_agnostic():
     """The API-level policy body is identical regardless of provider — the
     provider-specific behavior lives in the operation-level chat policy."""
@@ -126,17 +160,24 @@ def test_policy_emits_model_dimension():
 
 def test_policy_emits_usage_trace():
     """The outbound policy emits a per-call `trace` (log-class telemetry, not
-    pre-aggregated) carrying requestId/model/subscription/api + usage. Verified
-    on dev-a03: 5 non-stream calls -> 5 traces with full usage, itemCount=1 (no
-    sampling). This is the App Insights observability line and is deliberately
-    NOT the billing source — billing rides the hub -> Event Hub path."""
+    pre-aggregated) carrying requestId/model/subscription/api. Verified on
+    dev-a03: 5 non-stream calls -> 5 traces, itemCount=1 (no sampling). This is
+    the App Insights observability line and is deliberately NOT the billing
+    source — billing rides the hub -> Event Hub path.
+
+    It used to assert a `usage` field too, read off the response body. That
+    assertion was written from non-streaming runs, where the cost is invisible:
+    parsing the body forces APIM to buffer the whole response, which turned
+    streaming into a 44-second wait for the first byte (dev-18). The field is
+    gone; token counts come from llm-emit-token-metric and from Cosmos.
+    """
     p = _provisioner()
     for provider in ("openai", "anthropic", "google"):
         xml = p._build_provider_policy("be-1", provider)
         # trace present with our source + per-call fields
         assert '<trace source="tokenfoundry-usage"' in xml
         assert 'name="requestId"' in xml
-        assert 'name="usage"' in xml
+        assert 'name="model"' in xml
 
 
 def test_breaker_rules_cover_5xx_and_upstream_429():

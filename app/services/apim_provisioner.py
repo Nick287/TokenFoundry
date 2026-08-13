@@ -296,6 +296,27 @@ class ApimProvisioner:
         "catch { return &quot;unknown&quot;; } "
         "}"
     )
+    # NOTE: no metadata here may read `context.Response.Body`.
+    #
+    # This trace used to carry a `usage` field built from
+    # `context.Response.Body.As<JObject>(preserveContent:true)`. Parsing the body
+    # as JSON requires having ALL of it, so APIM held the entire response —
+    # headers included — until upstream finished. Streaming still worked hop by
+    # hop from the hub, and was then flattened at the gateway: measured on
+    # dev-18, first byte at the client went from 0.94s (direct to the hub) to
+    # 44.08s (through APIM), with 100% of the body arriving in one burst.
+    # Removing this one metadata line brought it back to 3.08s with the bytes
+    # spread over 71% of the elapsed time.
+    #
+    # It bought nothing in exchange. An SSE response is not a JSON object, so
+    # `As<JObject>()` always threw on exactly the calls it damaged and the
+    # attribute recorded the fallback string. The reasoning was already written
+    # down one docstring below — the outbound `send-one-way-request` was deleted
+    # for this same reason — it just was not applied here as well.
+    #
+    # Token counts come from `llm-emit-token-metric` (real time) and from the
+    # hub's own event via Cosmos (billing). Neither needs the body at the
+    # gateway.
     _USAGE_TRACE = (
         '<trace source="tokenfoundry-usage" severity="information">'
         '<message>@("llm-usage " + context.Api.Id + " " + context.RequestId)</message>'
@@ -304,11 +325,6 @@ class ApimProvisioner:
         '<metadata name="subscription" value="@(context.Subscription?.Id ?? &quot;none&quot;)" />'
         '<metadata name="model" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;tfModel&quot;, &quot;unknown&quot;))" />'
         f'<metadata name="hub" value="{_HUB_EXPR}" />'
-        '<metadata name="usage" value="@{ try { var b = '
-        "context.Response.Body.As&lt;Newtonsoft.Json.Linq.JObject&gt;(preserveContent:true); "
-        "var u = b[&quot;usage&quot;] as Newtonsoft.Json.Linq.JObject; "
-        "return u != null ? u.ToString(Newtonsoft.Json.Formatting.None) : &quot;NO_USAGE_KEY&quot;; } "
-        'catch { return &quot;BODY_READ_FAILED&quot;; } }" />'
         "</trace>"
     )
 
@@ -665,6 +681,12 @@ class ApimProvisioner:
         Usage now originates at the hub, which sees both shapes and forwards
         upstream's authoritative `copilot_usage`, and travels
         hub → Event Hub → Capture → import job → Cosmos.
+
+        The same reasoning later had to be applied a second time: `_USAGE_TRACE`
+        carried its own `As<JObject>()` on the response body and flattened
+        streaming exactly the same way (first byte 0.94s direct to the hub vs
+        44.08s through APIM). Nothing in `<outbound>` may touch
+        `context.Response.Body` — see the note on `_USAGE_TRACE`.
 
         `llm-emit-token-metric` and `_USAGE_TRACE` stay: that is the real-time
         App Insights observability line, deliberately decoupled from billing.
