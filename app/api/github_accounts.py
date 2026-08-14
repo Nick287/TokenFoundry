@@ -592,8 +592,11 @@ def _deploy_account(account_id: str) -> None:
 def _teardown_account(account_id: str) -> None:
     """Remove from pools, terraform destroy, clean KV + DB. Best-effort/idempotent.
 
-    Ordering is load-bearing and the first step is a GATE, not a best effort:
+    Ordering is load-bearing and the first TWO steps are GATES, not best effort:
     pool member -> per-account backend -> Azure resources -> KV + DB row.
+    Either gate failing leaves every resource intact and the account marked
+    FAILED, so pressing delete again is a clean retry. Only step 3 (KV + DB) is
+    best-effort, because by then there is nothing left to strand.
     """
     db = SessionLocal()
     try:
@@ -618,14 +621,40 @@ def _teardown_account(account_id: str) -> None:
             logger.exception("_teardown_account: pool removal failed for %s", account_id)
             _fail(db, acct, f"APIM cleanup failed; nothing was destroyed — retry delete. {exc}")
             return
-        # 2) terraform destroy the resource group
+        # 2) terraform destroy the resource group.
+        #
+        # A GATE for the same reason step 1 is one. This used to be swallowed:
+        # destroy raised, the log recorded it, and step 3 went on to delete the
+        # KV secrets and the account row anyway. What that leaves is a Container
+        # App plus a managed environment billing monthly with NO record left
+        # anywhere to retry from — the operator has to find them by hand.
+        #
+        # Observed on dev-18 (2026-08-14): three accounts deleted from the UI,
+        # all three destroy runs failed, all three rows removed 1 second later,
+        # three resource groups orphaned. The destroys failed because the hub
+        # workflow reads REPO-LEVEL Actions variables (KEYVAULT_NAME,
+        # TFSTATE_STORAGE_ACCOUNT, ...) which are a single global slot that the
+        # most recent `deploy.sh` overwrites — so dev-18's destroy ran against
+        # dev-19's Key Vault and could not find its own job input. Any
+        # environment that is not the most recently deployed one hits this, and
+        # that is exactly when the failure must NOT be silent.
         token = None
         if acct.oauth_token_kv_ref:
             token = KeyVaultService().get_secret(acct.oauth_token_kv_ref)
         try:
             terraform_runner.destroy_hub(account_id, token or "")
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("_teardown_account: destroy failed for %s", account_id)
+            _fail(
+                db,
+                acct,
+                "Azure resources were NOT destroyed and nothing else was "
+                "removed — press delete again to retry. If this environment is "
+                "not the most recently deployed one, the hub workflow is "
+                "pointed at another environment's Key Vault and the retry will "
+                f"fail the same way until that is corrected. {exc}",
+            )
+            return
         # 3) clean KV secrets (oauth + hub key + admin token + job in/out) + DB row
         kv = KeyVaultService()
         _dash = account_id.replace("_", "-")

@@ -77,6 +77,10 @@ def wired(monkeypatch: pytest.MonkeyPatch):
 
     def _destroy(_aid: str, _tok: str) -> None:
         seen["destroy"] += 1
+        if seen.get("destroy_raises"):
+            raise RuntimeError(
+                "deploy run 31778893425 for gha_test ended failure"
+            )
 
     monkeypatch.setattr(gh, "ApimProvisioner", _Prov)
     monkeypatch.setattr(gh, "KeyVaultService", _Kv)
@@ -125,6 +129,54 @@ def test_apim_failure_marks_the_account_failed_with_a_reason(wired) -> None:
     # The message has to say the environment is untouched, or the operator's
     # next move is a manual hunt for half-deleted resources.
     assert "nothing was destroyed" in acct.error_detail
+
+
+# --- step 2: terraform destroy is a gate too ---------------------------------
+#
+# Observed on dev-18 (2026-08-14): three accounts deleted from the UI, all three
+# destroy runs failed, all three rows removed one second later. Three resource
+# groups — Container App + managed environment each — were left billing with no
+# record anywhere to retry from. The failure was already being logged; logging
+# was never the point.
+
+
+def test_destroy_failure_keeps_the_account_row_for_a_retry(wired) -> None:
+    """Deleting the row after a failed destroy is what makes it unrecoverable:
+    the resources are still in Azure and nothing left in the product knows."""
+    _acct, db, seen = wired
+    seen["destroy_raises"] = True
+
+    gh._teardown_account("gha_test")
+
+    assert db.deleted == [], "deleted the account row after destroy failed"
+
+
+def test_destroy_failure_leaves_the_kv_secrets_alone(wired) -> None:
+    """The job input and hub key are what a retry needs. Deleting them turns a
+    retryable failure into a permanent one — the second attempt cannot even
+    build the terraform inputs."""
+    _acct, _db, seen = wired
+    seen["destroy_raises"] = True
+
+    gh._teardown_account("gha_test")
+
+    assert seen["kv_deletes"] == [], "deleted KV secrets after destroy failed"
+
+
+def test_destroy_failure_marks_the_account_failed_with_an_actionable_reason(
+    wired,
+) -> None:
+    acct, _db, seen = wired
+    seen["destroy_raises"] = True
+
+    gh._teardown_account("gha_test")
+
+    assert acct.status == DeployStatus.FAILED
+    assert acct.error_detail is not None
+    # Two things the operator needs: that Azure still holds the resources, and
+    # that retrying is the next move rather than a manual hunt.
+    assert "NOT destroyed" in acct.error_detail
+    assert "delete again" in acct.error_detail
 
 
 def test_missing_account_is_a_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
