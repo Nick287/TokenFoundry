@@ -14,6 +14,12 @@ Token Foundry 运行起来每档要花多少钱 —— 从"我该选哪个 SKU"�
 >
 > 换区域、换协议价请用
 > [Azure 定价计算器](https://azure.microsoft.com/zh-cn/pricing/calculator/)复核。
+>
+> ⚠️ **本页只覆盖 Azure 基础设施成本,不覆盖 GitHub Copilot 侧的用量。**
+> 下表的规模假设(账号数、并发档位)来自合作伙伴环境的测试账号,只能用于评估;
+> GitHub 账号本身的容量是黑盒,上游不公布每账号配额,且同一批账号的实测结果本身
+> 就是双峰的。**客户环境的容量与成本必须用客户自己的账号重新实测**——
+> 详见 [CAPACITY.zh.md §0](CAPACITY.zh.md#0-️-这些数字的适用范围先读这一节)。
 
 ---
 

@@ -241,6 +241,11 @@ def run_level(url, headers, body, conc: int, n: int, timeout: int,
         "p50": statistics.median(lat) if lat else 0,
         "p95": (lat[int(len(lat) * 0.95)] if len(lat) > 1 else (lat[0] if lat else 0)),
         "ttft50": statistics.median(ttfts) if ttfts else 0,
+        # A level nobody actually served: everything 503'd and it took under a
+        # second per 100 requests, i.e. they were rejected at the gateway rather
+        # than sent upstream. Distinguishing this from a genuine collapse
+        # matters — the numbers look identical in the table.
+        "shed": len(c503) == n and n > 0 and wall < max(2.0, n / 100),
         "sample_err": next((r.get("err", "") for r in results if r.get("err")), ""),
     }
 
@@ -259,6 +264,12 @@ def main() -> int:
     ap.add_argument("--cooldown", type=int, default=COOLDOWN,
                     help=f"seconds between levels; lets a tripped breaker reset "
                          f"(default {COOLDOWN})")
+    ap.add_argument("--precool", type=int, default=0,
+                    help="seconds to wait BEFORE the first level. --cooldown "
+                         "only separates levels within one invocation, so when "
+                         "each level is its own run (the per-level discipline "
+                         "in CAPACITY.zh.md 6.2) the first one inherits "
+                         "whatever state the previous run left. Use 150 there.")
     ap.add_argument("--stop-error-rate", type=float, default=STOP_ERROR_RATE,
                     help=f"stop ramping once error rate exceeds this, 0-1 "
                          f"(default {STOP_ERROR_RATE})")
@@ -299,6 +310,10 @@ def main() -> int:
     print(hdr)
     print("-" * len(hdr))
 
+    if args.precool:
+        print(f"precool {args.precool}s (let any breaker from a PRIOR run reset)")
+        time.sleep(args.precool)
+
     rows = []
     for lvl in [int(x) for x in args.levels.split(",")]:
         r = run_level(url, headers, body, lvl, args.per_level, args.timeout,
@@ -310,6 +325,18 @@ def main() -> int:
         if args.stream:
             line += f" {r['ttft50']:>7.2f}"
         print(line)
+        if r["shed"]:
+            # Every request 503'd and the whole level finished in about the time
+            # it takes to REJECT n requests, not serve them. That is a breaker
+            # that was already open when the level started — most likely tripped
+            # by a previous run — so this row says nothing about capacity at
+            # this concurrency. Measured on dev-19: a streaming 48 level fired
+            # with zero gap after a non-streaming 96 collapse returned 144/144
+            # 503 at 0.00 RPS, and read as a total failure until the timestamps
+            # showed the two runs were 33 seconds apart.
+            print(f"     ^ NOT A CAPACITY RESULT: all {r['n']} shed in "
+                  f"{r['wall']:.1f}s — a breaker was already open. Re-run this "
+                  f"level with --precool 150.")
         if r["sample_err"]:
             print(f"     err sample: {r['sample_err'][:110]}")
         err_rate = 1 - (r["ok"] / r["n"] if r["n"] else 0)
