@@ -33,8 +33,14 @@ variable "sku_name" {
   default = "Developer_1"
 }
 # Log Analytics workspace that receives the APIM gateway LLM logs (below). This is
-# the billing source of truth: token usage lands in the dedicated table
-# ApiManagementGatewayLlmLog. Wired from module.monitor.log_analytics_id.
+# Currently UNUSED — kept deliberately, do not "clean up".
+#
+# It fed the Azure Monitor diagnostic setting that shipped GatewayLogs to the
+# workspace. That setting was removed (see the long note further down: the table
+# duplicated AppRequests row for row and nothing read it). The variable stays so
+# the restore snippet in that note is a single paste, and because the root
+# module already wires it — removing it here means editing two files to bring
+# gateway logging back for a debugging session.
 variable "log_analytics_workspace_id" { type = string }
 
 resource "azurerm_api_management" "apim" {
@@ -120,51 +126,51 @@ resource "azapi_update_resource" "diagnostic_metrics" {
   }
 }
 
-# APIM-level diagnostic SETTING (Azure Monitor) — routes the gateway LLM log
-# categories to the Log Analytics workspace. This is one HALF of the LLM token
-# billing pipeline:
-#   * this setting routes the GatewayLlmLogs category to the workspace's
-#     dedicated table (ApiManagementGatewayLlmLog), and
-#   * a per-API `largeLanguageModel` diagnostic (set in code by
-#     apim_provisioner._ensure_api_llm_diagnostic) is what actually turns token
-#     capture ON for each dynamically-created LLM API.
-# BOTH are required — verified on dev-a05 (2026-07-10): with only this setting and
-# no API-level diagnostic, streaming OpenAI token rows never reach the table.
+# NO Azure Monitor diagnostic setting on APIM — deliberately, and this is the
+# second category dropped from it rather than an oversight.
 #
-# logAnalyticsDestinationType = "Dedicated" gives the typed ApiManagementGatewayLlmLog
-# table (vs the generic AzureDiagnostics catch-all).
+# It used to route two categories to Log Analytics:
 #
-# Gateway request logs -> Log Analytics.
+# 1. GatewayLlmLogs -> ApiManagementGatewayLlmLog. Dropped first, because its
+#    token counts cannot be billed from. Measured on dev-15 (1180 requests):
+#    the prompt-token basis varies BY PROVIDER — claude-opus-4.8 reported 1,381
+#    against an actual 21,953 including cache reads (94% low), while
+#    gpt-5.4-mini reported 19,169, exactly prompt+cached. Same table, opposite
+#    conventions, and no column says which one a row uses. Streamed calls carry
+#    no content at all (0 of 114 rows) because SSE has no response body for the
+#    gateway to parse. The content it DID capture was a liability: full prompts
+#    and completions for every non-streamed call, unconditionally and for every
+#    tenant, which is not what docs/AUDIT.zh.md promises.
 #
-# GatewayLlmLogs is deliberately NOT collected. That category populates
-# ApiManagementGatewayLlmLog, and measuring it against Cosmos on dev-15
-# (1180 requests, per-model) showed its token counts are not usable:
+# 2. GatewayLogs -> ApiManagementGatewayLogs. Dropped now (2026-08-15). Nothing
+#    reads it: a whole-repo search finds the string only in this comment. And it
+#    is not merely unread, it is a DUPLICATE — measured on dev-19, that table
+#    and AppRequests held exactly the same 2,053 rows at ~2 MB each, the same
+#    calls written into the same workspace by two independent pipelines, one of
+#    which nobody queries. Ingestion scales with call volume (~1 MB per 1,000
+#    calls), so it is a bill that grows and never gets read.
 #
-#   * the prompt-token basis varies BY PROVIDER — for claude-opus-4.8 it
-#     reported 1,381 against an actual 21,953 including cache reads (94% low),
-#     while for gpt-5.4-mini it reported 19,169, which is exactly prompt+cached.
-#     Same table, opposite conventions, and no column says which one a row uses.
-#   * streamed calls carry no message content at all (0 of 114 rows), because
-#     SSE has no response body for the gateway to parse.
+# What still covers the ground it used to:
+#   * per-call latency + status  -> App Insights `requests` (AppRequests)
+#   * gateway vs backend split   -> `requests` joined to `dependencies`
+#   * token counts               -> llm-emit-token-metric (customMetrics) and
+#                                   the hub's copilot_usage via Event Hub -> Cosmos
+#   * audit trail                -> the hub's audit blob, not a gateway log
 #
-# So it cannot be billed from, and the content it does capture is a liability:
-# full prompts and completions for non-streamed calls, unconditionally and for
-# every tenant, which is not what docs/AUDIT.zh.md promises. Billing comes from
-# the hub's own copilot_usage via Event Hub; latency comes from GatewayLogs and
-# App Insights `requests`. Nothing reads this table.
+# What is genuinely given up: client IP, cache-hit status, and the raw
+# api/operation ids — useful for ad-hoc forensics, used by nothing today.
 #
-# Dropping it also removes the v2-tier constraint: GatewayLlmLogs does not exist
-# on Developer_1, so this resource used to fail apply on the default SKU.
-resource "azurerm_monitor_diagnostic_setting" "apim_llm_logs" {
-  name                           = "apim-gateway-llm-logs"
-  target_resource_id             = azurerm_api_management.apim.id
-  log_analytics_workspace_id     = var.log_analytics_workspace_id
-  log_analytics_destination_type = "Dedicated"
-
-  enabled_log {
-    category = "GatewayLogs"
-  }
-}
+# Dropping the resource also removes a v2-tier constraint: GatewayLlmLogs does
+# not exist on Developer_1, so this used to fail apply on the default SKU.
+#
+# To bring it back for a debugging session, add:
+#   resource "azurerm_monitor_diagnostic_setting" "apim_gateway_logs" {
+#     name                           = "apim-gateway-logs"
+#     target_resource_id             = azurerm_api_management.apim.id
+#     log_analytics_workspace_id     = var.log_analytics_workspace_id
+#     log_analytics_destination_type = "Dedicated"
+#     enabled_log { category = "GatewayLogs" }
+#   }
 
 # NOTE: APIM's identity deliberately has NO Cosmos role. It held "Cosmos DB Data
 # Contributor" for an outbound policy that wrote one usage document per call.
