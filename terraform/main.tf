@@ -37,6 +37,7 @@ module "monitor" {
   tags        = local.tags
 
   resource_group_name = azurerm_resource_group.this.name
+  sampling_percentage = var.app_insights_sampling_percentage
 }
 
 # --- Secrets (Key Vault) ---
@@ -132,6 +133,7 @@ module "apim" {
   app_insights_connection_string = module.monitor.app_insights_connection_string
   sku_name                       = var.apim_sku
   log_analytics_workspace_id     = module.monitor.log_analytics_id
+  sampling_percentage            = var.apim_sampling_percentage
 }
 
 # --- App secrets in Key Vault (DB connection string, JWT secret, admin pwd) ---

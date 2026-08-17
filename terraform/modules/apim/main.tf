@@ -43,6 +43,20 @@ variable "sku_name" {
 # gateway logging back for a debugging session.
 variable "log_analytics_workspace_id" { type = string }
 
+# The UPSTREAM half of App Insights sampling: how much telemetry APIM SENDS.
+# The downstream half is the App Insights component's own ingestion sampling
+# (modules/monitor). They sit in series on one pipe — but turn this one, not
+# that one; see the root variable descriptions for why the downstream knob may
+# have no effect at all on APIM-sourced telemetry.
+#
+# Written in TWO places below and they must not diverge — see the note on
+# azapi_update_resource.diagnostic_metrics. That is exactly why this is a
+# variable rather than a literal: the two writes now cannot disagree.
+variable "sampling_percentage" {
+  type    = number
+  default = 100
+}
+
 resource "azurerm_api_management" "apim" {
   name                = substr("${var.name_prefix}-apim-${var.suffix}", 0, 50)
   location            = var.location
@@ -98,7 +112,7 @@ resource "azurerm_api_management_diagnostic" "appinsights" {
   resource_group_name      = var.resource_group_name
   api_management_logger_id = azurerm_api_management_logger.appinsights.id
 
-  sampling_percentage       = 100
+  sampling_percentage       = var.sampling_percentage
   always_log_errors         = true
   verbosity                 = "information"
   http_correlation_protocol = "W3C"
@@ -108,6 +122,19 @@ resource "azurerm_api_management_diagnostic" "appinsights" {
 # llm-emit-token-metric REQUIRES it (verified on dev-a02: requests logged but
 # customMetrics empty until metrics=true was PATCHed in). Patch it via azapi,
 # preserving the settings azurerm wrote above.
+#
+# This resource depends on the azurerm one (via resource_id), so terraform
+# always runs it SECOND — making it the last writer on the same ARM object.
+# Every field it repeats therefore WINS. That was a trap while the percentage
+# was a literal in both places: editing the azurerm one appeared to work,
+# terraform reported success, the plan showed the change, and azapi silently put
+# it back. Both now read `var.sampling_percentage`, so they cannot disagree.
+#
+# The repeated fields may not even be necessary — azapi_update_resource merges
+# its body into the existing resource, so `metrics` alone might suffice. That is
+# testable (drop them, apply, re-read sampling/alwaysLog from ARM) but untested,
+# and whoever wrote them may have been working around something the comment does
+# not record. Sharing the variable removes the hazard without betting on it.
 resource "azapi_update_resource" "diagnostic_metrics" {
   type        = "Microsoft.ApiManagement/service/diagnostics@2022-08-01"
   resource_id = azurerm_api_management_diagnostic.appinsights.id
@@ -120,7 +147,7 @@ resource "azapi_update_resource" "diagnostic_metrics" {
       httpCorrelationProtocol = "W3C"
       sampling = {
         samplingType = "fixed"
-        percentage   = 100
+        percentage   = var.sampling_percentage
       }
     }
   }

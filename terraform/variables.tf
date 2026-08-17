@@ -153,6 +153,85 @@ variable "cosmos_throughput_rus" {
   default     = 0
 }
 
+variable "apim_sampling_percentage" {
+  description = <<-EOT
+    How much of the APIM gateway's telemetry reaches Application Insights, in
+    percent. 100 = every request, which is the default and is what the
+    reconciliation depends on.
+
+    This is the SOURCE-side knob (how much APIM sends). It is written to the
+    `applicationinsights` diagnostic and applies to the `requests`, `traces` and
+    `dependencies` tables. It does NOT apply to customMetrics: per Azure docs,
+    "metrics (including custom metrics) are never sampled". So token counts stay
+    exact at any value here — the `metrics` flag is their on/off switch, not
+    sampling. Billing is unaffected either way; that rides hub -> Event Hub ->
+    Cosmos and never touches App Insights.
+
+    LOWERING THIS BREAKS EXACT RECONCILIATION, and it is worth being explicit
+    about why, because the numbers still look plausible afterwards:
+
+      * The ledger check is `gateway 200+429+4xx == cosmos documents + hub lost`.
+        The left side comes from `requests`, the right side does not. Sample the
+        left and the equality is gone.
+      * `always_log_errors = true` exempts errors, so ONLY the successes get
+        sampled. At 10% a run of 1,739 successes and 13 failures reads as ~174
+        and 13 — a 1.3% failure rate rendered as 7%.
+      * Breaker-shed 503s exist ONLY in `requests`; Cosmos has no document for a
+        request that never reached a hub. Today that was 252 of 2,004 calls.
+      * `sum(itemCount)` recovers an ESTIMATE, not the exact count. The value of
+        the current check is that it closes exactly — that is how 36 streaming
+        refusals and a 540-token gap were each traced to a cause. A tolerance
+        band would have hidden both.
+
+    So before lowering this, change the four KQL queries in
+    app/services/usage_ingest.py from `count()` to `sum(itemCount)`, and accept
+    that the ledger becomes approximate. Reasonable range if ingestion cost ever
+    justifies it: 5-20.
+  EOT
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.apim_sampling_percentage > 0 && var.apim_sampling_percentage <= 100
+    error_message = "apim_sampling_percentage must be in (0, 100]. 0 would send nothing at all; use the diagnostic's own removal if that is the intent."
+  }
+}
+
+variable "app_insights_sampling_percentage" {
+  description = <<-EOT
+    Ingestion sampling on the Application Insights component itself, in percent.
+    100 = keep everything, the default. LEAVE IT AT 100 and use
+    apim_sampling_percentage as the knob — reason below.
+
+    The two are in series: apim_sampling_percentage decides how much APIM sends,
+    this decides how much App Insights keeps of what arrives. So turning the
+    UPSTREAM one down definitely works (10 upstream + 100 here = 10 overall).
+
+    Turning THIS one down may do nothing. Azure's docs say "if adaptive or
+    fixed-rate sampling methods are enabled for a telemetry type, ingestion
+    sampling is disabled for that specific type" — and the APIM diagnostic
+    always sends samplingType = "fixed", even at 100. If APIM stamps its
+    telemetry the way an SDK does, ingestion sampling is bypassed for
+    requests/traces/dependencies entirely. Whether it does is UNVERIFIED here:
+    every measurement on this project was taken with both knobs at 100, which
+    cannot distinguish the two cases. Do not assume the percentages multiply.
+
+    Same blast radius as the other knob if it applies at all: requests, traces
+    and dependencies yes; customMetrics no (metrics are never sampled).
+
+    It is declared mainly so it is FINDABLE. It was previously absent from the
+    configuration entirely, running on Azure's implicit default, so anyone who
+    went looking for it in the repo would conclude it did not exist.
+  EOT
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.app_insights_sampling_percentage > 0 && var.app_insights_sampling_percentage <= 100
+    error_message = "app_insights_sampling_percentage must be in (0, 100]."
+  }
+}
+
 variable "github_repo_owner" {
   description = "Owner (user/org) of the repo hosting deploy-hub.yml."
   type        = string
