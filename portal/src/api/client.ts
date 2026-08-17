@@ -149,6 +149,24 @@ export interface UsageRecordView {
   prompt_tok: number;
   completion_tok: number;
   cached_tok: number;
+  // Cache WRITE — what it cost to populate the prompt cache. Only Anthropic
+  // splits this out; 0 elsewhere because there is nothing to report, not
+  // because it was dropped.
+  cache_write_tok: number;
+  // Priced at write time from upstream's own copilot_usage, so the log and the
+  // invoice cannot drift. cost = upstream's price, billed = after markup.
+  cost_usd: number;
+  billed_usd: number;
+  // Why cost is what it is. "copilot_usage" = upstream priced it, the number is
+  // real. "unpriced" = upstream priced NOTHING and the 0 is a placeholder.
+  // null = document predates the field. Without this a $0.00 is ambiguous and
+  // the table would present the ambiguity as fact.
+  cost_source: string | null;
+  // The hub had to estimate tokens because upstream returned none. Such rows
+  // must not settle a billing dispute, so they are marked rather than shown
+  // like measured ones.
+  estimated: boolean;
+  streamed: boolean;
 }
 
 // One server-side page of the Cosmos-sourced call log.

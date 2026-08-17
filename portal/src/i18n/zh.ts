@@ -240,7 +240,10 @@ export const zh: TranslationShape = {
     cost: "成本（USD）",
     billed: "计费（USD）",
     telemetrySection: "调用与延迟 — 来自 App Insights",
-    callLog: "调用记录",
+    // 与上方 App Insights 的标注对称，标明数据来源。两个区块是**不同的数据源**，
+    // 不是两种意见：Cosmos 只会看到到达了 hub 的调用，所以被熔断挡掉的 503
+    // 只出现在遥测区块，这里一条都不会有。
+    callLog: "调用记录 — 来自 Cosmos（计费源）",
     colTime: "时间",
     colModel: "模型",
     colKey: "项目 / 密钥",
@@ -248,6 +251,16 @@ export const zh: TranslationShape = {
     colPromptTok: "输入 token",
     colCompletionTok: "输出 token",
     colCachedTok: "缓存命中",
+    colCacheWriteTok: "缓存写入",
+    colCostUsd: "成本（USD）",
+    // 上游没有给出价格，写 0 就是把猜测伪装成事实。改为显示短横线并说明原因。
+    unpriced: "未定价",
+    unpricedHint:
+      "上游未对这次调用返回价格（非 Copilot 后端，或响应结构未被识别）。"
+      + "记为「未定价」而不是 $0.00 —— 导入器不会拿本地价目表去猜。",
+    estimated: "估算",
+    estimatedHint:
+      "上游未返回用量，这些 token 数是 hub 估算的。**不可**用于计费争议的裁定。",
     noRecords: "该租户暂无调用记录。",
     showAll: "显示全部 {{n}} 条",
     pagePrev: "上一页",

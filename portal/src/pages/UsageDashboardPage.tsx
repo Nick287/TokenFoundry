@@ -523,6 +523,8 @@ export function UsageDashboardPage() {
                   <th>{t("usage.colPromptTok")}</th>
                   <th>{t("usage.colCompletionTok")}</th>
                   <th>{t("usage.colCachedTok")}</th>
+                  <th>{t("usage.colCacheWriteTok")}</th>
+                  <th>{t("usage.colCostUsd")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -558,6 +560,36 @@ export function UsageDashboardPage() {
                     <td>{r.prompt_tok.toLocaleString()}</td>
                     <td>{r.completion_tok.toLocaleString()}</td>
                     <td>{r.cached_tok.toLocaleString()}</td>
+                    <td>{r.cache_write_tok.toLocaleString()}</td>
+                    {/* Cost carries its own provenance. An "unpriced" row is
+                        also $0.00, and rendering the two identically would turn
+                        "we could not price this" into "this was free" — the
+                        importer deliberately refuses to guess a price, and that
+                        refusal only helps if it stays visible here. Estimated
+                        token counts get the same treatment: they must not read
+                        like measured ones. */}
+                    <td className={r.cost_source === "unpriced" ? "cell-alert" : undefined}>
+                      {r.cost_source === "unpriced" ? (
+                        <span title={t("usage.unpricedHint")}>
+                          — <small>{t("usage.unpriced")}</small>
+                        </span>
+                      ) : (
+                        <>
+                          ${r.billed_usd.toFixed(4)}
+                          {r.estimated && (
+                            <>
+                              {" "}
+                              <small
+                                className="cell-alert"
+                                title={t("usage.estimatedHint")}
+                              >
+                                {t("usage.estimated")}
+                              </small>
+                            </>
+                          )}
+                        </>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>

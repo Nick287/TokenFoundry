@@ -243,7 +243,11 @@ export const en = {
     cost: "Cost (USD)",
     billed: "Billed (USD)",
     telemetrySection: "Calls & latency — from App Insights",
-    callLog: "Call log",
+    // Says where the rows come from, matching the App Insights label above.
+    // The two blocks are deliberately different sources, not two opinions:
+    // Cosmos only ever sees calls that reached a hub, so a breaker-shed 503
+    // appears in the telemetry block and nowhere here.
+    callLog: "Call log — from Cosmos (billing source)",
     colTime: "Time",
     colModel: "Model",
     colKey: "Project / Key",
@@ -251,6 +255,19 @@ export const en = {
     colPromptTok: "Prompt tok",
     colCompletionTok: "Completion tok",
     colCachedTok: "Cached tok",
+    colCacheWriteTok: "Cache write",
+    colCostUsd: "Cost (USD)",
+    // Upstream priced nothing for this call, so 0 would be a guess dressed as a
+    // fact. Shown as a dash with the reason instead.
+    unpriced: "unpriced",
+    unpricedHint:
+      "Upstream returned no price for this call (non-Copilot backend, or an "
+      + "unrecognised response shape). Recorded as unpriced rather than $0.00 — "
+      + "the importer does not guess from a local price table.",
+    estimated: "est.",
+    estimatedHint:
+      "The hub estimated these token counts because upstream returned none. "
+      + "Do not use this row to settle a billing dispute.",
     noRecords: "No call records yet for this tenant.",
     showAll: "Show all {{n}}",
     pagePrev: "Previous",

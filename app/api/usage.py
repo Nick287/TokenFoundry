@@ -101,6 +101,31 @@ def _extract_tokens(record: dict) -> tuple[int, int, int]:
     return (int(prompt), int(completion), int(cached))
 
 
+def _extract_cache_write(record: dict) -> int:
+    """Cache-WRITE tokens, i.e. what it cost to populate the prompt cache.
+
+    Separate from `_extract_tokens` rather than a fourth tuple element: the
+    aggregation path has no use for it and changing that signature would touch
+    code that is right as it is.
+
+    Only upstream splits this out. The hub's own normalized counts have no
+    cache-write equivalent, which is why the importer writes an explicit
+    `cache_write_tok: 0` for those rows — so a missing key means "old document",
+    not "no cache writes".
+
+    Anthropic calls it `cache_creation_input_tokens`; OpenAI's schema has no
+    equivalent, so this stays 0 there rather than being faked from another
+    field.
+    """
+    if "cache_write_tok" in record:
+        return int(record.get("cache_write_tok", 0) or 0)
+    raw = record.get("raw_response")
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if not isinstance(usage, dict):
+        return 0
+    return int(usage.get("cache_creation_input_tokens", 0) or 0)
+
+
 def _summarize(tenant_id: str, rows: list[dict]) -> UsageSummary:
     summary = UsageSummary(tenant_id=tenant_id)
     for r in rows:
@@ -119,7 +144,7 @@ def _summarize(tenant_id: str, rows: list[dict]) -> UsageSummary:
 
 def _to_record_view(r: dict, key_projects: dict[str, dict] | None = None) -> dict[str, Any]:
     """Flatten a raw usage document into a compact row for the portal's call
-    log (time / model / key+project / tokens).
+    log (time / model / key+project / tokens / cost).
 
     `key_projects` maps a virtual-key id -> {"project_id", "project_name"} so the
     log can show the owning project alongside the key (resolved from PostgreSQL;
@@ -145,6 +170,25 @@ def _to_record_view(r: dict, key_projects: dict[str, dict] | None = None) -> dic
         "prompt_tok": prompt,
         "completion_tok": completion,
         "cached_tok": cached,
+        "cache_write_tok": _extract_cache_write(r),
+        # Priced at WRITE time from upstream's own `copilot_usage`, so the log
+        # and the invoice cannot drift apart. cost = upstream's price;
+        # billed = after our per-model markup.
+        "cost_usd": float(r.get("cost_usd", 0.0) or 0.0),
+        "billed_usd": float(r.get("billed_usd", 0.0) or 0.0),
+        # Without this a $0.00 is ambiguous, and the portal would present the
+        # ambiguity as fact. "copilot_usage" = upstream priced it and the answer
+        # really is that number; "unpriced" = upstream priced NOTHING for this
+        # call (non-Copilot backend, or a response shape we did not recognise)
+        # and the 0 is a placeholder. The importer already refuses to guess from
+        # a local price table for exactly this reason — surfacing the flag is
+        # what keeps that refusal visible instead of silently rendering as $0.
+        "cost_source": r.get("cost_source"),
+        # True when the hub had to ESTIMATE token counts because upstream
+        # returned none. Such rows must not be used to settle a billing dispute,
+        # so the log has to say so rather than showing them like measured ones.
+        "estimated": bool(r.get("estimated")),
+        "streamed": bool(r.get("streamed")),
     }
 
 
