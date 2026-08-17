@@ -2,6 +2,16 @@
 
 > 整理自与助手的讨论，事实点已对照微软官方文档源（`MicrosoftDocs/azure-docs`、`MicrosoftDocs/azure-ai-docs`）核对。
 > 日期：2026-07-02。具体策略名/字段/GA 状态仍在迭代，落地前以最新官方文档为准。
+>
+> ⚠️ **本文是"能力与决策笔记"，不是当前实现的说明书。** 它写在大量实测之前，其后有几条
+> 结论被我们自己的测量推翻了。凡是被推翻的地方，本文**保留原文并就地标注**——因为当初
+> 为什么那样想、后来是什么证据改变了它，本身就是有用的信息。已知的三处：
+>
+> | 位置 | 当时的结论 | 现在 |
+> | --- | --- | --- |
+> | TL;DR 第 5 条 | 推荐 session-aware 会话粘性 | ❌ 实测为**负资产**，见 [CAPACITY.zh.md §4.3](CAPACITY.zh.md) |
+> | §4 dev-a05 一节 | 计费完全走 APIM 的 LlmLog | ❌ 计费改走 hub → Event Hub → Cosmos，该日志**已不再采集** |
+> | §5.6 示例 | outbound 读 `context.Response.Body` | ⚠️ 会**压平流式**，见该节警告 |
 
 ## TL;DR（最重要的结论）
 
@@ -10,6 +20,12 @@
 3. **⚠️ 概念纠正（关键）**：APIM 的 **语义缓存（semantic cache）** 缓存的是"**整段问答的最终答案**"，命中即**跳过大模型**返回旧答案 —— 适合 FAQ/重复问答，**不适合多轮聊天**（几乎不命中，误命中会串答案）。
 4. **多轮聊天/长上下文省钱**要的是另一套机制：**Azure OpenAI 自带的 Prompt Caching**（前缀缓存），**默认开启、无需配置**，对重复的输入前缀打折计费。
 5. 对"连续聊天"场景的推荐组合：**APIM 同构后端池 + session-aware 会话粘性 + token 计量**，省钱靠**下游 Prompt Caching + 稳定的 prompt 前缀**；**不要开 APIM 语义缓存**。
+
+   > ❌ **会话粘性这一条已被实测推翻**（见 [CAPACITY.zh.md §4.3](CAPACITY.zh.md)）。推理是
+   > "同一会话打到同一个 hub → 复用它的 prompt 缓存"，但**前提不成立**：Anthropic 的
+   > prompt 缓存在**上游**、按**内容**寻址，不属于某个 hub、也不属于某个 GitHub 账号。
+   > 在两套环境、六个账号上复现的结果是**亲和收益恒为零**，而代价是真的：粘性会把负载
+   > 压向单个 hub，正好抵消掉后端池的意义。**其余四条仍然成立。**
 
 ---
 
@@ -113,7 +129,21 @@ Client ──> APIM (AI Gateway)
 
 ### ⚠️⚠️ dev-a05 实测（2026-07-10）：openai 流式 token=0 的真相与修复
 
-**结论先行**：官方 LlmLog（`ApiManagementGatewayLlmLog`）**能**精确记录 openai 流式
+> ❌ **本节的结论已被取代，但过程仍然有效——所以保留原文。**
+>
+> 当时的结论是"计费完全走 APIM 的 LlmLog"。后来在 dev-15 上把 `ApiManagementGatewayLlmLog`
+> 与 Cosmos 逐模型对比（1,180 次请求），发现它**根本不能用来计费**：prompt token 的口径
+> **随 provider 变化**——claude-opus-4.8 报 1,381 而实际含缓存读取是 21,953（低 94%），
+> 同一张表里 gpt-5.4-mini 报的却正好是 prompt+cached。**没有任何一列告诉你某行用的是
+> 哪种口径。** 加上流式行完全没有内容（114 行中 0 行），该类别已被**彻底停止采集**。
+>
+> 现在：**计费走 hub → Event Hub → Capture → 导入 → Cosmos**，实时 token 观测走
+> `llm-emit-token-metric`（customMetrics）。两者都不解析网关侧的响应体。
+>
+> **下面的排查过程本身依然值得读**——它是"对照实验定位根因"的范例，而且那个
+> `"object":"chat.completion.chunk"` 的发现解释了 APIM 如何识别 OpenAI 流式 chunk。
+
+**当时的结论**：官方 LlmLog（`ApiManagementGatewayLlmLog`）**能**精确记录 openai 流式
 token —— 前提是后端每个 SSE chunk 带 `"object":"chat.completion.chunk"` 字段。GitHub
 Copilot hub 原本**不带**，导致 completion=0。在 hub 侧给流式 chunk 注入该字段后，LlmLog
 立即精确记录（实测探针 15/36/43 全对）。计费**完全走 APIM 的 LlmLog**。
@@ -443,6 +473,19 @@ resource pool 'Microsoft.ApiManagement/service/backends@2023-09-01-preview' = {
 ```
 
 ### 5.6 Session awareness 的 cookie 处理
+
+> 🔴 **下面这段示例读了 `context.Response.Body`。在流式 API 上照抄会压平整条流。**
+>
+> `As<JObject>()` 必须拿到**整个**响应体才能解析，于是 APIM 会一直扣着响应——连响应头
+> 一起——直到上游结束。dev-18 实测：客户端首字节从直连 hub 的 **0.94s** 变成经 APIM 的
+> **44.08s**，且整个 body 一次性到达。我们自己的 usage trace 里就写过一模一样的表达式，
+> 删掉它之后首字节回到 3.08s、字节分布回到 71%。
+>
+> 更糟的是它**换不来任何东西**：SSE 响应不是 JSON 对象，`As<JObject>()` 在它所损害的
+> 那些调用上必然抛异常。**在非流式路径上验证过的策略，不等于在流式路径上安全。**
+>
+> 本项目的守护测试断言整个 outbound 段不含 `Response.Body`（`tests/test_apim_policy.py`），
+> 因为这个错误在同一个文件里犯过两次。
 
 启用会话粘性后，**客户端必须自己处理 cookie**：存下 `Set-Cookie` 值并在后续请求带上。对 Assistants API 这类场景，可在 `outbound` 用 policy 从响应体取 `thread id` 拼进 cookie 的 `Path`：
 

@@ -1,5 +1,23 @@
 # customMetrics / Diagnostic / LlmLog 排查记录
 
+> ⚠️ **本文是历史排查记录。其中关于 `ApiManagementGatewayLlmLog` 的结论已被取代。**
+>
+> 当时判定它"有数据、且准确"。后来在 dev-15 上把它与 Cosmos 逐模型比对（1,180 次
+> 请求）才发现**它不能作为计费口径**：prompt token 的基准**随 provider 变化**——
+> claude-opus-4.8 报 1,381 而含缓存读取的实际值是 21,953（低 94%），同一张表里
+> gpt-5.4-mini 报的却正好是 prompt+cached，**且没有任何一列标明某行用的是哪种口径**。
+> 流式行完全没有内容（114 行中 0 行）。该类别现已**彻底停止采集**。
+>
+> 2026-08-15 起 `GatewayLogs` 也一并关闭（与 `AppRequests` 逐行重复、无人读取），
+> 所以 **APIM 上不再有任何 Azure Monitor 诊断设置**。
+>
+> **现状**：计费走 hub → Event Hub → Capture → 导入 → Cosmos；实时 token 观测走
+> `llm-emit-token-metric`（customMetrics）。本文里关于 **customMetrics 与 diagnostic
+> 的部分依然有效**——尤其是 `metrics: true` 那个静默失效的坑，它至今仍是
+> customMetrics 的唯一开关。
+>
+> ---
+>
 > 2026-07-20。一次耗时很长的排查，结论对将来配 APIM token 计量至关重要。
 > 核心一句话：**API 级诊断漏配 `metrics=true` 会静默关闭 emit-token-metric（customMetrics），
 > 表现为 Token 细分 UI 空白、cached 拿不到。**

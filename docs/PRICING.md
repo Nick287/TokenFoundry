@@ -11,6 +11,27 @@ What Token Foundry costs to run, by tier — from a "which SKU do I pick" angle.
 > storage sizes). The only estimate is Log Analytics' monthly ingested GB, given
 > as a range.
 >
+> **dev-17 was reclaimed on 2026-08-09 and dev-18 on 2026-08-15; the current
+> environment is dev-19.** The figures were not re-measured and do not need to
+> be: all three come from the **same terraform**, and dev-19's apply was 45 added
+> / 0 destroyed with a resource set identical to dev-18's. Same shapes, same unit
+> prices, same money. dev-17 is still named here rather than swapped for dev-19
+> because that is where the quantities were actually read.
+>
+> Two things have since REDUCED cost, not yet re-measured:
+>
+> * `ApiManagementGatewayLogs` collection was turned off (2026-08-15), roughly
+>   −1 KB of Log Analytics ingestion per call.
+> * The response-body read was removed from `_USAGE_TRACE`, shrinking `traces`
+>   rows.
+>
+> ⚠️ **This page covers Azure infrastructure only, not GitHub Copilot usage.**
+> The scale assumptions (account counts, concurrency tiers) come from partner
+> test accounts and are for evaluation only; per-account capacity is a black box
+> the upstream never discloses, and repeat runs on the same accounts are bimodal.
+> **Customer capacity and cost must be re-measured on the customer's own
+> accounts** — see [CAPACITY.zh.md §0](CAPACITY.zh.md).
+>
 > The previous version of this page was assembled by hand and priced a
 > **different environment**: a Developer-tier APIM in Central US, with no Event
 > Hubs, no audit blob store and no usage-capture store at all. The tables below
@@ -21,7 +42,7 @@ What Token Foundry costs to run, by tier — from a "which SKU do I pick" angle.
 
 ---
 
-## What we actually pay today (dev-17, 3 GitHub accounts)
+## What we actually pay today (read from dev-17; dev-19 is identical in shape)
 
 | Component | Configuration | **USD / month** |
 |---|---|---|
@@ -124,28 +145,29 @@ Extrapolated from coefficients measured today (**1.74 KB per usage document**,
 the account count and the hub row — **it is the most sensitive input in the
 table**.
 
-² **`cosmos_throughput_rus` now defaults to 400 (provisioned)**, so the **next
-environment created** is built that way. Provisioned works out to $0.0222 per
-million RU against serverless's $0.285 — **12.8× cheaper** — so it wins above
-roughly **8% utilisation** (about 8M calls/month at 400 RU/s). At 10M/month
-utilisation is 10% (saves $7); at 20M/month it is 20% (saves $35).
+² **`cosmos_throughput_rus` defaults to 0 (serverless).** It briefly defaulted
+to 400 (provisioned); dev-18 was built to test that and disproved it. The
+surface arithmetic is persuasive: provisioned works out to $0.0222 per million
+RU against serverless's $0.285 — **12.8× cheaper** — so it appears to win above
+roughly **8% utilisation**, about 8M calls/month at 400 RU/s.
 
-> ⚠️ **400 RU/s covers steady-state writes only — it does not survive a load
-> test or heavy dashboard use.** Measured on dev-18 (2026-08-09): 8% utilisation
-> during a smoke test, then **100% saturated for 45+ minutes** the moment a ramp
-> started, with **2,236 throttled requests** (23% of all Cosmos requests) in six
-> hours.
+> ⚠️ **The break-even is self-contradictory: the volume at which provisioned-400
+> becomes cheaper is already the volume at which provisioned-400 does not work.**
+> 8M calls/month averages ~33 RU/s. The dev-18 campaign averaged exactly that —
+> and Cosmos throttled it **2,904 times**, sitting at 100% of the 400 RU/s
+> ceiling for 45 minutes straight.
 >
-> That break-even counts **writes** (~10 RU per call) and misses three things:
-> the importer writes in 300-second bursts rather than smoothly, a
-> cross-partition aggregate costs up to 5,000 RU — **12.5 seconds of a 400 RU/s
-> budget in a single query** — and reconciliation/dashboards poll. Serverless
-> has no ceiling to hit, which is why four earlier campaigns never surfaced it.
+> The cause is **shape, not size**. Peak demand over a whole minute was 255 RU/s,
+> comfortably under 400 — but Cosmos enforces per second, and this workload is
+> spiky by construction: the importer flushes a whole Capture blob at once every
+> 300s, and one cross-partition aggregate costs up to 5,000 RU, i.e. **12.5
+> seconds of a 400 RU/s budget in a single query**. Clearing that needs 1000+
+> RU/s, which pushes break-even past ~20M calls/month. Serverless has no ceiling
+> to hit, which is why four earlier campaigns never surfaced any of this.
 >
-> **Nothing was lost** (the SDK retries 429, and the final document count
-> matched prediction exactly) but import latency stretched badly. For load
-> testing or heavy dashboard use, raise to 1000+ RU/s or use autoscale
-> (`autoscale max 1000`, billed at 10% when idle). See
+> **Nothing was lost either way** — the importer only advances its watermark
+> after a whole blob is in, and the SDK retries 429 — so the cost of getting
+> this wrong is import latency, not billing gaps. See
 > [CAPACITY.zh.md](CAPACITY.zh.md) §7.6.
 
 > ⚠️ **This switch only works at environment-creation time, and terraform's plan
@@ -157,9 +179,12 @@ utilisation is 10% (saves $7); at 20M/month it is 20% (saves $35).
 > "Refreshing state", with zero planned changes.) The failure is safe — nothing
 > is destroyed — but the switch cannot be made this way.
 >
-> dev-17 is therefore pinned to `cosmos_throughput_rus = 0` in
-> `terraform.tfvars`; **a new environment should delete that line** and take the
-> 400 default.
+> dev-17 was therefore pinned to `cosmos_throughput_rus = 0` in
+> `terraform.tfvars`. **0 is now the default**, so a new environment writes
+> nothing at all — dev-19 has no such line and came up serverless (verified:
+> `capabilities: [{"name":"EnableServerless"}]`). The reverse is what now needs
+> pinning: an environment already CREATED provisioned must state its own value,
+> or the next apply tries to make it serverless and fails. dev-18 pinned 400.
 
 **The cost structure inverts as volume grows.** APIM is 71–74% of today's bill;
 by 20M calls/month **hub Container Apps + Log Analytics together exceed it**. At
@@ -318,7 +343,7 @@ per extra million), and whether Standard v2's VNet integration is by then in use
    writes. Note Capture bills a **flat TU-hour rate, independent of event
    volume** — a whole day of load testing produced ~1,800 events, so that money
    buys "switched on", nothing else.
-3. **Log Analytics sampling / daily cap** — today `sampling_percentage = 100`
+3. **Log Analytics sampling / daily cap** — today `apim_sampling_percentage = 100`
    (every call logged) and `dailyQuotaGb = -1` (uncapped). At dev volume that is
    at most $44.85/month, but **it is the fastest-growing line as volume rises**.
    Measured billed telemetry is **3.85 KB per call**:
@@ -339,23 +364,43 @@ per extra million), and whether Standard v2's VNet integration is by then in use
 
    10M calls/month $110 → $20; 20M calls/month $219 → $39.
 
-   > ⚠️ **Sampling breaks the exact reconciliation.** The closure check
-   > `gateway 200 == cosmos with-tokens + Σ hub lost` counts App Insights
-   > `requests`. Logging only 10% forces a ÷0.1 extrapolation, degrading it from
-   > "equal to the record" into "a statistical estimate". customMetrics and
-   > Cosmos are unaffected; what's lost is **gateway-side request-count
-   > precision**. A workable compromise: run at 10% normally and turn it back to
-   > 100% for a reconciliation campaign (the APIM diagnostic property takes
-   > effect in seconds, no rebuild).
+   > The table above was measured in early 2026-08 and two entries have since
+   > moved — correct them at the next re-measurement:
+   >
+   > * The 974 B for `traces` is too high. `_USAGE_TRACE` no longer reads the
+   >   response body for a `usage` field (it flattened streaming — CAPACITY §7.7);
+   >   five short attributes remain. **Not re-measured.**
+   > * The table **omits `ApiManagementGatewayLogs`**, which was switched on at
+   >   the time and measured ~**1 KB/call** on dev-19 — so the real total was
+   >   closer to 4.9 KB than 3.85 KB. Collection stopped on 2026-08-15 (it
+   >   duplicated `AppRequests` row for row and nothing read it), so this line is
+   >   now zero.
 
-4. **Cosmos provisioned is already the default for new environments**
-   (`cosmos_throughput_rus = 400`). Existing serverless environments can't be
-   switched, and shouldn't be — see footnote ² above.
+   > ⚠️ **Sampling breaks the exact reconciliation.** The closure check counts
+   > App Insights `requests`. Logging only 10% means extrapolating with
+   > `sum(itemCount)`, degrading it from "equal to the record" into "a
+   > statistical estimate". Exactness is what let 36 streaming refusals and a
+   > 540-token gap each be traced to a cause. customMetrics and Cosmos are
+   > unaffected; what's lost is **gateway-side request-count precision**.
+   >
+   > Two further traps: `always_log_errors = true` keeps every error while
+   > sampling the successes, so **the failure rate is inflated** (1.3% renders as
+   > ~7% at 10%); and breaker-shed 503s exist **only** in `requests` — Cosmos has
+   > no document for them.
+   >
+   > A workable compromise: run at 10% normally and turn it back to 100% for a
+   > reconciliation campaign (the APIM diagnostic property takes effect in
+   > seconds, no rebuild). **Before lowering it, change the four KQL queries in
+   > `app/services/usage_ingest.py` from `count()` to `sum(itemCount)`.**
+
+4. **Cosmos defaults to serverless** (`cosmos_throughput_rus = 0`). It briefly
+   defaulted to provisioned 400 until dev-18 disproved that — see footnote ²
+   above. Existing environments can't be switched either way, and shouldn't be.
 
 ---
 
 *Unit prices: Azure Retail Prices API (`prices.azure.com`), **Southeast Asia**,
-USD, pay-as-you-go, pulled 2026-08. Quantities: `az` against the running dev-17.
+USD, pay-as-you-go, pulled 2026-08. Quantities: `az` against dev-17 while it ran (since reclaimed; dev-19 is built from the same terraform and is identical in shape).
 For another region or agreement, confirm on the
 [Azure pricing calculator](https://azure.microsoft.com/en-us/pricing/calculator/).
 The classic-tier table keeps its older Central US list prices and was not
