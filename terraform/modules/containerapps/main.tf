@@ -32,6 +32,16 @@ variable "cosmos_account_name" { type = string }
 variable "cosmos_account_id" { type = string }
 variable "app_insights_id" { type = string }
 variable "apim_service_name" { type = string }
+# Passed through to the control plane because the API-level diagnostics it
+# writes are NOT terraform-managed: the llm-* APIs are created at runtime
+# when a GitHub account is added, so terraform cannot know their names.
+# Terraform owns the SERVICE-level diagnostic; the control plane owns the
+# per-API ones, and both must carry the same value or the portal shows a
+# number that does not govern the traffic.
+variable "apim_sampling_percentage" {
+  type    = number
+  default = 100
+}
 variable "apim_id" { type = string }
 variable "acr_id" { type = string }
 variable "acr_login_server" { type = string }
@@ -244,6 +254,10 @@ resource "azurerm_container_app" "app" {
       env {
         name  = "TF_APIM_SERVICE_NAME"
         value = var.apim_service_name
+      }
+      env {
+        name  = "TF_APIM_SAMPLING_PERCENTAGE"
+        value = tostring(var.apim_sampling_percentage)
       }
       env {
         name  = "TF_APP_INSIGHTS_RESOURCE_ID"

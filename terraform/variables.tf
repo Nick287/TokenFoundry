@@ -187,13 +187,36 @@ variable "apim_sampling_percentage" {
     app/services/usage_ingest.py from `count()` to `sum(itemCount)`, and accept
     that the ledger becomes approximate. Reasonable range if ingestion cost ever
     justifies it: 5-20.
+
+    0 IS ALLOWED and is a distinct posture, not just "very low". Combined with
+    alwaysLog=allErrors — which is set on every API diagnostic and was verified
+    working on dev-19 (2026-08-20: at 10%, successes stored 5 of 50 while all 17
+    failures were kept) — zero means:
+
+        successful requests : not logged at all
+        failed requests     : every one still logged
+        customMetrics       : untouched, metrics are never sampled
+        Cosmos billing      : untouched, it never went through App Insights
+
+    That is a cleaner trade than a low non-zero value: 10% keeps a random tenth
+    of successes, which is neither cheap nor accurate. 0 says plainly "successes
+    are not worth storing, failures are".
+
+    What it costs: the gateway side of the reconciliation goes away entirely
+    (the ledger's `gateway 200` term is unmeasurable), along with call counts,
+    latency percentiles and the portal's traffic charts. Breaker-shed 503s
+    survive, since they are errors.
+
+    Reach for 0 when ingestion volume actually hurts — Azure warns that logging
+    every event can cost 40-50% of throughput at high request rates — not to
+    save the few dollars it amounts to at low volume.
   EOT
   type        = number
   default     = 100
 
   validation {
-    condition     = var.apim_sampling_percentage > 0 && var.apim_sampling_percentage <= 100
-    error_message = "apim_sampling_percentage must be in (0, 100]. 0 would send nothing at all; use the diagnostic's own removal if that is the intent."
+    condition     = var.apim_sampling_percentage >= 0 && var.apim_sampling_percentage <= 100
+    error_message = "apim_sampling_percentage must be between 0 and 100."
   }
 }
 
@@ -229,6 +252,47 @@ variable "app_insights_sampling_percentage" {
   validation {
     condition     = var.app_insights_sampling_percentage > 0 && var.app_insights_sampling_percentage <= 100
     error_message = "app_insights_sampling_percentage must be in (0, 100]."
+  }
+}
+
+variable "log_retention_days" {
+  description = <<-EOT
+    Log Analytics retention in days.
+
+    NOT a cost lever. PerGB2018 includes the first 31 days free, so 7 and
+    30 bill identically; ingestion is what costs money, and it is charged
+    once per GB on the way in. Measured on dev-19: 28 MB over 7 days, of
+    which 57% was the control plane's own console log — which is why the
+    健康-probe access lines were filtered out rather than the retention cut.
+
+    It IS a data-minimisation lever: the diagnostic has logClientIp on, so
+    these tables carry caller IP addresses.
+
+    LOWERING IT SAVES NOTHING. Azure's own wording: "lowering the retention
+    period below 31 days does not reduce costs, as 31 days of analytics
+    retention are included in the ingestion price." You pay per GB once, on the
+    way IN; retention is only charged beyond 31 days.
+
+    So 30 means "no retention charge, with a full month to debug from". The way
+    to spend less on logs is to ingest less — which is why the health-probe
+    access lines were filtered out (82% of the control plane's log volume) and
+    the duplicate GatewayLogs collection was switched off, rather than the
+    window being shortened.
+
+    The provider also refuses under 30 anyway. Attempted 7 on 2026-08-20:
+
+        Error: expected retention_in_days to be in the range (30 - 730), got 7
+
+    rejected at plan time, before the request reached Azure. (Azure's API/CLI
+    can go as low as 4 days, so this is a provider bound rather than a platform
+    one — but going there would buy data minimisation only, never money.)
+  EOT
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.log_retention_days >= 30 && var.log_retention_days <= 730
+    error_message = "PerGB2018 allows 30-730 days. Values under 30 are rejected by the provider before reaching Azure, and would not save anything: the first 31 days of retention are included in the per-GB ingestion charge."
   }
 }
 

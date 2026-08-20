@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     azure_subscription_id: str = ""
     resource_group: str = ""
     apim_service_name: str = ""
+    # Telemetry sampling for the per-API diagnostics this service writes.
+    #
+    # Terraform owns the SERVICE-level diagnostic; it cannot own the per-API ones
+    # because the llm-* APIs are created here at runtime, when a GitHub account
+    # is added. Both must carry the same number: an API-level diagnostic
+    # OVERRIDES the service-level one, and fields it omits do NOT fall back —
+    # measured on dev-19, where a service-level 10% left the LLM APIs logging
+    # 73/73 and 20/20, i.e. fully unsampled.
+    apim_sampling_percentage: int = 100
     # ACR + Key Vault names + region — injected by terraform (TF_ACR_NAME /
     # TF_KEYVAULT_NAME / TF_AZURE_LOCATION, plus TF_ACR_LOGIN_SERVER for image
     # refs). The Portal's "push SP creds to GitHub" flow (app/api/deploy_config.py)

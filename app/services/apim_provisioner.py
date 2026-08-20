@@ -333,6 +333,15 @@ class ApimProvisioner:
         self._sub_id = s.azure_subscription_id
         self._rg = s.resource_group
         self._service = s.apim_service_name
+        # Clamped to the range APIM accepts rather than trusted: this arrives
+        # through an env var, where a typo is silent.
+        #
+        # 0 is deliberately permitted. With alwaysLog=allErrors (set on every
+        # API diagnostic below) it means "log failures, drop successes" — a
+        # coherent posture, and a cheaper one than any low non-zero value, which
+        # keeps a random fraction of successes and is therefore neither complete
+        # nor cheap. Verified on dev-19 that errors do survive sampling.
+        self._sampling_percentage = min(max(int(s.apim_sampling_percentage), 0), 100)
         # No Cosmos coordinates here any more: APIM no longer writes usage
         # documents (see `_build_provider_policy`). Cosmos is reached only by the
         # control plane's own ingest/import services.
@@ -1050,6 +1059,36 @@ class ApimProvisioner:
             "properties": {
                 "loggerId": logger_id,
                 "metrics": True,
+                # An API-level diagnostic OVERRIDES the service-level one, and a
+                # field it omits does NOT fall back — it takes APIM's own
+                # default. Measured on dev-19 (2026-08-20): with the service
+                # diagnostic set to 10% sampling and alwaysLog=allErrors, the
+                # llm-* APIs logged 73 of 73 successes and 20 of 20 failures.
+                # Fully unsampled, because this body carried neither field.
+                #
+                # The consequence was not a wrong number on a dashboard: it made
+                # `apim_sampling_percentage` inert. Anyone lowering it to cut
+                # ingestion would have seen the log volume refuse to move, with
+                # nothing anywhere saying why. Restating the values here is what
+                # makes that variable mean something for the APIs that carry all
+                # the traffic.
+                "sampling": {
+                    "samplingType": "fixed",
+                    "percentage": self._sampling_percentage,
+                },
+                # Errors skip sampling. Only observable once sampling is below
+                # 100 — at 100 every request is kept anyway, so this field has no
+                # effect and cannot be verified. Set regardless: the moment
+                # somebody does lower the percentage, failures must stay whole or
+                # the failure RATE on screen becomes fiction (successes sampled,
+                # errors not).
+                "alwaysLog": "allErrors",
+                # Matches the service-level setting. The two disagreed before —
+                # service W3C, API-level defaulting to Legacy — which quietly
+                # changed the correlation-id format for exactly the APIs that
+                # serve traffic.
+                "httpCorrelationProtocol": "W3C",
+                "verbosity": "information",
             }
         }
         try:
@@ -1057,7 +1096,11 @@ class ApimProvisioner:
             with httpx.Client(timeout=30.0) as hc:
                 r = hc.put(url, headers=headers, json=body)
                 r.raise_for_status()
-            logger.info("API diagnostic pinned (metrics on, LLM logging off) on %s", api_id)
+            logger.info(
+                "API diagnostic pinned on %s (metrics on, sampling %d%%, "
+                "alwaysLog=allErrors, LLM logging off)",
+                api_id, self._sampling_percentage,
+            )
         except (httpx.HTTPError, HttpResponseError) as exc:
             logger.warning("API diagnostic on %s skipped: %s", api_id, exc)
 

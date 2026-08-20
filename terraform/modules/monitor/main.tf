@@ -5,6 +5,26 @@ variable "location" { type = string }
 variable "tags" { type = map(string) }
 variable "resource_group_name" { type = string }
 
+# How long Log Analytics keeps data, in days.
+#
+# NOT a cost lever: PerGB2018 includes the first 31 days of retention
+# free, so anything at or under that bills the same as 7. What you pay
+# for is INGESTION — each GB is charged once on the way in. Shortening
+# retention only shortens how far back you can look.
+#
+# It IS a data-minimisation lever: the diagnostic has logClientIp on, so
+# these tables hold caller IP addresses. Keeping them 7 days instead of
+# 30 is a smaller footprint of personal data, which is a real reason even
+# though it is not a financial one.
+#
+# ⚠️ Azure may reject values below 30 on PerGB2018 — 7 is documented as
+# available only on the legacy Free tier. Verified on dev-19 (see the
+# apply result recorded with this change).
+variable "retention_in_days" {
+  type    = number
+  default = 30
+}
+
 # The DOWNSTREAM half of App Insights sampling: how much the component KEEPS of
 # what reaches it. The upstream half is the APIM diagnostic's own sampling
 # (modules/apim), which decides how much is sent in the first place.
@@ -30,7 +50,7 @@ resource "azurerm_log_analytics_workspace" "law" {
   resource_group_name = var.resource_group_name
   tags                = var.tags
   sku                 = "PerGB2018"
-  retention_in_days   = 30
+  retention_in_days   = var.retention_in_days
 }
 
 resource "azurerm_application_insights" "appi" {

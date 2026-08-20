@@ -38,6 +38,7 @@ module "monitor" {
 
   resource_group_name = azurerm_resource_group.this.name
   sampling_percentage = var.app_insights_sampling_percentage
+  retention_in_days   = var.log_retention_days
 }
 
 # --- Secrets (Key Vault) ---
@@ -176,6 +177,7 @@ module "containerapps" {
   suffix                     = local.suffix
   subscription_id            = data.azurerm_client_config.current.subscription_id
   log_analytics_workspace_id = module.monitor.log_analytics_id
+  apim_sampling_percentage   = var.apim_sampling_percentage
   log_analytics_customer_id  = module.monitor.log_analytics_customer_id
   image_tag                  = var.image_tag
   hub_image_tag              = var.hub_image_tag
