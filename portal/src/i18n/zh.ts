@@ -22,6 +22,7 @@ export const zh: TranslationShape = {
     signIn: "登录",
     signingIn: "登录中…",
     failed: "登录失败",
+    sessionExpired: "登录已过期，已自动退出。请重新登录以继续。",
   },
   common: {
     loading: "加载中…",
@@ -67,6 +68,12 @@ export const zh: TranslationShape = {
     auditOn: "已开启",
     auditOff: "关闭",
     auditEnable: "开启审计",
+    // 功能封禁期间替代「开启审计」显示。用「暂不提供」而非「即将推出」——
+    // 链路是齐的，只是还没端到端验证过。
+    auditUnavailable: "暂不提供",
+    auditUnavailableHint:
+      "原文审计暂未开放。整条链路已就绪，但尚未端到端验证过，"
+      + "且它的失败是静默的——所以在真实环境上跑通并核实之前，保持关闭。",
     auditDisable: "关闭审计",
     auditOnTitle: "开启原文审计？",
     auditOnImpact:

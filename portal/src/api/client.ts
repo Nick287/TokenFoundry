@@ -258,6 +258,39 @@ export interface UsageBreakdown {
   totals: UsageTotals;
 }
 
+/**
+ * A non-2xx response, carrying the status so callers can branch on it.
+ *
+ * Previously every failure was a bare `Error("401: ...")`, which meant an
+ * expired session was indistinguishable from a real error at the call site —
+ * and nothing acted on it. The UI kept rendering, every panel came back empty,
+ * and it read as "the system is broken" rather than "sign in again".
+ */
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly detail: string,
+  ) {
+    super(`${status}: ${detail}`);
+    this.name = "ApiError";
+  }
+}
+
+/** Fired when the backend rejects our token. AuthProvider listens and logs out.
+ *
+ * An event rather than a direct call so this module stays free of any auth
+ * import — the dependency runs one way (auth -> client), and every call site
+ * gets the behaviour without having to remember it.
+ */
+export const UNAUTHORIZED_EVENT = "tf:unauthorized";
+
+function raise(status: number, detail: string): never {
+  if (status === 401) {
+    window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+  }
+  throw new ApiError(status, detail);
+}
+
 async function request<T>(
   path: string,
   token: string,
@@ -271,10 +304,7 @@ async function request<T>(
       ...(init?.headers ?? {}),
     },
   });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`${res.status}: ${detail}`);
-  }
+  if (!res.ok) raise(res.status, await res.text());
   return res.json() as Promise<T>;
 }
 
@@ -291,10 +321,7 @@ async function requestNoContent(
       ...(init?.headers ?? {}),
     },
   });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`${res.status}: ${detail}`);
-  }
+  if (!res.ok) raise(res.status, await res.text());
 }
 
 export const api = {

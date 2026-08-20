@@ -829,6 +829,17 @@ tr:focus-within .row-actions { opacity: 1; }
   font-size: 0.85rem;
 }
 
+/* An informational message, not a failure — used for "your session expired".
+   Deliberately not .error: nothing went wrong, and red would suggest the user
+   did something incorrect when they only sat idle too long. */
+.notice {
+  color: var(--muted);
+  font-size: 0.88rem;
+  border-left: 3px solid var(--accent, var(--muted));
+  padding: 0.4rem 0.7rem;
+  margin: 0.5rem 0;
+}
+
 /* --- Login --- */
 .login {
   max-width: 380px;

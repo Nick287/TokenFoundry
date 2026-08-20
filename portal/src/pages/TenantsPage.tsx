@@ -8,6 +8,25 @@ import { ConfirmDialog, Modal } from "../components/Modal";
 import { CopyId } from "../components/CopyId";
 import { useToast } from "../components/Toast";
 
+/**
+ * Raw-body archival is BUILT but not offered yet.
+ *
+ * Every layer is in place — the audit storage account and its container-scoped
+ * RBAC, the hub's uploader, the gateway's `x-tf-audit` stamp, this UI — but no
+ * tenant has ever had it switched on, so the path has never carried a single
+ * real call end to end. Shipping an operator switch for something unproven,
+ * whose failure mode is "customer source code silently does or does not land in
+ * a blob store", is not a trade worth making. Flip this to `true` once the
+ * pipeline has been exercised and verified on a live environment.
+ *
+ * Deliberately blocks ONLY turning it ON. If a tenant somehow already has
+ * archival enabled — set before this flag existed, or through the API, which
+ * this does not close — the operator must still be able to switch it OFF from
+ * here. A block that can trap someone in the enabled state would be worse than
+ * no block at all.
+ */
+const AUDIT_FEATURE_ENABLED = false;
+
 export function TenantsPage() {
   const principal = usePrincipal()!;
   const qc = useQueryClient();
@@ -183,12 +202,25 @@ export function TenantsPage() {
                   <button
                     type="button"
                     className="btn-sm"
-                    disabled={toggleAudit.isPending}
+                    // Turning it ON is blocked while the feature is unproven;
+                    // turning it OFF always stays available, so nobody can be
+                    // stranded in the archiving state.
+                    disabled={
+                      toggleAudit.isPending ||
+                      (!AUDIT_FEATURE_ENABLED && !tn.audit_enabled)
+                    }
+                    title={
+                      !AUDIT_FEATURE_ENABLED && !tn.audit_enabled
+                        ? t("tenants.auditUnavailableHint")
+                        : undefined
+                    }
                     onClick={() => setAuditing(tn)}
                   >
                     {tn.audit_enabled
                       ? t("tenants.auditDisable")
-                      : t("tenants.auditEnable")}
+                      : !AUDIT_FEATURE_ENABLED
+                        ? t("tenants.auditUnavailable")
+                        : t("tenants.auditEnable")}
                   </button>
                   <button
                     type="button"

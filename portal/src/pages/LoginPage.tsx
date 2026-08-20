@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { useAuth } from "../auth/AuthProvider";
 
 export function LoginPage() {
-  const { login } = useAuth();
+  const { login, sessionExpired } = useAuth();
   const { t } = useTranslation();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -28,6 +28,12 @@ export function LoginPage() {
     <div className="login">
       <h1>🔨 {t("brand")}</h1>
       <p>{t("tagline")}</p>
+      {/* Say WHY we are back here. Without it an expired session looks like the
+          app signed you out at random. Suppressed once a login attempt has
+          produced its own error, so the two never stack up. */}
+      {sessionExpired && !error && (
+        <p className="notice">{t("login.sessionExpired")}</p>
+      )}
       <form onSubmit={onSubmit} className="login-form">
         <label>
           {t("login.username")}

@@ -21,6 +21,8 @@ export const en = {
     signIn: "Sign in",
     signingIn: "Signing in…",
     failed: "login failed",
+    sessionExpired:
+      "Your session expired, so you were signed out. Sign in again to continue.",
   },
   common: {
     loading: "Loading…",
@@ -66,6 +68,14 @@ export const en = {
     auditOn: "on",
     auditOff: "off",
     auditEnable: "Turn on archival",
+    // Shown in place of "Turn on" while the feature is withheld. Says
+    // "not available" rather than "coming soon" — the pipeline exists,
+    // it just has not been proven end to end yet.
+    auditUnavailable: "Archival unavailable",
+    auditUnavailableHint:
+      "Raw-body archival is not offered yet. The pipeline is built but has "
+      + "not been verified end to end, and its failure mode is silent — so it "
+      + "stays switched off until it has been exercised on a live environment.",
     auditDisable: "Turn off archival",
     auditOnTitle: "Archive raw bodies?",
     auditOnImpact:
