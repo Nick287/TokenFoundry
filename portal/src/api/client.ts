@@ -219,6 +219,12 @@ export interface TokenGroup {
   subscription?: string;
   backend?: string;
   end_user?: string;
+  // Human-readable name for the group id, when one exists. Currently the
+  // GitHub login behind a hub: `backend` stays the durable id (a login can
+  // be renamed, the id cannot), and this rides along so the table can say
+  // WHICH account is spending. Absent when nothing resolves — e.g. an
+  // account deleted after its calls were billed.
+  label?: string;
   prompt_tok: number;
   cached_tok: number;
   // Priced HIGHER than input upstream, so it is shown rather than folded into

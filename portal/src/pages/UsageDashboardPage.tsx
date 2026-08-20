@@ -362,7 +362,17 @@ export function UsageDashboardPage() {
                         <tr key={label ?? "unknown"}>
                           <td>
                             {isId ? (
-                              <code className="id-cell">{label || t("usage.modelUnknown")}</code>
+                              <>
+                                <code className="id-cell">
+                                  {label || t("usage.modelUnknown")}
+                                </code>
+                                {/* The id is the identity; the login is the
+                                    answer to "which account is this?". Shown
+                                    only when the server resolved one — never
+                                    invented, so a blank here means the account
+                                    is gone, not that it is unnamed. */}
+                                {g.label && <span className="muted"> ({g.label})</span>}
+                              </>
                             ) : (
                               label || t("usage.modelUnknown")
                             )}

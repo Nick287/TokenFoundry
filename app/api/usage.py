@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import Principal, require_admin, tenant_scope
 from app.db import get_db
-from app.models.orm import Project, VirtualKey
+from app.models.orm import GitHubAccount, Project, VirtualKey
 from app.models.schemas import UsageSummary
 from app.services.usage_ingest import AppInsightsUsage, UsageStore
 
@@ -247,6 +247,44 @@ def _key_project_map(db: Session, tenant_id: str) -> dict[str, dict]:
     }
 
 
+def _hub_login_map(db: Session) -> dict[str, str]:
+    """Map hub id (gha_…) -> the GitHub login that backs it.
+
+    Cosmos records `hub_id` because that is the durable join key — a login can
+    be renamed on GitHub's side, and the id is what the control plane, the APIM
+    backend and the resource group all agree on. But `gha_5fe0a527b3bc` tells an
+    operator nothing about WHICH account is spending the money, which is the
+    whole point of grouping by hub. So the id stays the identity and the login
+    comes along as a label, exactly as the call log already does for
+    virtual key -> project.
+
+    Platform-wide on purpose: a hub is not tenant-scoped (several tenants can be
+    served by the same upstream account), so there is nothing to filter by.
+    """
+    rows = db.query(GitHubAccount.id, GitHubAccount.github_login).all()
+    return {r[0]: r[1] for r in rows if r[1]}
+
+
+def _label_hub_groups(payload: dict[str, Any], db: Session) -> dict[str, Any]:
+    """Attach `label` to each group when the breakdown is by hub.
+
+    Only touches the backend dimension; every other grouping already reads as
+    itself. Left absent rather than defaulted when a hub has no login on record
+    — an account deleted after its calls were billed still has rows in Cosmos,
+    and inventing a name for it would be worse than showing the raw id.
+    """
+    if payload.get("by") != "backend":
+        return payload
+    logins = _hub_login_map(db)
+    for g in payload.get("groups", []):
+        # cost_breakdown shapes each row as {<group_by>: value, ...}, so the id
+        # lives under the dimension name — not a generic "key".
+        login = logins.get(g.get("backend"))
+        if login:
+            g["label"] = login
+    return payload
+
+
 @router.get("/usage", response_model=UsageSummary)
 def my_usage(
     hours: int | None = None,
@@ -337,7 +375,7 @@ def my_usage_breakdown(
     carries the same per-call cost the invoice is built from — so a customer
     querying this sees the numbers they will be billed on, not an estimate."""
     key_ids = _tenant_key_ids(db, tenant_id)
-    return _usage_breakdown_payload(key_ids, hours=hours, by=by)
+    return _label_hub_groups(_usage_breakdown_payload(key_ids, hours=hours, by=by), db)
 
 
 @router.get("/admin/usage/{tenant_id}/breakdown")
@@ -350,7 +388,7 @@ def tenant_usage_breakdown(
 ) -> dict[str, Any]:
     """Platform admin: token breakdown for an explicitly named tenant."""
     key_ids = _tenant_key_ids(db, tenant_id)
-    return _usage_breakdown_payload(key_ids, hours=hours, by=by)
+    return _label_hub_groups(_usage_breakdown_payload(key_ids, hours=hours, by=by), db)
 
 
 @router.get("/admin/usage-breakdown")
@@ -358,7 +396,8 @@ def platform_usage_breakdown(
     hours: int = 24,
     by: str = "model",
     _: Principal = Depends(require_admin),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Platform admin: token breakdown across ALL keys/tenants (no subscription
     filter). Useful for the platform dashboard's per-model view."""
-    return _usage_breakdown_payload(None, hours=hours, by=by)
+    return _label_hub_groups(_usage_breakdown_payload(None, hours=hours, by=by), db)
