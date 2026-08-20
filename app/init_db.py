@@ -39,6 +39,13 @@ def _ensure_columns() -> None:
     statements = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled boolean NOT NULL DEFAULT false",
         "ALTER TABLE model_routes ADD COLUMN IF NOT EXISTS api_version varchar(64)",
+        # Actual vendor, for display/grouping only — `provider` stays the
+        # protocol that decides routing. Left NULL on existing rows rather than
+        # backfilled by a guess in SQL; the resync path fills it in from the
+        # model name, and a NULL renders as the bare id instead of a wrong
+        # vendor.
+        "ALTER TABLE model_routes ADD COLUMN IF NOT EXISTS vendor varchar(64)",
+        "CREATE INDEX IF NOT EXISTS ix_model_routes_vendor ON model_routes (vendor)",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS hub_key_kv_ref varchar(512)",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS admin_token_kv_ref varchar(512)",
         # Hub-reported health, polled from each hub's /api/status. Separate from

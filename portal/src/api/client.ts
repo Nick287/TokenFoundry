@@ -57,7 +57,14 @@ export interface VirtualKeySecret extends VirtualKey {
 export interface ModelRoute {
   id: string;
   name: string;
+  // The PROTOCOL the model is served over — decides the APIM API, the auth
+  // header and the available paths. Not the company: Grok and Kimi are
+  // "openai" here because that is the schema they speak.
   provider: "openai" | "anthropic" | "google" | "azure";
+  // The company that made it ("xAI", "Moonshot", "Anthropic"). Display and
+  // grouping only. null when the model name matches no known vendor — shown as
+  // a dash, never guessed.
+  vendor: string | null;
   owner_scope: "PLATFORM" | "TENANT";
   deployment_name: string | null;
   api_version: string | null;

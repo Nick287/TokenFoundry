@@ -142,6 +142,14 @@ class ModelRoute(Base, TimestampMixin):
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)  # client-facing alias
     provider: Mapped[Provider] = mapped_column(Enum(Provider), nullable=False)
+    # The company that made the model ("Anthropic", "xAI", "Moonshot"), for
+    # display and grouping. DELIBERATELY separate from `provider`, which is the
+    # protocol and decides routing: Grok and Kimi speak the OpenAI schema and so
+    # must route through llm-openai, but calling them "OpenAI" in the portal
+    # answers the wrong question when an operator asks which vendor the spend
+    # went to. Nullable — a model we cannot identify shows its raw id rather
+    # than a guessed vendor.
+    vendor: Mapped[str | None] = mapped_column(String(64), index=True)
     apim_backend_or_pool_id: Mapped[str | None] = mapped_column(String(256))
     deployment_name: Mapped[str | None] = mapped_column(String(128))
     # Azure OpenAI API version (e.g. "2024-10-21"); NULL for non-Azure providers.

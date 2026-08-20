@@ -214,6 +214,9 @@ class ModelRouteOut(BaseModel):
     id: str
     name: str
     provider: Provider
+    # Actual vendor, for display/grouping. None when the model name matches no
+    # known vendor — the portal then shows the id rather than a guess.
+    vendor: str | None = None
     tenant_id: str | None
     deployment_name: str | None
     api_version: str | None

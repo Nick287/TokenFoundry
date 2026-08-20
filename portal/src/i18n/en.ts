@@ -170,6 +170,11 @@ export const en = {
     priceOutCol: "$ out/1k",
     searchPlaceholder: "Search alias…",
     allProviders: "All providers",
+    allVendors: "All vendors",
+    // The company that made the model. Distinct from `provider`, which is
+    // the protocol it is served over — Grok and Kimi are both "openai"
+    // there while being xAI and Moonshot here.
+    vendor: "Vendor",
     noMatch: "No models match.",
     emptyTitle: "No models yet",
     emptyHint: "Add Claude, Kimi, GPT or Gemini as a client-facing alias.",

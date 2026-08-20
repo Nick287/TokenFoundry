@@ -17,7 +17,10 @@ export function ModelRoutesPage() {
   const toast = useToast();
   const [adding, setAdding] = useState(false);
   const [query, setQuery] = useState("");
-  const [providerFilter, setProviderFilter] = useState("");
+  // Filters by VENDOR (the company), not by provider (the protocol). Asking
+  // "show me xAI's models" is the question operators actually have; the old
+  // provider filter answered "show me things that speak the OpenAI schema".
+  const [vendorFilter, setVendorFilter] = useState("");
   const [form, setForm] = useState({
     name: "",
     provider: "anthropic",
@@ -88,14 +91,22 @@ export function ModelRoutesPage() {
     create.mutate();
   }
 
+  // Distinct vendors present, sorted. Unknown-vendor rows are reachable via
+  // search rather than getting an "Unknown" bucket that looks like a vendor.
+  const vendors = useMemo(
+    () =>
+      [...new Set((routes.data ?? []).map((r) => r.vendor).filter(Boolean))].sort() as string[],
+    [routes.data],
+  );
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return (routes.data ?? []).filter(
       (r) =>
         (!q || r.name.toLowerCase().includes(q)) &&
-        (!providerFilter || r.provider === providerFilter),
+        (!vendorFilter || (r.vendor ?? "") === vendorFilter),
     );
-  }, [routes.data, query, providerFilter]);
+  }, [routes.data, query, vendorFilter]);
 
   return (
     <section>
@@ -108,12 +119,17 @@ export function ModelRoutesPage() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
-        <select value={providerFilter} onChange={(e) => setProviderFilter(e.target.value)}>
-          <option value="">{t("models.allProviders")}</option>
-          <option value="anthropic">Anthropic</option>
-          <option value="openai">OpenAI</option>
-          <option value="google">Google</option>
-          <option value="azure">Azure OpenAI</option>
+        {/* Built from the routes actually present rather than a fixed list.
+            The hardcoded four went stale the moment upstream added Grok and
+            Kimi, and a filter that cannot name a model you can see is worse
+            than no filter. */}
+        <select value={vendorFilter} onChange={(e) => setVendorFilter(e.target.value)}>
+          <option value="">{t("models.allVendors")}</option>
+          {vendors.map((v) => (
+            <option key={v} value={v}>
+              {v}
+            </option>
+          ))}
         </select>
         <button type="button" className="add-toggle" onClick={() => setAdding((v) => !v)}>
           {adding ? t("common.close") : `+ ${t("models.addNew")}`}
@@ -161,6 +177,7 @@ export function ModelRoutesPage() {
             <thead>
               <tr>
                 <th>{t("models.aliasCol")}</th>
+                <th>{t("models.vendor")}</th>
                 <th>{t("models.provider")}</th>
                 <th>{t("models.scope")}</th>
                 <th>{t("models.priceInCol")}</th>
@@ -176,7 +193,8 @@ export function ModelRoutesPage() {
               {filtered.map((r) => (
                 <tr key={r.id}>
                   <td><code>{r.name}</code></td>
-                  <td>{r.provider}</td>
+                  <td>{r.vendor ?? <span className="muted">—</span>}</td>
+                  <td><code className="id-cell">{r.provider}</code></td>
                   <td>{r.owner_scope}</td>
                   <td>{r.price_in_per_1k ? `$${r.price_in_per_1k}` : <span className="cell-zero">—</span>}</td>
                   <td>{r.price_out_per_1k ? `$${r.price_out_per_1k}` : <span className="cell-zero">—</span>}</td>

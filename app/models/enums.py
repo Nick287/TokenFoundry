@@ -105,3 +105,36 @@ class DeployStatus(StrEnum):
     READY = "ready"             # hub deployed and joined to the provider pools
     FAILED = "failed"            # deploy or pool-join errored (see error_detail)
     DELETING = "deleting"        # terraform destroy + pool-removal in progress
+
+
+# Actual vendor behind a model, for display and grouping ONLY — never routing.
+#
+# The portal used to offer the four `provider` values as "供应商", which reads as
+# a vendor list but is really a protocol list: Kimi and Grok both show up under
+# "OpenAI" because that is the schema they speak. Operators asking "which
+# vendor's models are we spending on" got the wrong answer.
+#
+# Prefix-matched in order, longest-lived names first. Unknown -> None, and the
+# portal shows the raw id rather than a guess: inventing a vendor for a model we
+# have not identified is exactly the kind of authoritative-looking wrong answer
+# this codebase keeps having to undo.
+_VENDOR_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("claude",), "Anthropic"),
+    (("gpt", "o1-", "o3-", "o4-", "chatgpt", "text-embedding"), "OpenAI"),
+    (("gemini",), "Google"),
+    (("grok",), "xAI"),
+    (("kimi",), "Moonshot"),
+    (("deepseek",), "DeepSeek"),
+    (("mai-",), "Microsoft"),
+    (("llama",), "Meta"),
+    (("mistral", "codestral"), "Mistral"),
+)
+
+
+def vendor_for_model(model_id: str) -> str | None:
+    """The company that made the model, e.g. grok-4.6 -> "xAI"."""
+    m = model_id.lower()
+    for prefixes, vendor in _VENDOR_PREFIXES:
+        if m.startswith(prefixes):
+            return vendor
+    return None

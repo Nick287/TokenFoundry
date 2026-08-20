@@ -33,7 +33,15 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import Principal, require_admin
 from app.db import SessionLocal, get_db
-from app.models.enums import AuthMode, DeployStatus, OwnerScope, Provider
+from app.models.enums import (
+    AuthMode,
+    DeployStatus,
+    OwnerScope,
+    Provider,
+)
+from app.models.enums import (
+    vendor_for_model as _vendor_for_model,
+)
 from app.models.orm import GitHubAccount, ModelRoute
 from app.models.schemas import (
     DevicePollOut,
@@ -56,14 +64,28 @@ def _provider_for_model(model_id: str) -> str | None:
     """Map a hub model id to its client-facing APIM provider API. Mirrors
     scripts/register_hub_models.py:
       claude-* -> anthropic (Messages API),
-      gpt-*/o[0-9]-* -> openai (Chat Completions + Responses),
+      gpt-*/o[0-9]-*/grok-*/kimi-* -> openai (Chat Completions + Responses),
       gemini-*  -> google (OpenAI-compatible).
     Anything else (embeddings, experimental, mai-*, trajectory-*) has no
-    client-facing provider API, so it returns None and is skipped."""
+    client-facing provider API, so it returns None and is skipped.
+
+    NOTE this is the PROTOCOL, not the vendor — see `_vendor_for_model`. grok
+    and kimi are xAI's and Moonshot's models served over the OpenAI-compatible
+    schema, so they route through `llm-openai`; giving them their own provider
+    would make the gateway build an `llm-xai` API and pool that no upstream
+    endpoint answers.
+
+    ⚠️ grok is served ONLY on /v1/responses. Measured 2026-08-20 through the
+    gateway: /v1/chat/completions returns 400 `unsupported_api_for_model`
+    ("not accessible via the /chat/completions endpoint") for grok-4.5 and
+    grok-4.6, while /v1/responses answers 200 with a full `copilot_usage`. Both
+    operations live on the same `llm-openai` API, so the route is correct — the
+    caller just has to pick the right path.
+    """
     m = model_id.lower()
     if m.startswith("claude"):
         return "anthropic"
-    if m.startswith(("gpt", "o1-", "o3-", "o4-", "chatgpt")):
+    if m.startswith(("gpt", "o1-", "o3-", "o4-", "chatgpt", "grok", "kimi")):
         return "openai"
     if m.startswith("gemini"):
         return "google"
@@ -163,6 +185,7 @@ def _register_hub_catalog(
                     tenant_id=None,  # platform-pooled (RESELL/INTERNAL)
                     name=mid,
                     provider=Provider(provider),
+                    vendor=_vendor_for_model(mid),
                     apim_backend_or_pool_id=pool_id,
                     owner_scope=OwnerScope.PLATFORM,
                     auth_mode=AuthMode.MI,
@@ -170,6 +193,18 @@ def _register_hub_catalog(
             )
             existing.add(mid)
             created += 1
+
+    # Backfill `vendor` on rows that predate the column. Done here rather than as
+    # a SQL default in init_db because the value is derived from the model NAME,
+    # which SQL would have to re-implement — and because a resync is already the
+    # operation an operator runs when the catalog looks wrong.
+    backfilled = 0
+    for r in all_routes:
+        if r.vendor is None:
+            v = _vendor_for_model(r.name)
+            if v:
+                r.vendor = v
+                backfilled += 1
 
     removed = 0
     if prune:

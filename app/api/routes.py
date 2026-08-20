@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import Principal, require_admin
 from app.db import get_db
+from app.models.enums import vendor_for_model as _vendor_for_model
 from app.models.orm import ModelRoute
 from app.models.schemas import ModelRouteCreate, ModelRouteOut, ModelRouteUpdate
 from app.services.apim_provisioner import ApimProvisioner
@@ -53,6 +54,10 @@ def add_route(
         tenant_id=body.tenant_id,
         name=body.name,
         provider=body.provider,
+        # Derived, not taken from the request: the vendor follows from the model
+        # name, and letting a caller assert it would let the portal group spend
+        # under a company that did not earn it.
+        vendor=_vendor_for_model(body.name),
         apim_backend_or_pool_id=backend_id,
         deployment_name=body.deployment_name,
         api_version=body.api_version,

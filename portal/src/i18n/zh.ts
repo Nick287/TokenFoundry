@@ -167,6 +167,10 @@ export const zh: TranslationShape = {
     priceOutCol: "输出$/1k",
     searchPlaceholder: "搜索别名…",
     allProviders: "全部供应商",
+    allVendors: "全部厂商",
+    // 模型的实际厂商。与 provider 不同——后者是它走的协议：Grok 和 Kimi
+    // 在 provider 上都是 openai，但厂商分别是 xAI 和 Moonshot。
+    vendor: "厂商",
     noMatch: "无匹配模型。",
     emptyTitle: "还没有模型",
     emptyHint: "把 Claude、Kimi、GPT 或 Gemini 添加为面向客户的别名。",
