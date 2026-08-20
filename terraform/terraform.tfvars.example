@@ -1,21 +1,105 @@
-# Token Foundry — example variables (mirrors infra/main.bicepparam).
-# Copy to terraform.tfvars and fill in, OR pass values via -var / TF_VAR_*.
-# NOTE: real terraform.tfvars is gitignored — never commit secrets.
+# Token Foundry — example variables.
+#
+# Copy to terraform.tfvars and edit, OR pass values via -var / TF_VAR_*.
+# NOTE: the real terraform.tfvars is gitignored — never commit secrets.
+#
+# Every variable below has a full description in variables.tf, including the
+# measurements behind the non-obvious defaults. This file is the short version:
+# what you normally set, and what you should leave alone unless you know why.
 
+# --- Identity of this environment ------------------------------------------
+# resource_group_name is the ONE value you must change per environment. Every
+# resource name is derived from the resource group's id (substr(md5(rg.id),0,13)),
+# so a new group can never collide with an old one — not even with the
+# soft-deleted Key Vault or APIM left behind by a destroyed environment.
+#
+# Use a separate terraform workspace per environment as well; the state is local
+# and `deploy.sh` does NOT switch workspaces for you.
 name_prefix         = "tokenfoundry"
 environment_name    = "dev"
-resource_group_name = "tokenfoundry-rg"
-# Subscription restricts some resources (e.g. PostgreSQL) from eastus —
-# deploy everything to centralus for consistency.
-location       = "centralus"
+resource_group_name = "tokenfoundry-rg-dev-01"
+
+# southeastasia is what the current environments run in. Note the subscription
+# blocks some resources (PostgreSQL) in certain regions — keep every resource in
+# one region rather than mixing.
+location       = "southeastasia"
 pg_admin_login = "tfadmin"
 
-# Image tag only — the Container App image ref is assembled by Terraform as
-# <acr-login-server>/tokenfoundry:<image_tag>. scripts/deploy.sh builds & pushes
-# this tag for you, so you normally don't set it here.
-# image_tag = "latest"
+# --- APIM tier --------------------------------------------------------------
+# StandardV2 is what we run. It is 71-74% of the bill and Basic v2 would save
+# ~$550/month, which we deliberately do NOT do: VNet integration starts at
+# Standard v2, and migrating back up later costs more than the difference.
+#
+# The v2 tiers are also a HARD requirement for Anthropic's native Messages API —
+# the classic tiers (Developer/Basic/Standard/Premium) cannot meter it. The
+# Developer_1 default below only suits a throwaway evaluation.
+# See docs/PRICING.zh.md for the full comparison.
+# The value is <tier>_<capacity>, NOT the bare tier name — "StandardV2" alone is
+# rejected by the provider ("not a valid Api Management sku name") and you only
+# find out at plan time.
+apim_sku = "StandardV2_1"
 
-# --- Secrets: do NOT set here. Export before running plan/apply:
+# --- Cosmos throughput ------------------------------------------------------
+# 0 = serverless, and that is almost always right. Provisioned 400 RU/s looks
+# 12.8x cheaper per RU, but the volume at which it wins is already the volume at
+# which it breaks: dev-18 ran a 33 RU/s average and was throttled 2,904 times,
+# saturated for 45 minutes straight, because this workload is SPIKY (the importer
+# flushes a whole Capture blob at once, and one cross-partition aggregate can
+# cost 5,000 RU — 12.5 seconds of a 400 RU/s budget in a single query).
+#
+# WARNING: this is a CREATION-TIME choice and terraform's plan will not tell you
+# that. azurerm treats the account's `capabilities` as computed, so changing this
+# on an existing environment produces no diff at all — the plan looks benign and
+# the apply then fails on Azure's side. An environment already built provisioned
+# must PIN its value here.
+# cosmos_throughput_rus = 0
+
+# --- Telemetry sampling -----------------------------------------------------
+# Two knobs IN SERIES on one pipe: APIM decides how much it SENDS, App Insights
+# decides how much it KEEPS of what arrived. Both affect requests/traces/
+# dependencies; NEITHER affects customMetrics (metrics are never sampled) or
+# billing, which rides hub -> Event Hub -> Cosmos and never touches App Insights.
+#
+# Leave both at 100 while the reconciliation is expected to close EXACTLY: the
+# ledger check reads `gateway 200+429+4xx` from the `requests` table while the
+# other side comes from Cosmos, so sampling one side ends the equality. Lowering
+# it also inflates the visible failure rate, because always_log_errors keeps
+# every error while sampling the successes.
+#
+# If ingestion cost ever forces it down: turn down the APIM one (that direction
+# definitely works), change the four KQL queries in app/services/usage_ingest.py
+# from count() to sum(itemCount) first, and accept an approximate ledger.
+# apim_sampling_percentage         = 100
+# app_insights_sampling_percentage = 100
+
+# --- APIM publisher contact (shown in the developer portal) -----------------
+# publisher_email = "admin@tokenfoundry.local"
+# publisher_name  = "Token Foundry"
+
+# --- The repo that hosts deploy-hub.yml -------------------------------------
+# The control plane dispatches hub deploys to this repo's Actions.
+# github_repo_owner = "Nick287"
+# github_repo_name  = "TokenFoundry"
+
+# --- Image tags: normally NOT set here --------------------------------------
+# scripts/deploy.sh builds, pushes and passes both of these, so setting them by
+# hand is only for reproducing a specific build. The Container App image ref is
+# assembled as <acr-login-server>/tokenfoundry:<image_tag>.
+#
+# Running `terraform plan` yourself DOES require them — pass the values the
+# environment currently runs, or the plan will propose rolling the image:
+#   terraform plan -var image_tag=vYYYYMMDDHHMMSS -var hub_image_tag=vYYYYMMDDHHMMSS
+# image_tag     = "v20260101000000"
+# hub_image_tag = "v20260101000000"
+
+# --- Secrets: do NOT set them here. Export before running plan/apply --------
 #   export TF_VAR_pg_admin_password="$PG_PWD"
 #   export TF_VAR_jwt_secret="$JWT"
 #   export TF_VAR_admin_password="$ADMIN_PWD"
+#
+# scripts/bootstrap.sh generates these and stores them in Key Vault for you.
+#
+# NOTE: admin_password only SEEDS the first admin user, on the very first apply
+# (init_db inserts it if absent and never updates it). Changing the admin
+# password later — through the portal's Users page — leaves this value and the
+# Key Vault copy stale, and they are then no longer what logs you in.
