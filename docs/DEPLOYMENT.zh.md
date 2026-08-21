@@ -77,8 +77,8 @@ pg_admin_password = "<pg 密码>"          # 敏感 —— 不入 git
 jwt_secret        = "<jwt 签名密钥>"
 admin_password    = "<种子 admin 密码>"
 
-# APIM SKU。token 计量必须用 v2 tier —— Anthropic Messages API 的 token 计数、
-# 以及 GatewayLlmLogs 诊断日志类别都需要 v2。默认的 Developer_1 不适用本项目。
+# APIM SKU。token 计量必须用 v2 tier —— Anthropic 原生 Messages API 的 token
+# 计量只在 v2 层可用。默认的 Developer_1 不适用本项目。
 apim_sku = "StandardV2_1"
 
 # 承载 deploy-hub.yml 的 GitHub 仓库（方案 A 的 hub 部署）。可选 —— 默认
@@ -87,12 +87,43 @@ apim_sku = "StandardV2_1"
 # 必须属于对该仓库有管理权限的账号。
 # github_repo_owner = "your-org"
 # github_repo_name  = "your-repo"
+
+# --- 以下四个都有默认值，新环境通常不用写 ---
+
+# Cosmos 吞吐。0 = serverless，就是默认值，绝大多数情况下是对的。
+# ⚠️ 这是**创建时固定**的选择，而且 terraform 的 plan 不会警告你：azurerm 把
+# capabilities 当作 computed，改这个值对已有环境**不产生任何 diff**，plan 看起来
+# 人畜无害，apply 在 Azure 侧才失败。已按预配建出来的环境必须显式钉住自己的值。
+# cosmos_throughput_rus = 0
+
+# APIM 遥测采样（0–100）。100 = 每次调用都记，是默认值，也是精确对账的前提。
+# 降低它会让闭合式失去精确性（左边取自 requests，右边取自 Cosmos）。
+# 0 是一个**有意义的档位**而不只是"很低"：配合 alwaysLog=allErrors（每个 API 诊断
+# 都会写），0 表示「成功不记、失败全记、token 计量完整保留」。
+# apim_sampling_percentage = 100
+
+# App Insights 组件侧的摄入采样。**保持 100，改它很可能无效**：APIM 诊断始终发
+# samplingType=fixed，而 Azure 文档说已有固定速率采样的类型会禁用摄入采样。
+# 声明它主要是为了「找得到」——它本来就在那里跑着隐式默认值。
+# app_insights_sampling_percentage = 100
+
+# Log Analytics 保留天数（30–730）。**降低它省不到钱**：前 31 天的保留已含在摄入
+# 价里，Azure 原话是 "lowering the retention period below 31 days does not reduce
+# costs"。要省日志钱只能减少**摄入量**。
+# log_retention_days = 30
 ```
 
-> ⚠️ **`apim_sku = "StandardV2_1"` 是必需的，不是可选。** 默认 `Developer_1` SKU 下
-> `GatewayLlmLogs` 日志类别不存在（`azurerm_monitor_diagnostic_setting.apim_llm_logs`
-> apply 会失败），Anthropic token 计量也不工作。附带好处：v2 APIM 约 1–2 分钟建成，
-> 而经典 tier 要 30–45 分钟。
+> ⚠️ **`apim_sku = "StandardV2_1"` 是必需的，不是可选。** 经典层
+> （Developer / Basic / Standard / Premium）**不支持 Anthropic 原生 Messages API 的
+> token 计量**，而那是本项目的核心能力。附带好处：v2 APIM 约 1–2 分钟建成，
+> 经典 tier 要 30–45 分钟。
+>
+> 注意值的格式是 `<层级>_<容量>`：写成 `StandardV2` 会被 provider 拒绝
+> （`not a valid Api Management sku name`），而且只在 plan 时才报出来。
+>
+> 旧版本这里还写着"Developer_1 下 GatewayLlmLogs 类别不存在导致 apply 失败"——
+> 该诊断设置已于 2026-08-15 整个删除（它与 `AppRequests` 逐行重复且无人读取），
+> 所以那条理由不再适用。**结论没变，理由变了。**
 
 **资源名是派生的，不是手挑的。** 每个资源（Key Vault、APIM、ACR、Container App…）的
 后缀由 RG id 计算：
@@ -191,6 +222,74 @@ Portal → **GitHub 账号** → **+ GitHub 账号**。一次 GitHub 设备流�
 > 里做）。漏掉 `metrics` 会静默关闭 `emit-token-metric`（Portal 的 Token 细分 + cached 变空），
 > 因为 API 级诊断会 override 服务级诊断。详见
 > [customMetrics-diagnostic-troubleshooting.md](customMetrics-diagnostic-troubleshooting.md)。
+
+## 更新已有环境
+
+部署是三阶段，**更新不是**——改了什么决定用哪种动作，用错了要么白改，要么动到不该动的东西。
+
+| 改了什么 | 该做什么 | 为什么 |
+| --- | --- | --- |
+| 应用代码（`app/` / `portal/`） | `./scripts/update-app.sh -g <rg>` | 重建镜像 + 滚动修订版，**完全不碰 terraform** |
+| hub 代码（`vendored/gitmodel-hub/`） | `./scripts/deploy.sh -g <rg>` | 要重建 hub 镜像；hub 本身由 Actions 部署 |
+| terraform 变量 / 资源 | `terraform apply`（见下方警告） | 基础设施 |
+| **APIM 策略、API 级诊断、模型目录** | **在 Portal 点「重新同步模型」** | ⬅ 见下 |
+
+### ⚠️ 有一类配置 terraform 和部署都改不动
+
+APIM 的**策略**和**API 级诊断**不是 terraform 资源，也不随镜像更新生效。它们由控制面在
+**添加 GitHub 账号 / 点「重新同步模型」**时写入——因为 `llm-anthropic` 这几个 API 是运行时
+才创建的，terraform 在 apply 的那一刻根本不知道会有哪些 API。
+
+```
+terraform apply     →  APIM 本体、服务级诊断
+update-app.sh       →  控制面镜像（含写策略/诊断的代码）
+点「重新同步模型」   →  ⬅ 策略和 API 级诊断真正被写入的时刻
+```
+
+**后果**：改了策略或诊断相关的代码、部署完毕，**已存在的 API 仍是旧的**，直到有人点同步。
+
+这不是理论问题。2026-08 有客户报流式仍然失效，而修复早已合入——原因就是他们那套环境的
+API 策略是修复前写入的，更新镜像不会重写它。同理，`apim_sampling_percentage` 这个变量
+在 API 级诊断补全之前，改了**完全没有反应**。
+
+判断方法：改动如果落在 `app/services/apim_provisioner.py`，部署后**一定要点一次同步**。
+
+### ⚠️ 不要跑不带 `-target` 的完整 apply
+
+现存漂移：Azure 自动给 Container Apps 环境挂了 `Consumption` workload profile，而配置里
+没有声明它，于是 plan 每次都想**抹掉**它——控制面正跑在那个 profile 上。
+
+```bash
+# 只应用你真正要改的资源
+terraform apply -target=module.apim.azurerm_api_management_diagnostic.appinsights                 -target=module.apim.azapi_update_resource.diagnostic_metrics                 -var image_tag=<当前 tag> -var hub_image_tag=<当前 tag>
+```
+
+`terraform plan` 也需要这两个 tag，否则会因为缺必填变量而中止；**传当前线上正在跑的值**，
+不然 plan 会顺带提议滚动镜像。查法：
+
+```bash
+az containerapp show -g <rg> -n <aca> --query "properties.template.containers[0].image" -o tsv
+```
+
+根治办法是在 `modules/containerapps` 里显式声明该 profile，让配置与实际一致——尚未做。
+
+### 更新应用（最常见）
+
+```bash
+az login && az account set --subscription <id>
+./scripts/update-app.sh -g tokenfoundry-rg-dev-19
+```
+
+它会：ACR 云端构建 → 滚动 Container App → 等修订版 Running → `/healthz` 冒烟。约 5–8 分钟。
+
+⚠️ 打包的是**工作区当前内容**，不是 git HEAD。所以未提交的改动**会**进镜像；反过来，
+`git status` 显示 `M` 不代表没部署。要确认线上跑的是什么，看镜像 tag：
+
+```bash
+az containerapp show -g <rg> -n <aca> --query "properties.template.containers[0].image" -o tsv
+```
+
+---
 
 ## 销毁环境
 
