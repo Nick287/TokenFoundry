@@ -30,6 +30,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import secrets
 import uuid
 from datetime import UTC, datetime
@@ -44,6 +45,43 @@ from . import audit, eventhub, store
 from . import copilot_client as cc
 from . import image_client as ic
 from .config import get_settings
+
+# Configure the ROOT logger before anything else logs. Nothing here did, which
+# meant Python's default WARNING level silently swallowed every `log.info` this
+# service emits — including "dropped unsupported fields for upstream", the one
+# line that would have shown a request field being removed. That line has
+# existed for as long as the stripping has, and had never once been printed.
+#
+# The cost was not just a missing log. It made the hub unobservable in exactly
+# the place where its behaviour is a decision rather than a passthrough: whether
+# a field survived, which betas were forwarded. Debugging then falls back to
+# inference, and absence of a log line gets misread as absence of the behaviour.
+#
+# `force=True` matters under uvicorn: it installs its own handlers on import, so
+# a plain basicConfig() would be a no-op here. Same reasoning as the control
+# plane's app/main.py, which fixed this on its side long ago.
+#
+# INFO is the default rather than WARNING, deliberately. The lines this service
+# emits at INFO are operational, not debug chatter: which hub served a request,
+# whether a field was stripped, which betas were forwarded. At WARNING the hub
+# is silent until something breaks — and the failures it has actually had were
+# silent ones, where nothing errored and the wrong thing quietly happened.
+#
+# Cost is not the trade-off here: the hub environments have no log destination,
+# so nothing is ingested or stored. Only the live stream
+# (`az containerapp logs show`) reads these, and that costs nothing.
+#
+# HUB_LOG_LEVEL turns it down without a rebuild if it ever does become noise.
+logging.basicConfig(
+    level=os.environ.get("HUB_LOG_LEVEL", "INFO").strip().upper(),
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    force=True,
+)
+# Azure SDK loggers stay at WARNING: at INFO they emit a block per HTTP request
+# (every Event Hub send, every blob write), which would bury the hub's own lines.
+for _noisy in ("azure", "azure.core.pipeline.policies.http_logging_policy",
+               "urllib3", "httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 
@@ -677,19 +715,48 @@ def _anthropic_has_image(req: dict[str, Any]) -> bool:
     return _scan(req.get("system"))
 
 
-def _upstream_version_header(request: Request) -> dict[str, str]:
-    """The `anthropic-version` to forward upstream.
+def _upstream_contract_headers(request: Request) -> dict[str, str]:
+    """The contract headers to forward upstream: `anthropic-version`, and
+    `anthropic-beta` when the caller sent one.
 
-    Copilot's native endpoint expects the header. Prefer the caller's value so a
-    client pinned to a different contract version keeps working; fall back to
-    the configured default otherwise.
+    Copilot's native endpoint expects the version header. Prefer the caller's
+    value so a client pinned to a different contract version keeps working; fall
+    back to the configured default otherwise.
+
+    `anthropic-beta` used to be dropped entirely, and dropping it is not neutral
+    — a beta REQUEST FIELD is only accepted when its header rides along.
+    Measured against the Copilot backend on 2026-08-26:
+
+        context_management, no header  -> 400 "Extra inputs are not permitted"
+        context_management + header    -> 200
+
+    So withholding the header turned a supported feature into a rejected
+    request, and `strip_unsupported` then hid that by deleting the field.
+
+    FILTERED, not forwarded verbatim. The first version of this passed the
+    caller's header through unchanged, reasoning that the backend refusing an
+    unknown beta with a clear message beats guessing here. That reasoning was
+    wrong about how the backend refuses: the check is ALL-OR-NOTHING over the
+    list. One unrecognised entry fails the entire request —
+
+        anthropic-beta: context-management-2025-06-27,advisor-tool-2026-03-01
+        -> 400 "unsupported beta header(s): advisor-tool-2026-03-01"
+
+    — and Claude Code sends several betas at once, so verbatim forwarding broke
+    every Claude Code request the moment it shipped. An allowlist is therefore
+    the only safe shape: forward what upstream is known to accept, drop the rest
+    exactly as before. Unknown betas cost their feature, not the request.
     """
-    return {
+    headers = {
         "anthropic-version": (
             request.headers.get("anthropic-version")
             or get_settings().anthropic_version
         )
     }
+    forwardable = aa.forwardable_betas(request.headers.get("anthropic-beta"))
+    if forwardable:
+        headers["anthropic-beta"] = ",".join(sorted(forwardable))
+    return headers
 
 
 # =========================================================================== #
@@ -1010,10 +1077,10 @@ async def v1_messages_count_tokens(request: Request) -> Any:
     mapped = aa.map_model(body.get("model"))
     if mapped != body.get("model"):
         body = {**body, "model": mapped}
-    body, _ = aa.strip_unsupported(body)
+    body, _ = aa.strip_unsupported(body, request.headers.get("anthropic-beta"))
     try:
         status, data = await cc.post_json(
-            "/v1/messages/count_tokens", body, _upstream_version_header(request)
+            "/v1/messages/count_tokens", body, _upstream_contract_headers(request)
         )
     except cc.NotAuthenticatedError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
@@ -1040,9 +1107,24 @@ async def v1_messages(request: Request) -> Any:
     req = await request.json()
     # Passthrough forwards the body verbatim, so anything the Copilot backend
     # does not recognise fails the whole request. Drop those fields first.
-    req, dropped = aa.strip_unsupported(req)
+    _client_beta = request.headers.get("anthropic-beta")
+    req, dropped = aa.strip_unsupported(req, _client_beta)
     if dropped:
         log.info("dropped unsupported fields for upstream: %s", ", ".join(dropped))
+    # One line per request recording the beta negotiation, because the outcome
+    # is otherwise invisible: a stripped field and an honoured one both produce
+    # a 200, and the hub's environment has no log destination configured, so
+    # only the live stream (`az containerapp logs show`) can be read. Logs what
+    # the client asked for, what survived the allowlist, and whether the gated
+    # field made it through — the three facts needed to answer "did context
+    # editing actually apply".
+    if _client_beta or "context_management" in req:
+        log.info(
+            "beta: client=%s forwarded=%s context_management=%s",
+            _client_beta or "-",
+            ",".join(sorted(aa.forwardable_betas(_client_beta))) or "-",
+            "kept" if "context_management" in req else "absent/stripped",
+        )
     tenant = _extract_tenant(request)
     end_user = _extract_end_user(req)
     model = req.get("model")
@@ -1056,7 +1138,7 @@ async def v1_messages(request: Request) -> Any:
         {"Copilot-Vision-Request": "true"} if _anthropic_has_image(req) else None
     )
     # Copilot's native endpoint expects the Anthropic version header.
-    headers = {**_upstream_version_header(request), **(vision_headers or {})}
+    headers = {**_upstream_contract_headers(request), **(vision_headers or {})}
 
     if not stream:
         req.pop("stream", None)

@@ -64,7 +64,21 @@ PROVIDER_APIS: dict[str, dict] = {
         "backend": "llm-anthropic",
         "auth_header": "x-api-key",
         "bearer": False,
-        "ops": [("messages", "/v1/messages")],
+        # count_tokens is a standard Messages API endpoint, not an extra: the
+        # SDKs expose it as client.messages.count_tokens and Anthropic's docs
+        # tell clients to use it rather than estimate, because token counts are
+        # model-specific and tiktoken undercounts Claude by 15-20% (more on code
+        # and non-English text).
+        #
+        # The hub has always implemented it; only the APIM operation was
+        # missing, so the gateway 404'd it. Observed on dev-19 (2026-08-25):
+        # Claude Code called /v1/messages/count_tokens and got a 404, leaving it
+        # to guess at context size. Non-fatal — clients degrade to estimating —
+        # which is exactly why it went unnoticed.
+        "ops": [
+            ("messages", "/v1/messages"),
+            ("count-tokens", "/v1/messages/count_tokens"),
+        ],
     },
     "openai": {
         "api_id": "llm-openai",
@@ -1089,6 +1103,19 @@ class ApimProvisioner:
                 # serve traffic.
                 "httpCorrelationProtocol": "W3C",
                 "verbosity": "information",
+                # NOT logging request headers here. Tried
+                # `frontend.request.headers: ["anthropic-beta"]` on 2026-08-25 to
+                # make the hub's beta-forwarding decision observable; the PUT
+                # returned success and APIM stored `frontend: null`. Silently
+                # discarded, like the azurerm `capabilities` case — the write is
+                # accepted and the value does not take effect, so a config left
+                # here would read as working observability that does not exist.
+                #
+                # If this is worth another attempt, a newer api-version is the
+                # thing to change. The lower-effort alternative is to give the
+                # hub Container App environments a log destination — they have
+                # none, which is the actual reason the hub's own log line about
+                # dropped fields cannot be read.
             }
         }
         try:
