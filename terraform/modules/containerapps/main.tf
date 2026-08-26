@@ -467,6 +467,30 @@ resource "azurerm_role_assignment" "monitoring_reader" {
   principal_type       = "ServicePrincipal"
 }
 
+# AcrPull on the registry for the SYSTEM identity — distinct from the AcrPull
+# the pull identity already holds above, and not redundant with it.
+#
+# The two identities do different jobs. The user-assigned `pull` identity is what
+# the Container Apps PLATFORM authenticates with to fetch the image at revision
+# start; application code never uses it. Code uses DefaultAzureCredential, which
+# resolves to the SYSTEM identity — the one every other assignment in this
+# section targets.
+#
+# The control plane now asks the registry for the newest `gitmodel` tag before
+# deploying a hub (app/services/acr.py), so that resolution runs as the system
+# identity and needs its own grant. Observed on dev-19 2026-08-26: without this,
+# the tag lookup fails and the deploy silently falls back to TF_HUB_IMAGE_TAG —
+# which is the stale value the lookup exists to stop trusting, so the fix would
+# have been inert while looking deployed.
+#
+# Read-only: listing tags needs the `pull` scope, and nothing here pushes images.
+resource "azurerm_role_assignment" "app_acr_pull" {
+  scope                = var.acr_id
+  role_definition_name = "AcrPull"
+  principal_id         = azurerm_container_app.app.identity[0].principal_id
+  principal_type       = "ServicePrincipal"
+}
+
 # Log Analytics Reader on the WORKSPACE. Monitoring Reader above is scoped to the
 # App Insights component, which lets query_resource(app_insights_id) read the
 # requests/customMetrics tables — but the token-metering breakdown queries the

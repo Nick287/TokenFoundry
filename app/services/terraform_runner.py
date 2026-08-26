@@ -35,6 +35,8 @@ from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobClient
 
 from app.config import get_settings
+from app.services import acr
+from app.services.github_repo import GitHubRepoConfigurator, GitHubRepoError
 from app.services.keyvault import KeyVaultService
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,11 @@ _GITHUB_API = "https://api.github.com"
 _FIND_RUN_TIMEOUT = 120     # find the triggered run within 2 min
 _RUN_POLL_TIMEOUT = 1800    # run completes within 30 min
 _POLL_INTERVAL = 10         # seconds
+# The ACR repository holding hub images. deploy.sh builds `gitmodel:<tag>` here.
+_HUB_REPOSITORY = "gitmodel"
+# Same Key Vault secret app/api/deploy_config.py publishes repo config with. The
+# deploy PAT this module uses elsewhere cannot write Actions variables.
+_BOOTSTRAP_PAT_SECRET = "github-bootstrap-pat"
 
 
 class TerraformError(RuntimeError):
@@ -224,6 +231,87 @@ def _read_state_outputs(account_id: str) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# Image selection                                                             #
+# --------------------------------------------------------------------------- #
+# The workflow reads the image from the HUB_IMAGE_REF repo variable
+# (deploy-hub.yml -> TF_VAR_image_ref_override), and nothing re-publishes that
+# variable except an operator pressing "推送 GitHub 部署配置" in the portal. So it
+# drifts, and the drift is invisible: a stale tag is a valid string, so the hub
+# deploys and runs — just on old code.
+#
+# dev-19, 2026-08-26: the variable said gitmodel:v20260814044101 while all three
+# live hubs ran v20260825225134. A new account added then would have joined the
+# fleet twelve days behind it, missing that day's beta-forwarding fix.
+#
+# Refreshing it here, immediately before the dispatch, is what makes a new hub
+# match the registry rather than match whenever someone last pressed a button.
+#
+# Deliberately NOT a workflow_dispatch input, which would be the tidier shape and
+# would also sidestep the repo variable being a single global slot: GitHub
+# rejects an undeclared input outright ("Unexpected inputs provided"), and
+# Actions runs the workflow file from the REPOSITORY, not from our working tree.
+# Sending an input the deployed workflow does not declare would break account
+# creation in every environment whose repo has not been updated yet — which is
+# precisely the older environments this is meant to help.
+def _refresh_hub_image_ref() -> None:
+    """Point HUB_IMAGE_REF at the newest hub image, best-effort.
+
+    Falls back in order, logging which rung it landed on:
+
+        newest tag in ACR      -- what we want
+        settings.hub_image_tag -- what terraform injected; stale after an
+                                  out-of-band `az acr build`, but valid
+        leave it alone         -- today's behaviour, so a failure here is never
+                                  worse than not having this function
+
+    Never raises: an unresolvable image must not stop an account being created.
+
+    Uses the BOOTSTRAP PAT, not the deploy PAT this module otherwise uses. The
+    deploy PAT can dispatch workflows but is scoped out of the variables API —
+    it answers `403 Resource not accessible by personal access token` (verified
+    2026-08-26). A missing bootstrap PAT is a legitimate state, so that is a
+    skip, not an error.
+    """
+    s = get_settings()
+    tag = None
+    if s.acr_name:
+        tag = acr.newest_tag(s.acr_name, _HUB_REPOSITORY)
+    else:
+        logger.warning("hub image: acr_name is not set; cannot ask the registry")
+
+    source = "registry"
+    if not tag:
+        tag, source = s.hub_image_tag, "TF_HUB_IMAGE_TAG"
+    if not tag:
+        logger.warning(
+            "hub image: neither the registry nor TF_HUB_IMAGE_TAG resolved a tag; "
+            "leaving HUB_IMAGE_REF as it is — the new hub gets whatever it "
+            "currently names"
+        )
+        return
+
+    pat = KeyVaultService().get_secret(_BOOTSTRAP_PAT_SECRET)
+    if not pat:
+        logger.warning(
+            "hub image: no bootstrap PAT in Key Vault (%s), so HUB_IMAGE_REF "
+            "cannot be refreshed; the new hub will use whatever it names now, "
+            "not gitmodel:%s",
+            _BOOTSTRAP_PAT_SECRET, tag,
+        )
+        return
+
+    ref = f"gitmodel:{tag}"
+    try:
+        configurator = GitHubRepoConfigurator(s.github_repo_owner, s.github_repo_name, pat)
+        with httpx.Client(timeout=30.0) as hc:
+            configurator.set_variable(hc, "HUB_IMAGE_REF", ref)
+    except (GitHubRepoError, httpx.HTTPError) as exc:
+        logger.warning("hub image: could not publish HUB_IMAGE_REF=%s: %s", ref, exc)
+        return
+    logger.info("hub image: HUB_IMAGE_REF -> %s (from %s)", ref, source)
+
+
+# --------------------------------------------------------------------------- #
 # Public surface (unchanged contract)                                         #
 # --------------------------------------------------------------------------- #
 def deploy_hub(account_id: str, oauth_token: str) -> dict[str, str]:
@@ -234,6 +322,10 @@ def deploy_hub(account_id: str, oauth_token: str) -> dict[str, str]:
     admin_token = _new_admin_token()
     hub_api_key = _new_hub_key()
     _write_jobinput(account_id, oauth_token, admin_token, hub_api_key)
+
+    # Before the dispatch, not after: the workflow reads the variable when it
+    # starts, so a refresh that lands later applies to the NEXT account.
+    _refresh_hub_image_ref()
 
     since = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     correlation_id = f"{account_id}-{secrets.token_hex(4)}"
