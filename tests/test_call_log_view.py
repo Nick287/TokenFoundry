@@ -44,6 +44,22 @@ def _doc(**over) -> dict:
 # --- the fields the call log gained -----------------------------------------
 
 
+def test_route_is_the_model_and_api_is_the_endpoint():
+    """These two are easy to mistake for each other and were, for a while: the
+    portal's Model column rendered `api ?? route`, so every row read
+    "llm-anthropic" instead of the model.
+
+    That ordering was right when APIM wrote these documents itself — the metric
+    policy cannot read the request body, so `route` was "unknown" and the API id
+    was the only label available. The hub emits the events now and carries the
+    model, which left the fallback hiding the better field behind the worse one.
+    Both must stay on the row, and they are not interchangeable: `route` answers
+    "which model", `api` answers "over which protocol"."""
+    v = _to_record_view(_doc())
+    assert v["route"] == "claude-opus-4.8"
+    assert v["api"] == "llm-anthropic"
+
+
 def test_view_carries_cache_write_and_cost():
     v = _to_record_view(_doc())
     assert v["cache_write_tok"] == 7

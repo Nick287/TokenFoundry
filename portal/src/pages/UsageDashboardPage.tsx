@@ -541,7 +541,21 @@ export function UsageDashboardPage() {
                 {records.data.items.map((r, i) => (
                   <tr key={`${r.ts}-${i}`}>
                     <td>{r.ts ? new Date(r.ts).toLocaleString() : "—"}</td>
-                    <td>{r.api ?? r.route}</td>
+                    {/* The header says Model, so the model is what this has to
+                        show. It rendered `api ?? route` from the days when APIM
+                        wrote these documents itself: the metric policy cannot
+                        read the request body, so `route` was "unknown" and the
+                        API id was the only label there was. The hub emits the
+                        events now and carries the real model, which turned that
+                        fallback into a way of hiding the better field behind
+                        the worse one — `api` is always set, so `?? r.route`
+                        never once ran. The API id stays as a second line: it
+                        says which protocol the call arrived on, which is the
+                        thing a model name does not tell you. */}
+                    <td>
+                      {r.route && r.route !== "unknown" ? r.route : "—"}
+                      {r.api ? <div className="cell-sub">{r.api}</div> : null}
+                    </td>
                     <td>
                       {r.project_name ? (
                         <>

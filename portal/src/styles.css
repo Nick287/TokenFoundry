@@ -767,6 +767,16 @@ tr:focus-within .row-actions { opacity: 1; }
 .cell-alert { color: var(--error); font-weight: 600; }
 .cell-zero { color: #b0aca4; }
 
+/* Secondary line under a cell's primary value — the qualifier, not the answer
+   (the API id beneath a model name). Muted and smaller so the column still
+   reads as one value per row at a glance. */
+.cell-sub {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.3;
+  margin-top: 0.1rem;
+}
+
 /* Empty-table call to action. */
 .empty-cta { text-align: center; color: var(--muted); padding: 1.25rem; }
 .empty-cta strong { display: block; color: var(--ink); margin-bottom: 0.25rem; }
