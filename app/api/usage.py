@@ -247,6 +247,30 @@ def _key_project_map(db: Session, tenant_id: str) -> dict[str, dict]:
     }
 
 
+def _project_names_for(db: Session, key_ids: list[str]) -> dict[str, str]:
+    """Map virtual-key id -> owning project NAME, for the keys actually asked about.
+
+    Sibling of `_hub_login_map`, and platform-wide for the same reason: which
+    project owns a key is a property of the key, not of who is asking, so the
+    answer does not change between the tenant-scoped and platform-wide
+    breakdowns. Scoped by the ids in hand rather than by tenant so the
+    platform-wide view — which has no tenant to filter on — does not have to pull
+    every key in the system to label a handful of groups.
+
+    Distinct from `_key_project_map`, which the call log uses: that one is keyed
+    by tenant and carries project_id as well, because the log renders both.
+    """
+    if not key_ids:
+        return {}
+    rows = (
+        db.query(VirtualKey.id, Project.name)
+        .join(Project, VirtualKey.project_id == Project.id)
+        .filter(VirtualKey.id.in_(key_ids))
+        .all()
+    )
+    return {r[0]: r[1] for r in rows if r[1]}
+
+
 def _hub_login_map(db: Session) -> dict[str, str]:
     """Map hub id (gha_…) -> the GitHub login that backs it.
 
@@ -265,23 +289,39 @@ def _hub_login_map(db: Session) -> dict[str, str]:
     return {r[0]: r[1] for r in rows if r[1]}
 
 
-def _label_hub_groups(payload: dict[str, Any], db: Session) -> dict[str, Any]:
-    """Attach `label` to each group when the breakdown is by hub.
+# Which PostgreSQL lookup names each opaque dimension. Both dimensions group on
+# an id that is durable but unreadable, and both keep the id as the identity
+# while a name rides along — a virtual key and a GitHub account can each be
+# renamed or deleted, the id cannot.
+_LABELLERS = {
+    "backend": lambda db, ids: _hub_login_map(db),
+    "subscription": _project_names_for,
+}
 
-    Only touches the backend dimension; every other grouping already reads as
-    itself. Left absent rather than defaulted when a hub has no login on record
-    — an account deleted after its calls were billed still has rows in Cosmos,
-    and inventing a name for it would be worse than showing the raw id.
+
+def _label_groups(payload: dict[str, Any], db: Session) -> dict[str, Any]:
+    """Attach `label` to each group whose dimension groups on an opaque id.
+
+    `backend` gets the GitHub login, `subscription` gets the owning project name;
+    model/api/end_user already read as themselves and are left alone.
+
+    A label is left ABSENT rather than defaulted when nothing resolves. A key or
+    an account deleted after its calls were billed still has rows in Cosmos, and
+    inventing a name for it would be worse than showing the raw id — the row is
+    real spend, it just has no owner on record any more.
     """
-    if payload.get("by") != "backend":
+    labeller = _LABELLERS.get(str(payload.get("by")))
+    if labeller is None:
         return payload
-    logins = _hub_login_map(db)
-    for g in payload.get("groups", []):
-        # cost_breakdown shapes each row as {<group_by>: value, ...}, so the id
-        # lives under the dimension name — not a generic "key".
-        login = logins.get(g.get("backend"))
-        if login:
-            g["label"] = login
+    # cost_breakdown shapes each row as {<group_by>: value, ...}, so the id lives
+    # under the dimension name — not a generic "key".
+    dim = str(payload["by"])
+    groups = payload.get("groups", [])
+    names = labeller(db, [g[dim] for g in groups if g.get(dim)])
+    for g in groups:
+        name = names.get(g.get(dim))
+        if name:
+            g["label"] = name
     return payload
 
 
@@ -375,7 +415,7 @@ def my_usage_breakdown(
     carries the same per-call cost the invoice is built from — so a customer
     querying this sees the numbers they will be billed on, not an estimate."""
     key_ids = _tenant_key_ids(db, tenant_id)
-    return _label_hub_groups(_usage_breakdown_payload(key_ids, hours=hours, by=by), db)
+    return _label_groups(_usage_breakdown_payload(key_ids, hours=hours, by=by), db)
 
 
 @router.get("/admin/usage/{tenant_id}/breakdown")
@@ -388,7 +428,7 @@ def tenant_usage_breakdown(
 ) -> dict[str, Any]:
     """Platform admin: token breakdown for an explicitly named tenant."""
     key_ids = _tenant_key_ids(db, tenant_id)
-    return _label_hub_groups(_usage_breakdown_payload(key_ids, hours=hours, by=by), db)
+    return _label_groups(_usage_breakdown_payload(key_ids, hours=hours, by=by), db)
 
 
 @router.get("/admin/usage-breakdown")
@@ -400,4 +440,4 @@ def platform_usage_breakdown(
 ) -> dict[str, Any]:
     """Platform admin: token breakdown across ALL keys/tenants (no subscription
     filter). Useful for the platform dashboard's per-model view."""
-    return _label_hub_groups(_usage_breakdown_payload(None, hours=hours, by=by), db)
+    return _label_groups(_usage_breakdown_payload(None, hours=hours, by=by), db)
