@@ -227,6 +227,10 @@ Portal → **GitHub 账号** → **+ GitHub 账号**。一次 GitHub 设备流�
 
 部署是三阶段，**更新不是**——改了什么决定用哪种动作，用错了要么白改，要么动到不该动的东西。
 
+> **先看 [`CHANGELOG.zh.md`](../CHANGELOG.zh.md)**：每条改动都标了「要生效需要做什么」。
+> 一套停在几周前的环境往往需要不止一个动作，而漏掉的那个不会报错。
+> 拿不准就跑 `python scripts/check_env.py -g <rg>`，它会逐层告诉你差在哪。
+
 | 改了什么 | 该做什么 | 为什么 |
 | --- | --- | --- |
 | 应用代码（`app/` / `portal/`） | `./scripts/update-app.sh -g <rg>` | 重建镜像 + 滚动修订版，**完全不碰 terraform** |
