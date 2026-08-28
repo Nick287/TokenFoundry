@@ -282,6 +282,22 @@ class GitHubAccountOut(BaseModel):
     container_app_fqdn: str | None
     backend_ids: list[str]
     created_at: datetime
+    # Hub-reported health, polled from /api/status — NOT part of `status`, which
+    # is a deploy state machine that reaches READY and stops. A hub whose Copilot
+    # login expired is still READY and still answers, with a 503 on every
+    # request, so `status` alone renders a dead hub green.
+    #
+    # `hub_logged_in` is deliberately tri-state. None means we have not heard
+    # from this hub yet (fresh deploy, or a poller that has not run), and it must
+    # not render like True — otherwise the page reports health it never
+    # measured. `hub_status_at` is what makes that legible: None here says
+    # "never reached", and a stale timestamp says how old the answer is.
+    hub_logged_in: bool | None = None
+    hub_status_at: datetime | None = None
+    # Events the hub gave up on for good — the billing-data-is-gone number.
+    # Surfaced alongside the login because both answer "is this account
+    # actually working", and neither is visible from the deploy status.
+    usage_events_lost: int = 0
 
 
 # ----- Budget -----

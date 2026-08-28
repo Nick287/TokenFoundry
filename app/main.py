@@ -134,6 +134,42 @@ async def _usage_import_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def _hub_status_loop() -> None:
+    """Ask every deployed hub how it is, forever, on a timer.
+
+    Same shape as the import loop above and for the same reasons: the poller is
+    synchronous (httpx + SQLAlchemy), so each pass goes to a worker thread; and
+    `poll_once` swallows its own failures, so this only has to survive
+    cancellation.
+
+    Its point is that `GitHubAccount.status` cannot answer "is this hub still
+    working". READY means the container deployed, and it never changes again —
+    so a hub whose Copilot login expired shows green while returning 503 to
+    every request. This loop is what lets the portal say otherwise.
+
+    Safe on several replicas: each pass is an idempotent overwrite of what the
+    hub itself reported, not an increment.
+    """
+    from app.services.hub_status_poller import poll_once
+
+    interval = max(settings.hub_status_interval_seconds, 60)
+    # Offset from the import loop's first pass so a cold start does not fire
+    # both at once on every replica.
+    await asyncio.sleep(interval // 2)
+    while True:
+        stats = await asyncio.to_thread(poll_once)
+        # Logged on EVERY pass, not only when something is wrong. A loop whose
+        # only evidence of life is a warning cannot be told apart from a loop
+        # that never started — and this one exists to make health observable, so
+        # it has to be observable itself. Warning when there is something to act
+        # on, info otherwise.
+        if stats["expired"] or stats["unreachable"]:
+            logger.warning("hub-status: %s", stats)
+        else:
+            logger.info("hub-status: %s", stats)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Bootstrap: create tables + seed the admin user before serving traffic.
@@ -143,13 +179,18 @@ async def lifespan(_app: FastAPI):
     from app.init_db import init_db
 
     init_db()
-    importer = asyncio.create_task(_usage_import_loop())
+    background = [
+        asyncio.create_task(_usage_import_loop()),
+        asyncio.create_task(_hub_status_loop()),
+    ]
     try:
         yield
     finally:
-        importer.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await importer
+        for task in background:
+            task.cancel()
+        for task in background:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(

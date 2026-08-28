@@ -63,6 +63,12 @@ def _ensure_columns() -> None:
         "audit_payloads_dropped integer NOT NULL DEFAULT 0",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS "
         "hub_status_at timestamptz",
+        # Nullable with NO default, unlike the counters above. An existing row
+        # has never been polled, and "unknown" is the honest reading — defaulting
+        # it to true would tell the operator every hub is logged in on the
+        # strength of never having asked.
+        "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS "
+        "hub_logged_in boolean",
         "ALTER TABLE github_accounts ADD COLUMN IF NOT EXISTS "
         "hub_drop_reason varchar(256)",
         # Raw-body audit archival opt-in. Defaults false: an existing tenant must

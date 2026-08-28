@@ -184,6 +184,15 @@ export const zh: TranslationShape = {
     starting: "启动中…",
     accountCol: "账号",
     statusCol: "状态",
+    hubHealthCol: "Hub 健康",
+    poolFullHint:
+      "已达上限：APIM 后端池最多 30 个成员，每个 GitHub 账号占用 1 个。要再加账号，需先删除一个现有账号。",
+    poolNearLimit: "接近上限：APIM 后端池最多 30 个成员，每个 GitHub 账号占 1 个。",
+    hubLoggedIn: "已登录",
+    hubExpired: "登录失效",
+    hubUnknown: "未知",
+    hubStale: "最后确认于",
+    hubLost: "丢失计费事件",
     endpointCol: "Hub 端点",
     emptyTitle: "还没有 GitHub 账号",
     emptyHint:

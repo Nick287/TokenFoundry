@@ -92,6 +92,20 @@ export interface GitHubAccount {
   container_app_fqdn: string | null;
   backend_ids: string[];
   created_at: string;
+  // Hub-reported health, polled from the hub's own /api/status. Separate from
+  // `status`, which is a DEPLOY state machine: it reaches "ready" and stops, so
+  // it cannot tell you the hub stopped working afterwards.
+  //
+  // Tri-state, and the null is load-bearing. A hub whose Copilot login expired
+  // keeps answering — with a 503 on every request — while `status` stays
+  // "ready". null means nobody has polled it yet, which must not render like
+  // true: that would report health that was never measured.
+  hub_logged_in: boolean | null;
+  // When that answer was taken. null = never reached. A stale timestamp is not
+  // a failure, but it does change what the answer is worth.
+  hub_status_at: string | null;
+  // Usage events this hub gave up on for good — billing data that is gone.
+  usage_events_lost: number;
 }
 
 // Returned by POST /github-accounts/device/start — what the user needs to

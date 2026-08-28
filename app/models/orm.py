@@ -261,6 +261,20 @@ class GitHubAccount(Base, TimestampMixin):
     # Last successful poll. NULL means never reached — which reads very
     # differently from "reached, and everything was zero".
     hub_status_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Whether the hub still holds a working Copilot login, as of hub_status_at.
+    #
+    # Tri-state ON PURPOSE, and the NULL is the point. A hub whose OAuth token
+    # expired keeps answering — it just returns 503 "Hub not logged in to
+    # Copilot" to every request — while `status` stays READY forever, because
+    # READY only ever meant "the container deployed". So the portal showed green
+    # for a hub serving nothing, and the pool quietly ran at 2/3 capacity as the
+    # circuit breaker shed and re-admitted it every 60 seconds.
+    #
+    # NULL is "not polled yet", which must not render like True. Absence of
+    # evidence read as evidence of health is the failure this project keeps
+    # meeting; a fresh deploy, a poller that has not run, and a hub that is
+    # genuinely logged in have to look different on the page.
+    hub_logged_in: Mapped[bool | None] = mapped_column(Boolean)
     # Most recent drop reason, as the hub reported it: an exception CLASS NAME,
     # never a message (the hub's /api/status is unauthenticated and Azure error
     # strings carry namespace FQDNs and identity ids).

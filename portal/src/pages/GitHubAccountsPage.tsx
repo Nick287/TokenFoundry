@@ -21,11 +21,67 @@ import { useToast } from "../components/Toast";
 
 const TRANSITIONAL: GitHubDeployStatus[] = ["pending", "deploying", "deleting"];
 
+// Azure's cap on members in an API Management backend pool:
+// "You can include up to 30 backends in a pool."
+// https://learn.microsoft.com/azure/api-management/backends
+//
+// Each GitHub account contributes exactly ONE backend to each provider pool
+// (add_hub_to_pools creates llm-<provider>-<account_id> for openai, anthropic
+// and google), so the pool ceiling is the account ceiling — 30, not 10 and not
+// 90. Surfaced here because the alternative is finding out at account 31, when
+// the deploy has already built a resource group and a Container App that cannot
+// join the pool.
+const POOL_MEMBER_LIMIT = 30;
+
 // Map a deploy status onto the shared badge tones (styles.css).
 function statusBadgeClass(status: GitHubDeployStatus): string {
   if (status === "ready") return "badge badge-active";
   if (status === "failed") return "badge badge-suspended";
   return "badge"; // pending / deploying / deleting — neutral
+}
+
+// How long an answer stays worth showing as current. Past this the hub has
+// missed several polls (the default interval is 5 minutes), which usually means
+// it went unreachable — the poller keeps the last good answer rather than
+// blanking it, so the age is what tells you to stop trusting it.
+const STATUS_STALE_MS = 20 * 60 * 1000;
+
+/** The hub's own account of itself: logged in, login expired, or not known.
+ *
+ * Three states rather than a boolean, because "we have not asked" is not
+ * health. A hub is polled every few minutes; before the first poll, and for a
+ * hub that has gone unreachable, the honest answer is that we do not know — and
+ * rendering that as green would be the page asserting something it never
+ * measured. The remedies differ too: an expired login needs the operator to
+ * re-authorise, an unreachable hub needs someone to look at the deployment.
+ */
+function hubHealth(a: GitHubAccount, t: (k: string) => string) {
+  if (a.status !== "ready") return <span className="cell-zero">—</span>;
+
+  const at = a.hub_status_at ? new Date(a.hub_status_at) : null;
+  const stale = !at || Date.now() - at.getTime() > STATUS_STALE_MS;
+
+  if (a.hub_logged_in === null || !at) {
+    return <span className="badge">{t("github.hubUnknown")}</span>;
+  }
+  return (
+    <>
+      <span className={a.hub_logged_in ? "badge badge-active" : "badge badge-suspended"}>
+        {t(a.hub_logged_in ? "github.hubLoggedIn" : "github.hubExpired")}
+      </span>
+      {/* An age only earns space once it undermines the badge above it. */}
+      {stale && (
+        <div className="cell-sub">
+          {t("github.hubStale")} {at.toLocaleString()}
+        </div>
+      )}
+      {a.usage_events_lost > 0 && (
+        <div className="cell-sub cell-alert">
+          {t("github.hubLost")} {a.usage_events_lost}
+        </div>
+      )}
+    </>
+  );
 }
 
 export function GitHubAccountsPage() {
@@ -53,6 +109,11 @@ export function GitHubAccountsPage() {
     queryFn: () => api.getDeployStatus(principal.token),
   });
   const ready = deployStatus.data?.ready ?? false;
+  // Counts every row, including one still deploying: it has already claimed its
+  // pool slot, so treating it as free would let the operator start a 31st that
+  // cannot be wired up.
+  const accountCount = accounts.data?.length ?? 0;
+  const atPoolLimit = accountCount >= POOL_MEMBER_LIMIT;
 
   const start = useMutation({
     mutationFn: () => api.startGithubDevice(principal.token),
@@ -103,13 +164,28 @@ export function GitHubAccountsPage() {
           type="button"
           className="add-toggle"
           onClick={() => start.mutate()}
-          disabled={start.isPending || !ready}
-          title={!ready ? t("github.gateHint") : undefined}
+          disabled={start.isPending || !ready || atPoolLimit}
+          title={
+            atPoolLimit
+              ? t("github.poolFullHint")
+              : !ready
+                ? t("github.gateHint")
+                : undefined
+          }
         >
           {start.isPending ? t("github.starting") : `+ ${t("github.addNew")}`}
         </button>
-        <span className="count">{accounts.data?.length ?? 0}</span>
+        {/* Shown as a fraction, not a bare count: the ceiling is a hard Azure
+            limit on pool members, not a soft guideline, and an operator planning
+            capacity needs to see it before they are standing on it. */}
+        <span className="count">
+          {accountCount} / {POOL_MEMBER_LIMIT}
+        </span>
       </div>
+      {atPoolLimit && <p className="error">{t("github.poolFullHint")}</p>}
+      {!atPoolLimit && accountCount >= POOL_MEMBER_LIMIT - 3 && (
+        <p className="hint">{t("github.poolNearLimit")}</p>
+      )}
       {!ready && !deployStatus.isLoading && (
         <p className="hint">{t("github.gateHint")}</p>
       )}
@@ -131,6 +207,7 @@ export function GitHubAccountsPage() {
               <tr>
                 <th>{t("github.accountCol")}</th>
                 <th>{t("github.statusCol")}</th>
+                <th>{t("github.hubHealthCol")}</th>
                 <th>{t("github.endpointCol")}</th>
                 <th>{t("common.actions")}</th>
               </tr>
@@ -149,6 +226,14 @@ export function GitHubAccountsPage() {
                       <div className="hint error-detail">{a.error_detail}</div>
                     )}
                   </td>
+                  {/* Deliberately its own column rather than folded into the one
+                      on the left. That one is the DEPLOY state: it reaches
+                      "ready" and never moves again, so a hub whose Copilot login
+                      expired keeps showing green while answering 503 to every
+                      request — traffic routes around it via the circuit breaker
+                      and the pool quietly runs short-handed. Three states, not
+                      two: unknown is not health. */}
+                  <td>{hubHealth(a, t)}</td>
                   <td>
                     {a.container_app_fqdn ? (
                       <a href={`https://${a.container_app_fqdn}`} target="_blank" rel="noreferrer">

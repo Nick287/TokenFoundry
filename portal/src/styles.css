@@ -532,6 +532,10 @@ code.id-cell {
   border-radius: 999px;
   font-size: 0.78rem;
   font-weight: 600;
+  /* A pill that wraps stops reading as a pill — the radius ends up round a
+     fragment and the row grows a line. Let the table scroll horizontally
+     (.table-scroll) instead of breaking the badge. */
+  white-space: nowrap;
 }
 
 .badge-active {

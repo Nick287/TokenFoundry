@@ -188,6 +188,15 @@ export const en = {
     starting: "Starting…",
     accountCol: "Account",
     statusCol: "Status",
+    hubHealthCol: "Hub health",
+    poolFullHint:
+      "At capacity: an APIM backend pool holds at most 30 members and each GitHub account uses one. Remove an account before adding another.",
+    poolNearLimit: "Approaching the limit: an APIM backend pool holds at most 30 members, one per GitHub account.",
+    hubLoggedIn: "Logged in",
+    hubExpired: "Login expired",
+    hubUnknown: "Unknown",
+    hubStale: "Last confirmed",
+    hubLost: "Billing events lost:",
     endpointCol: "Hub endpoint",
     emptyTitle: "No GitHub accounts yet",
     emptyHint:
