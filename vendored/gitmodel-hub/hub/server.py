@@ -348,6 +348,41 @@ def _extract_copilot_usage(obj: Any) -> dict[str, Any] | None:
     return None
 
 
+def _client_json(data: Any, status_code: int = 200) -> JSONResponse:
+    """The ONE way an upstream response body reaches a client.
+
+    Strips `copilot_usage` — GitHub's per-call billing record, carrying token
+    counts, `cost_per_batch` and `total_nano_aiu`. That is OUR cost of goods,
+    and upstream returns it inline on every call: verified against the live
+    gateway on 2026-08-28, present at the top level of both a `/v1/messages`
+    and a `/v1/chat/completions` 200. Forwarding it hands every tenant the
+    wholesale price behind the retail one they are billed.
+
+    A function rather than a rule to remember at each `return`: there are seven
+    places a body is handed back, and "strip it here too" is exactly the kind of
+    instruction a new endpoint silently skips.
+
+    Billing is unaffected. `_extract_copilot_usage` reads the object off the
+    body and hands it to `_emit_usage` BEFORE the response is built, and this
+    returns a copy — the record already on its way to Event Hub still carries
+    it. The standard `usage` object stays: clients need their own token counts,
+    and `llm-emit-token-metric` at the gateway reads that one.
+    """
+    return JSONResponse(_without_copilot_usage(data), status_code=status_code)
+
+
+def _without_copilot_usage(obj: Any) -> Any:
+    """A shallow copy without `copilot_usage`, or the value unchanged.
+
+    Copies rather than popping: the same dict is passed on as `resp_body` for
+    the audit archive, where the upstream record is worth keeping. Mutating it
+    here would quietly redact the archive too.
+    """
+    if isinstance(obj, dict) and "copilot_usage" in obj:
+        return {k: v for k, v in obj.items() if k != "copilot_usage"}
+    return obj
+
+
 def _scan_sse_copilot_usage(text: str) -> dict[str, Any] | None:
     """Find `copilot_usage` anywhere in a full SSE stream.
 
@@ -826,7 +861,7 @@ async def _passthrough(
                               served=None, endpoint=endpoint, usage3=(0, 0, 0),
                               streamed=False, estimated=False, status=status,
                               req_body=body, resp_body=data)
-            return JSONResponse(data, status_code=status)
+            return _client_json(data, status)
         served = data.get("model") if isinstance(data, dict) else None
         i, o, t, cached = _norm_usage(data.get("usage"), responses_shape=responses_shape)
         await _emit_usage(tenant=tenant, end_user=end_user, model=model,
@@ -835,7 +870,7 @@ async def _passthrough(
                           usage=data.get("usage"),
                           copilot_usage=_extract_copilot_usage(data),
                           req_body=body, resp_body=data)
-        return JSONResponse(data)
+        return _client_json(data)
 
     # Streaming passthrough. Ask the backend to report usage for chat.
     if not responses_shape:
@@ -1004,7 +1039,7 @@ async def v1_images_generations(request: Request) -> Any:
         tenant, _extract_end_user(body), model, "images.generations", data, status,
         req_body=body,
     )
-    return JSONResponse(data, status_code=status)
+    return _client_json(data, status)
 
 
 @app.post("/v1/images/edits")
@@ -1048,7 +1083,7 @@ async def v1_images_edits(request: Request) -> Any:
             ],
         },
     )
-    return JSONResponse(resp, status_code=status)
+    return _client_json(resp, status)
 
 
 # =========================================================================== #
@@ -1089,7 +1124,7 @@ async def v1_messages_count_tokens(request: Request) -> Any:
         # unhandled one here becomes an opaque 500. Surface the upstream reason
         # so a client sees "Bad credentials" instead of Internal Server Error.
         raise HTTPException(status_code=502, detail=str(e)) from e
-    return JSONResponse(data, status_code=status)
+    return _client_json(data, status)
 
 
 @app.post("/v1/messages")
@@ -1151,7 +1186,7 @@ async def v1_messages(request: Request) -> Any:
                               served=None, endpoint="messages", usage3=(0, 0, 0),
                               streamed=False, estimated=False, status=status,
                               req_body=req, resp_body=data)
-            return JSONResponse(data, status_code=status)
+            return _client_json(data, status)
         u = data.get("usage") or {}
         i = int(u.get("input_tokens", 0) or 0)
         o = int(u.get("output_tokens", 0) or 0)
@@ -1162,7 +1197,7 @@ async def v1_messages(request: Request) -> Any:
                           usage=data.get("usage"),
                           copilot_usage=_extract_copilot_usage(data),
                           req_body=req, resp_body=data)
-        return JSONResponse(data)
+        return _client_json(data)
 
     # Streaming: forward Copilot's native Anthropic SSE unchanged; sniff usage
     # off the stream (input_tokens is real, on message_start) for accounting.
