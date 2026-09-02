@@ -402,6 +402,46 @@ Responses API), and prints a pass/fail table. Configure the gateway URL and a
 virtual key via a local `.env` (gitignored); see the script's header for the
 required variables.
 
+## Which endpoint to call — it depends on the model
+
+The three provider APIs speak three different protocols, and **upstream accepts
+only one of them per model**. Sending a model to the wrong endpoint is not
+caught at the gateway: the request is forwarded and upstream rejects it.
+
+| Model | Endpoint | Auth header |
+| --- | --- | --- |
+| `claude-*` (8) | `POST {gateway}/llm-anthropic/v1/messages` | `x-api-key` |
+| `gemini-*` (3) | `POST {gateway}/llm-google/v1/chat/completions` | `api-key` |
+| `gpt-3.5/4/4o/4.1/5-mini`, `kimi-*` (17) | `POST {gateway}/llm-openai/v1/chat/completions` | `api-key` |
+| **`gpt-5.3-codex`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-{luna,sol,terra}`, `grok-4.5`, `grok-4.6`** (9) | **`POST {gateway}/llm-openai/v1/responses`** | `api-key` |
+
+The last row is the one exception worth remembering: those nine are available
+**only** on the Responses API. Upstream refuses them on `/v1/chat/completions`
+even though the portal lists them as available — the portal lists the model
+catalogue, not which protocol each model supports.
+
+### ⚠️ On a stream, the wrong endpoint looks like success
+
+Non-streaming gives you a clean `400`. **Streaming does not:**
+
+```
+POST /llm-openai/v1/chat/completions   {"model": "gpt-5.4", "stream": true}
+→ HTTP 200
+→ data: {"error": {"message": "upstream returned 400", "type": "upstream_error", ...}}
+```
+
+The hub commits to `200` the moment it starts forwarding the stream, and
+upstream only refuses afterwards, so the failure can only be delivered in-band.
+**A client that checks the HTTP status alone reads this as a successful empty
+answer.**
+
+Billing is unaffected — the ledger records upstream's real status, so these land
+in Cosmos as `status=400`, `cost_source=unpriced` — but a client has to parse
+the stream's `error` event for itself.
+
+The table was measured on dev-21: all 37 registered models across streaming and
+non-streaming on all four protocols.
+
 ## Security & data model
 
 How secrets and data are stored — what lives in Key Vault vs. PostgreSQL vs.

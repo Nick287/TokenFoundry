@@ -356,7 +356,40 @@ ACR / Container App):
 Responses API),并打印一张通过/失败表。通过本地 `.env`(已 gitignore)配置网关
 URL 和一个虚拟密钥;所需变量见脚本头部。
 
-## 安全与数据模型
+## 调用哪个端点 —— 按模型区分
+
+三个供应商 API 各说一种协议,而**上游对同一个模型只接受其中一种**。发错端点不会
+被网关拦下,它会一路转到上游、再由上游拒绝。
+
+| 模型 | 端点 | 认证头 |
+| --- | --- | --- |
+| `claude-*`(8 个) | `POST {gateway}/llm-anthropic/v1/messages` | `x-api-key` |
+| `gemini-*`(3 个) | `POST {gateway}/llm-google/v1/chat/completions` | `api-key` |
+| `gpt-3.5/4/4o/4.1/5-mini`、`kimi-*`(17 个) | `POST {gateway}/llm-openai/v1/chat/completions` | `api-key` |
+| **`gpt-5.3-codex`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.5`、`gpt-5.6-{luna,sol,terra}`、`grok-4.5`、`grok-4.6`**(9 个) | **`POST {gateway}/llm-openai/v1/responses`** | `api-key` |
+
+最后一行是唯一需要记住的例外:这 9 个模型**只在 Responses API 上可用**。它们在
+`/v1/chat/completions` 上被上游拒绝,尽管门户把它们列为可用模型 —— 门户列的是模型
+目录,不是它们各自支持的协议。
+
+### ⚠️ 流式发错端点会伪装成成功
+
+非流式发错端点会得到干脆的 `400`。**流式不会**:
+
+```
+POST /llm-openai/v1/chat/completions   {"model": "gpt-5.4", "stream": true}
+→ HTTP 200
+→ data: {"error": {"message": "upstream returned 400", "type": "upstream_error", ...}}
+```
+
+hub 在开始转发流的那一刻就已经把 `200` 发出去了,之后上游才拒绝,所以失败只能
+写在流体里。**只检查 HTTP 状态码的客户端会把这当成一次成功的空回答。**
+
+计费不受影响 —— 记账用的是上游真实状态(这类调用在 Cosmos 里是
+`status=400`、`cost_source=unpriced`),但客户端必须自己解析流里的 `error` 事件。
+
+上表用 dev-21 实测得出:37 个已注册模型 × 流式/非流式 × 四种协议全部跑过一遍。
+
 
 密钥和数据怎么存 —— 什么存在 Key Vault、什么存在 PostgreSQL、什么存在 Cosmos,
 调用方和用户怎么鉴权,RBAC 模型,以及诚实的取舍清单 —— 都记在
