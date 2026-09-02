@@ -383,6 +383,48 @@ def _without_copilot_usage(obj: Any) -> Any:
     return obj
 
 
+def _redact_sse_line(line: str) -> str:
+    """Remove `copilot_usage` from one SSE `data:` line, leaving all else alone.
+
+    One function for all four protocols because the survey found one rule: the
+    field is always a TOP-LEVEL key of the object on a `data:` line, never
+    nested. Only the carrier differs — `message_delta` on Anthropic, an ordinary
+    chunk on OpenAI (and Google repeats it across SEVERAL), and
+    `response.completed` on the Responses API. Keying off the event type instead
+    would have missed Google's repeats and any event type added later; keying
+    off the key cannot.
+
+    Non-JSON lines, `[DONE]`, and objects without the field are returned
+    unchanged and uncopied, so the overwhelming majority of chunks cost a
+    `startswith` and a `json.loads`.
+    """
+    if not line.startswith("data:"):
+        return line
+    payload = line[len("data:"):].strip()
+    if not payload or payload == "[DONE]":
+        return line
+    try:
+        obj = json.loads(payload)
+    except json.JSONDecodeError:
+        return line
+    if not isinstance(obj, dict) or "copilot_usage" not in obj:
+        return line
+    return "data: " + json.dumps(_without_copilot_usage(obj), separators=(",", ":"))
+
+
+def _redact_sse_event(event_text: str) -> bytes:
+    """Redact every `data:` line of one COMPLETE SSE event.
+
+    Complete, because `cc.stream` yields raw byte chunks that can split a line
+    mid-way. Running this on a chunk boundary would hand `json.loads` half an
+    object, the parse would fail, and the line would pass through with the field
+    still on it — a leak that only shows up under whatever chunking the network
+    happened to produce.
+    """
+    return "\n".join(_redact_sse_line(ln)
+                     for ln in event_text.split("\n")).encode("utf-8")
+
+
 def _scan_sse_copilot_usage(text: str) -> dict[str, Any] | None:
     """Find `copilot_usage` anywhere in a full SSE stream.
 
@@ -895,8 +937,16 @@ async def _passthrough(
         def _emit(event_text: str) -> bytes:
             # event_text is one SSE event ("data: {...}"), possibly needing the
             # usage split. Rejoin the (possibly two) data lines it produces.
+            #
+            # Redaction runs BEFORE standardisation, on the original line. Order
+            # matters only in one direction: standardisation can turn one data
+            # line into two, so redacting afterwards would have to handle its
+            # output shape as well as upstream's. Going first means it only ever
+            # sees what upstream sent. It cannot disturb the standardiser, which
+            # reads `usage`, `choices` and `object` — none of which this touches.
             out_lines = [
-                _standardize_openai_usage_line(ln) if ln.startswith("data:") else ln
+                _standardize_openai_usage_line(_redact_sse_line(ln))
+                if ln.startswith("data:") else ln
                 for ln in event_text.split("\n")
             ]
             return ("\n".join(out_lines)).encode("utf-8")
@@ -1199,15 +1249,40 @@ async def v1_messages(request: Request) -> Any:
                           req_body=req, resp_body=data)
         return _client_json(data)
 
-    # Streaming: forward Copilot's native Anthropic SSE unchanged; sniff usage
-    # off the stream (input_tokens is real, on message_start) for accounting.
+    # Streaming: forward Copilot's native Anthropic SSE with `copilot_usage`
+    # removed; sniff usage off the stream (input_tokens is real, on
+    # message_start) for accounting.
     async def gen() -> AsyncIterator[bytes]:
         collected: list[str] = []
         upstream_status = 200
+        # Event buffering, added for the redaction: cc.stream yields raw byte
+        # chunks that can split a `data:` line, and half an object does not
+        # parse — so only COMPLETE events (terminated by a blank line) are
+        # rewritten, and the partial tail is held over. Same shape as the
+        # OpenAI generator, which needed it for the same reason.
+        buf = ""
         try:
             async for chunk in cc.stream("/v1/messages", req, headers):
-                collected.append(chunk.decode("utf-8", "replace"))
-                yield chunk
+                text = chunk.decode("utf-8", "replace")
+                # `collected` gets the ORIGINAL, always. Billing scans it below
+                # for `copilot_usage`, and buffering the redacted copy instead
+                # would leave every streamed call `unpriced` at $0 — with the
+                # request still succeeding and nothing logged anywhere. The
+                # client gets the redacted bytes; the ledger gets what upstream
+                # actually said.
+                collected.append(text)
+                buf += text
+                while "\n\n" in buf:
+                    event, buf = buf.split("\n\n", 1)
+                    yield _redact_sse_event(event) + b"\n\n"
+            # NORMAL completion only — never in the `finally`. A `yield` during
+            # GeneratorExit raises "async generator ignored GeneratorExit" and
+            # kills the finally BEFORE the usage emit runs, losing the billing
+            # event for every interrupted request. Accounting is unaffected by
+            # the position: it reads `collected`, which already holds these
+            # bytes.
+            if buf:
+                yield _redact_sse_event(buf)
         except cc.UpstreamStatusError as exc:
             # Same shape as the OpenAI generator: the 200 is already sent, so
             # the refusal can only be delivered in-band, and it must be RECORDED

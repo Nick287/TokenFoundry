@@ -1,0 +1,29 @@
+event: message_start
+data: {"message":{"content":[],"id":"msg_011CedtGBVRqMSZpdsAJd933","model":"claude-opus-4-8","role":"assistant","stop_details":null,"stop_reason":null,"stop_sequence":null,"type":"message","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"inference_geo":"global","input_tokens":8,"output_tokens":7}},"type":"message_start"}
+
+event: content_block_start
+data: {"content_block":{"text":"","type":"text"},"index":0,"type":"content_block_start"}
+
+event: ping
+data: {"type":"ping"}
+
+event: content_block_delta
+data: {"delta":{"text":"Hi there! How's","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"delta":{"text":" it","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"delta":{"text":" going? Is there something I can","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_stop
+data: {"index":0,"type":"content_block_stop"}
+
+event: message_delta
+data: {"copilot_usage":{"token_details":[{"batch_size":1000000,"cost_per_batch":500000000000,"token_count":8,"token_type":"input"},{"batch_size":1000000,"cost_per_batch":50000000000,"token_count":0,"token_type":"cache_read"},{"batch_size":1000000,"cost_per_batch":625000000000,"token_count":0,"token_type":"cache_write"},{"batch_size":1000000,"cost_per_batch":2500000000000,"token_count":16,"token_type":"output"}],"total_nano_aiu":44000000},"delta":{"stop_details":null,"stop_reason":"max_tokens","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":8,"output_tokens":16,"output_tokens_details":{"thinking_tokens":0}}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+data: [DONE]
+
