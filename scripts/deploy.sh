@@ -56,61 +56,85 @@ az account get-access-token --output none 2>/dev/null || true
 TOKEN_REFRESH_PID=$!
 trap '[[ "${TOKEN_REFRESH_PID:-}" ]] && kill "$TOKEN_REFRESH_PID" 2>/dev/null || true' EXIT
 
-# --- 3. Start the single, full terraform apply ---
-# ONE apply builds everything, incl. the Container App. Terraform assembles the
-# image ref itself as <acr-login-server>/tokenfoundry:<image_tag>, so we only
-# pass the tag — no fake placeholder, no second apply. It runs in the background
-# so the image build (step 5) can happen in parallel: the Container App is the
-# last resource (gated behind APIM ~30+ min), by which point the ~4 min build is
-# long done and the tag is present in ACR. Key Vault access is granted inside
-# Terraform (keyvault module), so no manual role assignment here.
-log "terraform apply START — provisioning all infrastructure (APIM is the long pole)"
-# Both tags are passed explicitly and both are the SAME here, because step 5
-# below builds tokenfoundry:$TAG and gitmodel:$TAG together. They are separate
-# variables because update-app.sh later advances only the app one; see the
-# comment on image_tag in terraform/variables.tf.
+# --- 3. Create the ACR first, so the app image can be built into it ---
+# This used to be ONE full apply started in the background, with both image
+# builds racing alongside it. The comment justifying that read:
+#
+#     the Container App is the last resource (gated behind APIM ~30+ min), by
+#     which point the ~4 min build is long done and the tag is present in ACR
+#
+# That was true of the classic APIM tiers. It stopped being true when the
+# project moved to StandardV2, which this repo adopted for Anthropic token
+# metering and DEPLOYMENT.zh.md celebrates as "约 1–2 分钟建成" — measured at
+# 1m32s on a fresh deploy. The safety margin the parallelism rested on went from
+# thirty minutes to ninety seconds, while the app image still takes ~7 minutes
+# (it builds the React portal with node before the Python layer).
+#
+# So terraform reached the Container App with the tag not yet pushed, and Azure
+# refused it:
+#
+#     MANIFEST_UNKNOWN: manifest tagged by "v20260902115851" is not found
+#
+# That is not a retryable error. The app is left provisioningState=Failed with
+# no revision, `terraform import` rejects it ("has not been provisioned
+# successfully"), and bootstrap.sh exits before create-deployer-sp.sh — a
+# half-built environment on a customer's first run. Two consecutive fresh
+# deploys (2026-09-02) failed here, so this is now the normal outcome rather
+# than an unlucky one.
+#
+# The fix is to stop racing on the ONE image the Container App needs. The ACR
+# apply is seconds; the app build then blocks. The hub image stays in the
+# background because nothing in this apply consumes it — it is pulled later, by
+# the GitHub Action that deploys a per-account hub.
+log "terraform apply (1/2) — ACR only, so there is somewhere to push the image"
 terraform apply -input=false -auto-approve \
-  -var "image_tag=${TAG}" -var "hub_image_tag=${TAG}" &
-APPLY_PID=$!
+  -target=module.acr.azurerm_container_registry.acr \
+  -var "image_tag=${TAG}" -var "hub_image_tag=${TAG}" \
+  || die "terraform apply (ACR) failed — see output above"
 
-# --- 4. Wait for ACR to come up (it only depends on the RG, so ~seconds) ---
-# No -target pre-create: the single apply above creates ACR early. Poll its
-# output until ready, then we have somewhere to push the image.
+ACR_LOGIN_SERVER="$(terraform output -raw acr_login_server 2>/dev/null || true)"
+[[ -n "$ACR_LOGIN_SERVER" ]] || die "ACR was applied but acr_login_server is empty"
+ACR_NAME="${ACR_LOGIN_SERVER%%.*}"   # strip .azurecr.io
+
 if [[ "$SKIP_BUILD" != "true" ]]; then
-  log "Waiting for ACR to be created by the apply..."
-  ACR_LOGIN_SERVER=""
-  for _ in $(seq 1 60); do
-    ACR_LOGIN_SERVER="$(terraform output -raw acr_login_server 2>/dev/null || true)"
-    [[ -n "$ACR_LOGIN_SERVER" ]] && break
-    kill -0 "$APPLY_PID" 2>/dev/null || die "terraform apply exited before ACR was created — see output above"
-    sleep 10
-  done
-  [[ -n "$ACR_LOGIN_SERVER" ]] || die "ACR did not appear within timeout"
-  ACR_NAME="${ACR_LOGIN_SERVER%%.*}"   # strip .azurecr.io
-
-  # --- 5. Build images IN PARALLEL while the apply continues toward APIM ---
-  # Two images share this ACR: the control-plane app, and the pre-built GitModel
-  # hub. The hub is built ONCE here (not per deploy) and referenced per-account by
-  # the GitHub Action's terraform (方案 A: the Action deploys hubs, not this
-  # script). No deploy-job image any more — 方案 A runs terraform in the Action.
-  log "Building app + hub images IN PARALLEL"
-  ( az acr build -r "$ACR_NAME" -t "tokenfoundry:${TAG}" "$REPO_ROOT" ) &
-  BUILD_APP_PID=$!
-  # hub image: build context is the vendored hub root (has Dockerfile + hub/ +
-  # requirements.txt). The Action's per-account terraform references gitmodel:<tag>
-  # via its HUB_IMAGE_REF repo var (set by the Portal's deploy-config flow).
+  # --- 4. Build the images ---
+  # The APP image is built in the FOREGROUND: the Container App created by the
+  # apply below refers to it by tag, and Azure resolves that tag while
+  # provisioning the first revision. Anything less than "already pushed" is the
+  # race this section exists to remove.
+  #
+  # The HUB image goes to the background and is only waited on at the end. No
+  # resource in this apply references it — HUB_IMAGE_REF is published to GitHub
+  # Actions later, and the per-account hub deploy pulls it then. Keeping it
+  # parallel costs nothing and preserves most of the wall-clock the old shape
+  # was after.
+  log "Building hub image in the background"
   ( az acr build -r "$ACR_NAME" -t "gitmodel:${TAG}" "$REPO_ROOT/vendored/gitmodel-hub" ) &
   BUILD_HUB_PID=$!
-  wait "$BUILD_APP_PID" || { kill "$APPLY_PID" 2>/dev/null; die "app image build failed"; }
-  wait "$BUILD_HUB_PID" || { kill "$APPLY_PID" 2>/dev/null; die "hub image build failed"; }
-  log "All images built; apply continues toward the Container App"
+
+  log "Building app image (blocking — the Container App cannot be created without it)"
+  az acr build -r "$ACR_NAME" -t "tokenfoundry:${TAG}" "$REPO_ROOT" \
+    || { kill "$BUILD_HUB_PID" 2>/dev/null; die "app image build failed"; }
 else
-  log "Skipping build (reusing existing image tokenfoundry:${TAG})"
+  log "Skipping build (reusing existing images tagged ${TAG})"
+  BUILD_HUB_PID=""
 fi
 
-# --- 6. Wait for the full apply to finish (APIM is the long pole) ---
-log "Waiting for terraform apply to complete..."
-wait "$APPLY_PID" || die "terraform apply failed — see output above"
+# --- 5. Full apply. The app image is in ACR by now, so the Container App can
+#        actually start. ---
+log "terraform apply (2/2) — everything else (APIM is the long pole)"
+terraform apply -input=false -auto-approve \
+  -var "image_tag=${TAG}" -var "hub_image_tag=${TAG}" \
+  || die "terraform apply failed — see output above"
+
+# The hub image is only needed by later account deploys, but a failure here
+# still has to surface: HUB_IMAGE_REF would be published pointing at a tag that
+# was never pushed, and the error would resurface minutes later inside a GitHub
+# Actions run with no obvious link back to this deploy.
+if [[ -n "${BUILD_HUB_PID:-}" ]]; then
+  log "Waiting for the hub image build"
+  wait "$BUILD_HUB_PID" || die "hub image build failed — see output above"
+fi
 
 # Stop the token refresher now that the long apply is done.
 [[ "${TOKEN_REFRESH_PID:-}" ]] && kill "$TOKEN_REFRESH_PID" 2>/dev/null || true
