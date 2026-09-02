@@ -130,6 +130,16 @@ apim_sku = "StandardV2_1"
 > Anthropic Messages API token metering, which is the point of this project. A
 > side benefit: a v2 APIM builds in 1-2 minutes against 30-45 for classic.
 >
+> That speed-up had a consequence worth knowing about. `deploy.sh` used to run
+> the whole apply in the background and build both images alongside it, on the
+> reasoning that the Container App sits behind APIM's 30+ minutes and the build
+> would long since have finished. At 1m32s it does not, and the app image takes
+> ~7 minutes (it builds the React portal with node first) — so the apply reached
+> the Container App with the tag unpushed and Azure refused it with
+> `MANIFEST_UNKNOWN`, leaving an app that `terraform import` will not adopt. The
+> script now applies the ACR alone, blocks on the app image, then applies the
+> rest.
+>
 > The value is `<tier>_<capacity>`. A bare `StandardV2` is rejected by the
 > provider (`not a valid Api Management sku name`) and only at plan time.
 >
@@ -141,6 +151,51 @@ apim_sku = "StandardV2_1"
 ⚠️ It packages the WORKING TREE, not git HEAD. Uncommitted changes do ship; and
 a file showing `M` in `git status` is not evidence that it has not been
 deployed. To see what is actually running, read the image tag.
+
+---
+
+## Updating an existing environment
+
+> This section is fuller in [DEPLOYMENT.zh.md](DEPLOYMENT.zh.md), which the
+> project keeps as the primary version. The two traps below are the ones that
+> cost the most time, so they are repeated here.
+
+Configuration is written at several unrelated moments and "change the code,
+rebuild the image" covers only one of them. See
+[`CHANGELOG.zh.md`](../CHANGELOG.zh.md), where every entry states what it takes
+to make it real on an existing environment, and
+`python scripts/check_env.py -g <rg>`, which compares what an environment has
+against what the current code expects.
+
+### ⚠️ Rebuilding the hub image is not the same as a hub running it
+
+A hub is not part of the control plane. Each GitHub account gets its own
+Container App, in its own resource group, deployed by the `deploy-hub` GitHub
+Action. So a change under `vendored/gitmodel-hub/` takes two steps:
+
+1. **Rebuild the hub image** (`deploy.sh` does, or
+   `az acr build -r <acr> -t gitmodel:<tag> vendored/gitmodel-hub`)
+2. **Re-run the `deploy-hub` workflow for every account** (`action=apply`)
+
+Stop after step 1 and the image sits in the registry with nothing pulling it:
+existing hubs keep running the old code, and **nothing anywhere says so**. The
+`copilot_usage` redaction of 2026-09-02 is exactly this shape — the change lives
+entirely in the hub, so updating the control-plane image achieves nothing.
+
+`check_env.py`'s layer 6 reports each hub's running image against the newest tag
+in the registry.
+
+### ⚠️ APIM policies and per-API diagnostics are written by neither
+
+They are not terraform resources and do not ship with an image. The control
+plane writes them when an account is added or when an operator presses **resync
+models** in the portal — the `llm-*` APIs are created at runtime, so terraform
+cannot know their names at apply time.
+
+The consequence: change policy-related code, deploy it, and **the existing APIs
+are still the old ones** until somebody presses that button. A customer reported
+a streaming bug in 2026-08 whose fix had shipped weeks earlier, for exactly this
+reason.
 
 ---
 

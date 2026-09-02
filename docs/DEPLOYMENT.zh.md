@@ -159,11 +159,23 @@ az login && az account set --subscription <id>
 
 `bootstrap.sh` 按序跑两步，第一步失败就停：
 
-1. **`deploy.sh`** —— 一次 `terraform apply` 建整个环境（RG、Key Vault、ACR、APIM、
-   Cosmos、PostgreSQL、控制面 Container App、tfstate 存储）。并行用 `az acr build` 建两个
-   镜像：控制面 app（`tokenfoundry:<tag>`）和预建的 GitModel hub（`gitmodel:<tag>`）。v2 SKU
-   （StandardV2_1）下 APIM 约 1–2 分钟建成；之后较长的是 Postgres/Cosmos/Container App（各几分钟）。
-   结尾做 `/healthz` smoke test。
+1. **`deploy.sh`** —— 分两段 `terraform apply` 建整个环境（RG、Key Vault、ACR、APIM、
+   Cosmos、PostgreSQL、控制面 Container App、tfstate 存储）：
+
+   ```
+   apply ①  只建 ACR（数秒）
+   构建     hub 镜像 gitmodel:<tag> 在后台；app 镜像 tokenfoundry:<tag> 阻塞等待
+   apply ②  其余全部
+   ```
+
+   **app 镜像必须先推完**，因为 Container App 按 tag 引用它，Azure 会在激活第一个修订时
+   去解析这个 tag。这里原本是「一次 apply 丢后台、两个镜像并行构建」，依据是
+   「Container App 排在 APIM 后面，30+ 分钟足够构建完成」—— 换成 v2 SKU 后
+   APIM 只要 1 分半，而 app 镜像要 7 分钟（它要先用 node 构建前端），于是必然抢跑失败，
+   报 `MANIFEST_UNKNOWN`，且 Container App 会停在 `provisioningState=Failed`、
+   连 `terraform import` 都拒绝接管。hub 镜像仍然并行，因为这次 apply 里没有资源引用它。
+
+   之后较长的是 Postgres/Cosmos/Container App（各几分钟）。结尾做 `/healthz` smoke test。
 2. **`create-deployer-sp.sh`** —— 创建方案 A 的部署服务主体，授予其角色包，并把 creds
    写进 Key Vault 的 `deployer-sp-*` secret（确切角色 + 原因见 [SECURITY.zh.md](SECURITY.zh.md)）。
 
@@ -234,9 +246,24 @@ Portal → **GitHub 账号** → **+ GitHub 账号**。一次 GitHub 设备流�
 | 改了什么 | 该做什么 | 为什么 |
 | --- | --- | --- |
 | 应用代码（`app/` / `portal/`） | `./scripts/update-app.sh -g <rg>` | 重建镜像 + 滚动修订版，**完全不碰 terraform** |
-| hub 代码（`vendored/gitmodel-hub/`） | `./scripts/deploy.sh -g <rg>` | 要重建 hub 镜像；hub 本身由 Actions 部署 |
+| hub 代码（`vendored/gitmodel-hub/`） | 重建 hub 镜像 **+ 每个账号重跑 `deploy-hub`** | ⬅ 见下 |
 | terraform 变量 / 资源 | `terraform apply`（见下方警告） | 基础设施 |
 | **APIM 策略、API 级诊断、模型目录** | **在 Portal 点「重新同步模型」** | ⬅ 见下 |
+
+### ⚠️ 改了 hub 代码：重建镜像不等于 hub 用上了它
+
+hub 不是控制面的一部分——每个 GitHub 账号一个独立的 Container App，位于自己的资源组，
+由 `deploy-hub` GitHub Action 部署。所以改 `vendored/gitmodel-hub/` 之后要两步：
+
+1. **重建 hub 镜像**（`deploy.sh` 会建，或直接
+   `az acr build -r <acr> -t gitmodel:<tag> vendored/gitmodel-hub`）
+2. **对每个账号重跑 `deploy-hub` workflow**（`action=apply`），hub 才会滚到新镜像
+
+只做第 1 步，镜像躺在 ACR 里没人拉；已有的 hub 继续跑旧代码，而且**没有任何地方会提示你**。
+2026-09-02 的 `copilot_usage` 脱敏就是这一类：改动全在 hub 里，只更新控制面镜像完全无效。
+
+判断方法：改动如果落在 `vendored/gitmodel-hub/`，那就一定要走完这两步。
+`python scripts/check_env.py -g <rg>` 的第 6 层会把各 hub 实际镜像和 ACR 最新 tag 对出来。
 
 ### ⚠️ 有一类配置 terraform 和部署都改不动
 
