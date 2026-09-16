@@ -10,7 +10,7 @@
 | `./scripts/deploy.sh -g <rg>` | 上面全部 **+ hub 镜像 + terraform** |
 | `terraform apply` | Azure 资源、角色分配、服务级诊断、控制平面 env |
 | 门户「推送 GitHub 部署配置」 | 仓库变量 `HUB_IMAGE_REF` / `HUB_EVENTHUB_*` … |
-| 门户「重新同步模型」 | **APIM 的 API 操作、策略、API 级诊断** |
+| 门户「重新同步模型」 | **APIM 的 API 操作、API 级与操作级策略、策略引用的命名值、API 级诊断** |
 | 重跑 `deploy-hub` workflow | 每个账号的 hub 容器 |
 
 后三个既不是 terraform 资源、也不随镜像更新生效。2026-08-26 一天之内就有三起事故都源于此：新账号的 hub 起在 12 天前的镜像上；客户的计费页面从来没有数据；客户报的流式故障，修复其实几周前就合入了。
@@ -23,10 +23,34 @@
 
 ## 2026-09-16
 
-### Responses 会话钉在同一个 hub 上 · `154c523`
+### Responses 会话钉在同一个 hub 上 · `154c523` `850f0aa`
 **要生效：新镜像 + 门户「重新同步模型」**
 
 两步缺一不可。新镜像只是让生成策略的代码存在;策略和它依赖的命名值 `tf-hub-pool-joins` 是在「重新同步模型」那一刻才写进 APIM 的。**只更新镜像,网关行为一点不变。**
+
+```bash
+# 1. 控制平面镜像（app/ + portal/）
+./scripts/update-app.sh -g <rg>
+```
+
+**2.** 门户 →「GitHub 账号」→ 任意一个 READY 账号 →「重新同步模型」
+
+**不需要** `terraform apply`、不需要重新部署 hub、不需要「推送 GitHub 部署配置」。
+
+同步**任意一个**账号即可 —— `ensure_pooled_provider_api()` 配的是 API 与池子,与具体账号无关,不必挨个点。但要知道这个按钮**自身**的既有副作用(非本次引入):它以 `prune=True` 运行,会删掉 hub 目录里已不存在的 `PLATFORM` 模型路由;`TENANT`(BYO)路由不受影响。
+
+验证(`--output-file` 不能省:`az rest` 在 Windows 上会被策略 XML 的 BOM 噎住):
+
+```bash
+B="https://management.azure.com/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.ApiManagement/service/<apim>"
+az rest --method get --output-file p.xml \
+  --url "$B/apis/llm-openai/operations/responses/policies/policy?api-version=2024-05-01&format=rawxml"
+grep -c "tf-hub-pool-joins" p.xml   # 1 = 策略已就位
+az rest --method get --url "$B/namedValues/tf-hub-pool-joins?api-version=2024-05-01" \
+  --query "properties.value" -o tsv
+```
+
+最后一条应当列出池子里的**全部**后端。**在池子里却不在这个映射里的后端,接不到任何被钉住的会话** —— 出现这种情况说明它是绕过控制平面加进去的。
 
 把我们的端点配进 Codex 跑长任务,会反复看到:
 
@@ -52,7 +76,9 @@ APIM 的池亲和本来就能解决,只是**从未生效**:它签发的 `Session
 
 ⚠️ **开启这个策略会打断所有在途的 Responses 会话。** 它们的历史里混着多个 hub 的加密块,钉到任何一个都解不开 —— 而且比开启前更糟:之前靠重试还能碰上正确的 hub,之后 5 次重试全部落在同一台,永久卡死。**升级后让用户开新会话。** 新增账号不会有这个问题(加入时间过滤挡住了),只有本次上线这一次。
 
-命名值 `tf-hub-pool-joins` 由 `add_hub_to_pools` / 账号移除自动维护,已有成员回填为 0(视同"一直都在")。因为命名值是按请求解析的,**加删账号只改这个映射,不需要重推策略**。
+命名值 `tf-hub-pool-joins` 由 `add_hub_to_pools` / 账号移除自动维护。回填分两种情形,不能混:**首次建映射**(也就是本次升级)时把池中已有成员记为 `0`——它们确实早于所有在途会话,记别的会把整个池子对现有流量藏起来;**映射已存在、却冒出一个没见过的成员**(有人绕过控制平面手工加进池子)则记当前时间——给它 `0` 会让它成为更早那些会话的候选,把它们重映射到一台解不开其加密块的 hub 上,重演一次上面那个 ⚠️。
+
+因为命名值是按请求解析的,**加删账号只改这个映射,不需要重推策略**,也就不存在"策略里还写着一个已经离开池子的后端"的时间窗。
 
 ---
 
