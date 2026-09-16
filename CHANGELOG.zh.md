@@ -21,6 +21,41 @@
 
 ---
 
+## 2026-09-16
+
+### Responses 会话钉在同一个 hub 上 · `154c523`
+**要生效：新镜像 + 门户「重新同步模型」**
+
+两步缺一不可。新镜像只是让生成策略的代码存在;策略和它依赖的命名值 `tf-hub-pool-joins` 是在「重新同步模型」那一刻才写进 APIM 的。**只更新镜像,网关行为一点不变。**
+
+把我们的端点配进 Codex 跑长任务,会反复看到:
+
+```
+stream disconnected before completion: stream closed before response.completed
+```
+
+Codex 把它当成连接故障,最多重试 5 次;dev-19 在 2026-09-15 有 **127 次调用里 69 次**中招。它看起来像超时,我起初也是这么判的(先怪到 APIM 的 300 秒默认值,又怪到推理烧光 `max_output_tokens`)—— **两个都被实测推翻了**。
+
+真正的原因在 hub 日志里,69 条无一例外是同一句上游原文:
+
+```
+401 {"error":{"message":"input item does not belong to this connection"}}
+```
+
+Codex 用 `store: false` 跑,于是要求 `include: reasoning.encrypted_content`,把上一轮的输出项连同加密的推理内容回填进下一轮的 `input`。**那个加密块是用生成它的 Copilot 连接的密钥封的**,换一个 hub 就解不开。而此时 hub 早已发出 `200 OK`(`StreamingResponse` 在生成器体运行之前就把响应头写出去了),所以这个 401 只能以流内 `error` 事件的形式补发,流就此结束、没有 `response.completed`。
+
+APIM 的池亲和本来就能解决,只是**从未生效**:它签发的 `SessionId` cookie 需要客户端带回来,而 Codex 基于 reqwest,cookie store 默认关闭。所以现在由网关按会话自己算出这个 cookie —— 依次取 `thread-id`、`session-id`、body 里的 `prompt_cache_key`。三者都没有的请求**不钉**,维持轮询;用订阅密钥兜底会把一整把密钥的流量压在一个账号上,代价太大。
+
+选 rendezvous 散列而不是 `hash % N`,是因为重映射在这里**不是变慢而是卡死**:加密块留在旧 hub 上,5 次重试全部确定性地打在新 hub,一次都不会对。3 万条会话的模拟里,新增第 4 个 hub 时 `% N` 要迁移 75%、rendezvous 25%;再加上按加入时间过滤(**新 hub 对比它更早的会话不可见**)后降到 0。删除 hub 两者都是 33%,且都是非迁不可的那部分。
+
+只挂在 `responses` 这一个操作上,因为别的都不需要:`chat/completions` 和 Anthropic 原生 Messages 实测都能跨 hub 重放;而 Copilot 的 prompt cache **本来就跨 hub 共享** —— 456 次 Anthropic 调用均分在三个 hub 上,命中率仍有 96%。顺带修正了 `ensure_pooled_provider_api` 文档串里"亲和是为了 prompt cache 保温"这个说法,至少对 Anthropic 不成立。
+
+⚠️ **开启这个策略会打断所有在途的 Responses 会话。** 它们的历史里混着多个 hub 的加密块,钉到任何一个都解不开 —— 而且比开启前更糟:之前靠重试还能碰上正确的 hub,之后 5 次重试全部落在同一台,永久卡死。**升级后让用户开新会话。** 新增账号不会有这个问题(加入时间过滤挡住了),只有本次上线这一次。
+
+命名值 `tf-hub-pool-joins` 由 `add_hub_to_pools` / 账号移除自动维护,已有成员回填为 0(视同"一直都在")。因为命名值是按请求解析的,**加删账号只改这个映射,不需要重推策略**。
+
+---
+
 ## 2026-08-28
 
 ### Hub 失去 Copilot 登录时，门户会说出来 · `4db6699`
