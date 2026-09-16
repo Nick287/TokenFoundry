@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import timedelta
 
 import httpx
@@ -147,6 +148,31 @@ KEY_LIMITS_NV = "tf-key-token-limits"
 # map holds ~60-70 keys. _merge_key_limit raises past this so an over-cap issue
 # surfaces at key-issuance (502) rather than silently dropping a limit.
 _KEY_LIMITS_MAX_BYTES = 4000
+
+# --- Pool membership, for Responses-API conversation affinity -----------------
+# A second named value holding {backend_id: joined_at_unix_ms} for every hub in
+# every pool. Read by the `responses` operation policy (see
+# _build_responses_affinity_policy) to pick the hub a conversation is pinned to.
+#
+# Why a named value rather than baking the list into the policy: named values
+# are resolved at REQUEST time, so adding or removing an account updates routing
+# by writing this map — no policy rewrite, and no window where the policy names
+# a backend that has already left the pool.
+#
+# The timestamp is what makes a pool resize survivable. A hub is only a
+# candidate for conversations that started AFTER it joined, so a new account is
+# invisible to every conversation already in flight. Without that, adding an
+# account moves ~25% of live conversations to a different hub (75% if the
+# mapping were `hash % N`), and for the Responses API that is fatal rather than
+# slow — see _build_responses_affinity_policy.
+#
+# 0 means "has been here as long as anything that matters", which is what
+# backfilled pre-existing members get.
+POOL_JOINS_NV = "tf-hub-pool-joins"
+# Same 4096-char cap as KEY_LIMITS_NV. Entries are ~45 chars and APIM allows at
+# most 30 backends per pool across 3 pools, so ~90 entries ≈ 4000 chars — right
+# at the edge, hence the trim in _write_pool_joins rather than a hard failure.
+_POOL_JOINS_MAX_BYTES = 4000
 # Sentinels for "no limit of this kind" — large enough to never bite in practice.
 _TPM_UNLIMITED = 1_000_000_000
 _PERIOD_DEFAULT = "Yearly"
@@ -503,6 +529,23 @@ class ApimProvisioner:
                 ),
             )
 
+        # Pin each Responses-API conversation to one hub. Only meaningful against
+        # a POOL — a single-backend API has nothing to choose between — and only
+        # for providers that expose the op. POOL_JOINS_NV has to exist first:
+        # APIM rejects a policy that references a missing named value.
+        if backend_id.endswith("-pool") and any(o == "responses" for o, _ in cfg["ops"]):
+            self.ensure_pool_joins_nv(backend_id)
+            self.client.api_operation_policy.create_or_update(
+                self._rg,
+                self._service,
+                cfg["api_id"],
+                "responses",
+                "policy",
+                PolicyContract(
+                    value=self._build_responses_affinity_policy(), format="rawxml"
+                ),
+            )
+
         # Authorize subscription keys (scoped to these products) to call the API.
         for product_id in _LLM_PRODUCTS:
             try:
@@ -782,6 +825,115 @@ class ApimProvisioner:
   <on-error><base /></on-error>
 </policies>"""
 
+    @staticmethod
+    def _build_responses_affinity_policy() -> str:
+        """Operation-level policy for the `responses` op: pin one conversation to
+        one hub.
+
+        The Responses API is stateful in a way the other protocols are not. A
+        client that runs with `store: false` — Codex does — asks for
+        `include: reasoning.encrypted_content` and replays the previous turn's
+        output items in the next turn's `input`. Those items are sealed against
+        the Copilot connection that produced them, so a turn routed to a
+        different hub is rejected upstream:
+
+            401 {"error":{"message":"input item does not belong to this connection"}}
+
+        and because the hub has already committed to `200 OK` before it calls
+        upstream (StreamingResponse sends headers before the generator body
+        runs), the client sees a stream that simply ends with no
+        `response.completed`. Codex reports that as
+        `stream disconnected before completion` and retries; every retry
+        round-robins again. Measured on dev-19 2026-09-15: 69 of 127 calls.
+
+        Scoped to `responses` because nothing else needs it — `chat` and the
+        Anthropic Messages API were both verified to replay fine on a different
+        hub, and Copilot's prompt cache turned out to be shared ACROSS hubs
+        (456 calls spread evenly over three hubs still hit 96%), so affinity
+        buys them nothing either.
+
+        HOW IT PINS. APIM's pool already does affinity, keyed on a `SessionId`
+        cookie it mints — the value is just base64 of the backend id. It never
+        engages for Codex because reqwest's cookie store is off by default, so
+        the cookie is never sent back. This computes the same cookie from the
+        conversation's own identifier instead, before `<base />` runs
+        `set-backend-service`, so the pool sees it as if the client had sent it.
+        Nothing is stored: the same identifier yields the same backend on every
+        gateway instance.
+
+        Identifier, in order: the `thread-id` header, then `session-id`, then
+        `prompt_cache_key` in the body — Codex sends all three, other clients
+        may send one. A client that sends NONE is left alone (round-robin, the
+        behaviour it has today) rather than pinned by subscription, which would
+        park an entire key's traffic on one account.
+
+        WHY RENDEZVOUS AND NOT MODULO. A remap is not a hiccup here: the
+        conversation's sealed items live on the old hub, so all 5 of Codex's
+        retries fail against the new one and the conversation is stuck, not
+        slowed. Simulated over 30k threads, adding a fourth hub moves 75% of
+        live conversations under `hash % N` and 25% under rendezvous hashing;
+        removing one moves 67% under modulo (half of them needlessly) against
+        33% under rendezvous, all of which had to move. The join-time filter
+        then takes the add case to zero.
+
+        FNV-1a rather than a cryptographic hash, because APIM's expression
+        sandbox is not guaranteed to expose one, and rendezvous needs mixing,
+        not collision resistance. Order matters: hashing `backend + "|" + sid`
+        spreads to within 0.5pp across three hubs, while `sid + "|" + backend`
+        skews 3.5pp — the backend names differ only in their last 12 hex
+        characters, which FNV mixes poorly when they land in the final rounds.
+
+        The named value is read via `set-variable`, NOT interpolated into an
+        expression: `{{...}}` is compile-time text substitution and the map's
+        own quotes would tear the C# string literal apart.
+        """
+        return """<policies>
+  <inbound>
+    <choose>
+      <when condition="@(!context.Request.Headers.ContainsKey(&quot;Cookie&quot;))">
+        <set-variable name="tfSid" value="@{ var h = context.Request.Headers.GetValueOrDefault(&quot;thread-id&quot;, &quot;&quot;); if (string.IsNullOrEmpty(h)) { h = context.Request.Headers.GetValueOrDefault(&quot;session-id&quot;, &quot;&quot;); } if (string.IsNullOrEmpty(h)) { try { var b = context.Request.Body.As&lt;JObject&gt;(preserveContent:true); if (b != null &amp;&amp; b[&quot;prompt_cache_key&quot;] != null) { h = (string)b[&quot;prompt_cache_key&quot;]; } } catch { } } return h == null ? &quot;&quot; : h; }" />
+        <set-variable name="tfJoins" value="{{__NV__}}" />
+        <set-variable name="tfPin" value="@{
+    var sid = (string)context.Variables[&quot;tfSid&quot;];
+    if (string.IsNullOrEmpty(sid)) { return &quot;&quot;; }
+    long tms = 0;
+    try { var hex = sid.Replace(&quot;-&quot;, &quot;&quot;); if (hex.Length &gt;= 12) { tms = Convert.ToInt64(hex.Substring(0, 12), 16); } } catch { tms = 0; }
+    var prefix = context.Api.Id + &quot;-&quot;;
+    string best = null; long bestH = -1;
+    try {
+        var m = JObject.Parse((string)context.Variables[&quot;tfJoins&quot;]);
+        for (int pass = 0; pass &lt; 2; pass++) {
+            foreach (var p in m.Properties()) {
+                if (!p.Name.StartsWith(prefix)) { continue; }
+                long j = 0;
+                try { j = (long)p.Value; } catch { j = 0; }
+                if (pass == 0 &amp;&amp; tms &gt; 0 &amp;&amp; j &gt; tms) { continue; }
+                long v = 2166136261L;
+                var s = p.Name + &quot;|&quot; + sid;
+                foreach (char c in s) { v = ((v ^ (long)c) * 16777619L) &amp; 4294967295L; }
+                if (v &gt; bestH) { bestH = v; best = p.Name; }
+            }
+            if (best != null) { break; }
+        }
+    } catch { best = null; }
+    return best == null ? &quot;&quot; : best;
+}" />
+        <choose>
+          <when condition="@(((string)context.Variables[&quot;tfPin&quot;]).Length &gt; 0)">
+            <set-header name="Cookie" exists-action="override">
+              <value>@(&quot;SessionId=&quot; + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes((string)context.Variables[&quot;tfPin&quot;])))</value>
+            </set-header>
+          </when>
+        </choose>
+      </when>
+    </choose>
+    <base />
+  </inbound>
+  <backend><base /></backend>
+  <outbound><base /></outbound>
+  <on-error><base /></on-error>
+</policies>""".replace("__NV__", POOL_JOINS_NV)
+
     # --- Subscriptions (virtual keys) ---
 
     def create_subscription(
@@ -887,6 +1039,114 @@ class ApimProvisioner:
             params,
             if_match=etag or "*",
         ).result()
+
+    # --- Pool membership map (drives Responses-API conversation affinity) ---
+
+    def _pool_member_ids(self, pool_id: str) -> list[str]:
+        """Backend ids currently in a pool. Empty list if the pool isn't there yet
+        (first account) or ARM is unhappy — callers treat that as "nothing to
+        backfill", never as an error."""
+        url = f"{self._backend_base()}/{pool_id}?api-version={self._POOL_API_VERSION}"
+        try:
+            with httpx.Client(timeout=30.0) as hc:
+                r = hc.get(url, headers={"Authorization": f"Bearer {self._arm_token()}"})
+            if r.status_code != 200:
+                return []
+            services = ((r.json().get("properties") or {}).get("pool") or {}).get("services") or []
+        except Exception as exc:  # noqa: BLE001 — informational read, never fatal
+            logger.warning("could not read pool %s members: %s", pool_id, exc)
+            return []
+        return [s["id"].rsplit("/backends/", 1)[1] for s in services if "/backends/" in s.get("id", "")]
+
+    def _read_pool_joins(self) -> tuple[dict, str | None]:
+        """Parsed {backend_id: joined_ms} map + etag. Missing or unparsable both
+        yield ({}, ...) so callers start from an empty map."""
+        try:
+            nv = self.client.named_value.get(self._rg, self._service, POOL_JOINS_NV)
+        except ResourceNotFoundError:
+            return {}, None
+        try:
+            parsed = json.loads(nv.value) if nv.value else {}
+        except (ValueError, TypeError):
+            logger.warning("named value %s not valid JSON; resetting", POOL_JOINS_NV)
+            parsed = {}
+        return (parsed if isinstance(parsed, dict) else {}), getattr(nv, "e_tag", None)
+
+    def _write_pool_joins(self, mapping: dict, etag: str | None) -> None:
+        """Write the map back. Over the named-value size cap, drop the OLDEST
+        joiners: their entries are the ones a 0 would model correctly anyway, so
+        losing them degrades the filter rather than the routing."""
+        while True:
+            body = json.dumps(mapping, separators=(",", ":"))
+            if len(body) <= _POOL_JOINS_MAX_BYTES or len(mapping) <= 1:
+                break
+            oldest = min(mapping, key=lambda k: mapping[k])
+            logger.warning("%s over %d bytes; dropping oldest entry %s",
+                           POOL_JOINS_NV, _POOL_JOINS_MAX_BYTES, oldest)
+            mapping.pop(oldest)
+        self.client.named_value.begin_create_or_update(
+            self._rg,
+            self._service,
+            POOL_JOINS_NV,
+            NamedValueCreateContract(
+                display_name=POOL_JOINS_NV, value=body, secret=False
+            ),
+            if_match=etag or "*",
+        ).result()
+
+    def ensure_pool_joins_nv(self, pool_id: str | None = None) -> None:
+        """Ensure POOL_JOINS_NV exists before any policy references it — APIM
+        rejects a policy naming a missing named value.
+
+        Also backfills: a hub already in the pool when this first runs gets a
+        join time of 0, i.e. "visible to every conversation". That is the right
+        answer for an upgrade — those hubs predate every thread now in flight —
+        and it is what keeps the filter from hiding the entire pool on an
+        existing environment.
+
+        Idempotent: an entry already present is never rewritten, so a real join
+        timestamp is not clobbered back to 0 by a later resync.
+        """
+        existing, etag = self._read_pool_joins()
+        added = [b for b in (self._pool_member_ids(pool_id) if pool_id else [])
+                 if b not in existing]
+        if etag is not None and not added:
+            return
+        for backend_id in added:
+            existing[backend_id] = 0
+        self._write_pool_joins(existing, etag)
+        logger.info("named value %s ready (%d members, %d backfilled)",
+                    POOL_JOINS_NV, len(existing), len(added))
+
+    def record_pool_join(self, backend_id: str, joined_ms: int | None = None) -> None:
+        """Stamp a backend's join time. Best-effort: a hub that fails to register
+        here still serves traffic, it just won't be excluded from conversations
+        older than itself.
+
+        `joined_ms=0` means "no older than anything" — used for the first member
+        of a pool, which has to serve conversations that predate the pool.
+        """
+        try:
+            existing, etag = self._read_pool_joins()
+            if backend_id in existing:
+                return  # already known — keep the original join time
+            existing[backend_id] = int(time.time() * 1000) if joined_ms is None else joined_ms
+            self._write_pool_joins(existing, etag)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not record pool join for %s: %s", backend_id, exc)
+
+    def forget_pool_join(self, backend_id: str) -> None:
+        """Drop a backend from the map when it leaves the pool. Best-effort; a
+        stale entry only names a backend the pool no longer offers, and the
+        policy picks from the map's entries, so it must not linger — but a
+        failure here is not worth aborting an account removal."""
+        try:
+            existing, etag = self._read_pool_joins()
+            if existing.pop(backend_id, None) is None:
+                return
+            self._write_pool_joins(existing, etag)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not forget pool join for %s: %s", backend_id, exc)
 
     def upsert_key_limits(
         self,
@@ -1249,6 +1509,9 @@ class ApimProvisioner:
                     put_headers["If-Match"] = etag
                 pr = hc.put(url, headers=put_headers, json={"properties": props})
                 self._raise_for_arm(pr)
+                # Stamp the join so conversations older than this hub never
+                # route to it (see POOL_JOINS_NV).
+                self.record_pool_join(backend_id)
             elif r.status_code == 404:
                 # First account: create the pool with this one member + affinity.
                 props = {
@@ -1263,6 +1526,10 @@ class ApimProvisioner:
                 }
                 pr = hc.put(url, headers=headers, json={"properties": props})
                 self._raise_for_arm(pr)
+                # First member of a brand-new pool. 0 rather than now(): with no
+                # other hub to compete with it must serve every conversation,
+                # including any that predate the pool.
+                self.record_pool_join(backend_id, joined_ms=0)
             else:
                 self._raise_for_arm(r)
 
@@ -1342,6 +1609,7 @@ class ApimProvisioner:
                 # 404 = someone else got there first; still the desired end state.
                 if dr.status_code != 404:
                     self._raise_for_arm(dr)
+                self.forget_pool_join(backend_id)
                 return
             pool["services"] = kept
             props["pool"] = pool
@@ -1349,3 +1617,7 @@ class ApimProvisioner:
                 url, headers={**headers, "If-Match": etag}, json={"properties": props}
             )
             self._raise_for_arm(pr)
+            # Drop it from the affinity map too: the `responses` policy picks
+            # from that map's entries, so a stale one would pin conversations to
+            # a backend the pool no longer offers.
+            self.forget_pool_join(backend_id)
