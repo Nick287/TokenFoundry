@@ -1098,25 +1098,37 @@ class ApimProvisioner:
         """Ensure POOL_JOINS_NV exists before any policy references it — APIM
         rejects a policy naming a missing named value.
 
-        Also backfills: a hub already in the pool when this first runs gets a
-        join time of 0, i.e. "visible to every conversation". That is the right
-        answer for an upgrade — those hubs predate every thread now in flight —
-        and it is what keeps the filter from hiding the entire pool on an
-        existing environment.
+        Also backfills members the map has never seen. What they get depends on
+        whether the map existed, and the two cases are NOT the same:
+
+          * map absent — this is the upgrade. Every hub in the pool predates
+            every conversation now in flight, so they get 0, "visible to all".
+            Anything else would hide the whole pool from existing traffic.
+
+          * map present, member unknown — the backend was added to the pool
+            without going through `add_hub_to_pools` (by hand in the portal, or
+            by a partly-failed account add). It is new *relative to running
+            conversations*, so it gets now(). Backfilling 0 here would make it a
+            candidate for conversations that started before it existed, remap
+            them onto a hub that cannot decrypt their reasoning items, and
+            strand them — the same failure that turning this feature on caused
+            once, deliberately not repeated on every resync.
 
         Idempotent: an entry already present is never rewritten, so a real join
-        timestamp is not clobbered back to 0 by a later resync.
+        timestamp is not clobbered by a later resync.
         """
         existing, etag = self._read_pool_joins()
+        first_time = etag is None
         added = [b for b in (self._pool_member_ids(pool_id) if pool_id else [])
                  if b not in existing]
-        if etag is not None and not added:
+        if not first_time and not added:
             return
+        stamp = 0 if first_time else int(time.time() * 1000)
         for backend_id in added:
-            existing[backend_id] = 0
+            existing[backend_id] = stamp
         self._write_pool_joins(existing, etag)
-        logger.info("named value %s ready (%d members, %d backfilled)",
-                    POOL_JOINS_NV, len(existing), len(added))
+        logger.info("named value %s ready (%d members, %d backfilled at %d)",
+                    POOL_JOINS_NV, len(existing), len(added), stamp)
 
     def record_pool_join(self, backend_id: str, joined_ms: int | None = None) -> None:
         """Stamp a backend's join time. Best-effort: a hub that fails to register
