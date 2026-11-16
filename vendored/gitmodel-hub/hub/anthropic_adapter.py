@@ -160,6 +160,26 @@ FORWARDABLE_BETAS: frozenset[str] = frozenset({
     "mid-conversation-system-2026-04-07",
     "prompt-caching-scope-2026-01-05",
     "thinking-token-count-2026-05-13",
+    # Per-turn effort. Claude Code from 2.1.316 sends `per-turn-control` on
+    # EVERY request, with `output_config: {effort}` on the system message at
+    # messages[1] — not only when the effort changes. Upstream accepts that
+    # field only when the beta rides along; without it the answer is
+    #
+    #     400 "messages.1.output_config: Extra inputs are not permitted"
+    #
+    # So withholding this one did not cost a feature, it cost the request:
+    # every call from a current Claude Code failed, and its own retry ladder
+    # (six attempts, shedding betas as it goes) never helps because it keeps
+    # both this beta and the field. `mid-conversation-output-config` is the
+    # name Anthropic documents for the same feature. Both verified 2026-11-16
+    # against Copilot directly (no hub in the path), on both message shapes —
+    # an empty control message and effort on a system message with text.
+    "per-turn-control-2026-07-01",
+    "mid-conversation-output-config-2026-07-01",
+    # `output_config.task_budget`. Same failure mode, same verification: 400
+    # "output_config.task_budget: Extra inputs are not permitted" without it,
+    # 200 with it.
+    "task-budgets-2026-03-13",
 })
 
 

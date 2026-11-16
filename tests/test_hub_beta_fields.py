@@ -184,7 +184,37 @@ def test_allowlist_holds_only_verified_betas():
         "mid-conversation-system-2026-04-07",
         "prompt-caching-scope-2026-01-05",
         "thinking-token-count-2026-05-13",
+        "per-turn-control-2026-07-01",
+        "mid-conversation-output-config-2026-07-01",
+        "task-budgets-2026-03-13",
     })
+
+
+def test_current_claude_code_keeps_its_per_turn_beta():
+    """The header Claude Code 2.1.316+ sends on every request, captured from the
+    real client. `per-turn-control` must survive: the body carries a
+    message-level `output_config` that upstream rejects without it, so
+    dropping the beta fails the whole request rather than one feature."""
+    forwarded = aa.forwardable_betas(
+        "claude-code-20250219,interleaved-thinking-2025-05-14,"
+        "context-management-2025-06-27,per-turn-control-2026-07-01,"
+        "mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,"
+        "advanced-tool-use-2025-11-20,effort-2025-11-24")
+    assert "per-turn-control-2026-07-01" in forwarded
+
+
+def test_message_level_output_config_is_left_for_upstream():
+    """strip_unsupported only ever looks at top-level fields. The per-turn
+    effort lives inside messages[], and forwarding it untouched (together with
+    its beta) is the fix — rewriting it to top-level would lose the per-turn
+    semantics and invalidate the messages cache whenever effort changes."""
+    body = {"model": "m", "max_tokens": 10, "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": [{"type": "text", "text": "env"}],
+         "output_config": {"effort": "xhigh"}}]}
+    out, dropped = aa.strip_unsupported(body, "per-turn-control-2026-07-01")
+    assert dropped == []
+    assert out["messages"][1]["output_config"] == {"effort": "xhigh"}
 
 
 def test_the_one_refused_beta_stays_out():

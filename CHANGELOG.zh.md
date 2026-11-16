@@ -21,6 +21,56 @@
 
 ---
 
+## 2026-11-16
+
+### Claude Code ≥ 2.1.316 不再全部 400:放行逐轮 effort 的 beta
+**要生效：重建 hub 镜像 + 更新每个账号的 hub 容器**
+
+这是 **hub** 的改动,控制平面镜像和「重新同步模型」都碰不到它。hub 镜像构建出来以后,必须让每个账号的 hub 容器真正换上新镜像:
+
+```bash
+TAG=v$(date -u +%Y%m%d%H%M%S)
+az acr build -r <acr> -t gitmodel:$TAG vendored/gitmodel-hub
+# 对每个账号的 hub：
+az containerapp update -g tokenfoundry-hub-<account_id> -n h<id前8位>-hub \
+  --image <acr>.azurecr.io/gitmodel:$TAG
+```
+
+新添加的账号会自动用上 ACR 里最新的 hub 镜像,不需要额外操作。已有账号**不会**自动更新。
+
+**现象。**Claude Code 从 2.1.316 起,每个请求都返回:
+
+```
+messages.1.output_config: Extra inputs are not permitted
+```
+
+流式请求下,用户只能看到 `upstream returned 400`。Claude Code 会重试 6 次,每次少带几个 beta,但全部失败。客户端可以用 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` 临时绕过,代价是关掉所有实验功能。
+
+**原因不在请求体,在 beta 头。**新版 Claude Code 会把 `output_config: {effort}` 放在 `messages[1]` 那条 system 消息上,同时带上 `per-turn-control-2026-07-01`。这是**每个**请求都会发的,不只是切换 effort 的时候。上游只有在收到这个 beta 时才接受消息级的 `output_config`,而 hub 的 beta 白名单里没有它,转发前把它剥掉了。上游没收到 beta,就把这个字段当成多余字段拒绝。
+
+这个结论是在**绕开 hub 的情况下**直连 Copilot 验证的:同样的请求体,不带 beta 返回 400,带 beta 返回 200。两种消息形状(空的控制消息,以及有正文的 system 消息)都一样。
+
+也正因为如此,"通过网关测试,带不带 beta 头结果都一样"这个观察**说明不了问题**:不管客户端发不发,这个头都到不了上游。有一个外部方案建议把消息级 effort 改写到顶层,那个方案能绕过问题,但根因判断是错的。而且改写会丢掉逐轮控制的语义,每次 effort 变化都会让 messages 部分的 prompt cache 失效。放行 beta 就没有这些代价。
+
+白名单新增 3 项,每一项都在不经过 hub 的情况下直接发给 Copilot 验证过:
+
+| beta | 作用 |
+|---|---|
+| `per-turn-control-2026-07-01` | Claude Code 实际发送的名字 |
+| `mid-conversation-output-config-2026-07-01` | Anthropic 文档里的名字,同一个功能 |
+| `task-budgets-2026-03-13` | `output_config.task_budget`。原来同样因为这个原因用不了 |
+
+验证结果(dev-19):
+
+- 先只更新一个 hub,用 cookie 把请求固定上去,新旧 hub 对比:新 hub **8 / 8**,旧 hub **1 / 8**。测试覆盖两种消息形状的流式和非流式、多条控制消息、和顶层 `format` 共存、`task_budget`,以及普通请求的回归
+- 真实的 Claude Code 2.1.319 经过网关,完成了一次工具调用的来回(`num_turns=2`)
+
+Claude Code 还会发 `mid-conversation-tool-changes-2026-07-01` 和 `advanced-tool-use-2025-11-20`,目前**仍然被剥掉**。上游接受它们(放在完整 beta 列表里一起发,返回 200),但对应的功能还没有测过,所以暂时不放行。
+
+**另外**:白名单的注释里写着"上游对 beta 头全有或全无,一个不认识就整个请求 400"。但这次直连时,发一个根本不存在的 beta,上游也返回了 200。上游的行为可能已经变了。白名单本身保留不动,不过这条注释描述的前提可能已经不成立。
+
+---
+
 ## 2026-09-16
 
 ### Responses 会话钉在同一个 hub 上 · `154c523` `850f0aa`
