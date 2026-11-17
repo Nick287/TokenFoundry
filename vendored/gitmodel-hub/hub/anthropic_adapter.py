@@ -180,6 +180,16 @@ FORWARDABLE_BETAS: frozenset[str] = frozenset({
     # "output_config.task_budget: Extra inputs are not permitted" without it,
     # 200 with it.
     "task-budgets-2026-03-13",
+    # `thinking.display: "updates"` (progress notes between tool calls).
+    # Claude Code sends it in SDK / stream-json mode — the mode the VS Code
+    # extension and the Agent SDK drive — together with this beta. Plain
+    # `claude -p` sends "omitted", which is why it hides in casual testing.
+    # Without the beta upstream answers
+    #
+    #     400 "thinking.adaptive.display: Input should be 'summarized', 'omitted'"
+    #
+    # and with it, 200. Verified 2026-11-17 against Copilot directly.
+    "thinking-display-updates-2026-08-18",
 })
 
 

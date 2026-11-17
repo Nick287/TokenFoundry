@@ -21,6 +21,32 @@
 
 ---
 
+## 2026-11-17
+
+### SDK 模式的 Claude Code 不再 400:放行 `thinking.display: "updates"` 的 beta
+**要生效：重建 hub 镜像 + 更新每个账号的 hub 容器**(做法同下面 11-16 那条)
+
+**现象。**通过 VS Code 插件、Agent SDK 或 `--output-format stream-json` 运行的 Claude Code,每个请求都失败:
+
+```text
+400 thinking.adaptive.display: Input should be 'summarized', 'omitted'
+```
+
+流式请求下只能看到 `upstream returned 400`。下游的 LiteLLM 甚至把这些请求记成了 0 token 的 success。
+
+**为什么平时测不出来。**普通的 `claude -p` 发的是 `display: "omitted"`。只有 SDK / stream-json 模式才会发 `"updates"`,同时带上 `thinking-display-updates-2026-08-18`。这是用 2.1.325 抓包确认的。
+
+**原因和 11-16 那条一样。**hub 的白名单把这个 beta 剥掉了,上游没收到 beta,就把 `"updates"` 当成非法值。在绕开 hub 的情况下直连 Copilot 验证过:不带 beta 返回 400,带 beta 返回 200。
+
+外部报告认为"TF 上游不支持 updates"、"TF 不转发 anthropic-beta",这两点都不准确。他们带了 beta 也被拒,是因为这个 beta 在 hub 被剥掉了;"编造的 beta 也返回 200",是因为 Copilot 本身不会拒绝不认识的 beta。报告建议把 `updates` 改写成 `omitted`,能绕过报错,但会丢掉工具调用之间的进度提示。
+
+验证结果(dev-19):
+
+- 先只更新一个 hub,用 cookie 把请求固定上去,新旧 hub 对比:新 hub **4 / 4**,旧 hub **1 / 4**。测试覆盖流式和非流式,以及 SDK 模式的真实请求形状(`updates` 加消息级 effort)
+- 真实的 Claude Code 2.1.325 以 SDK 模式(`--input-format stream-json`)经过网关,完成了一次工具调用的来回(`num_turns=2`)。hub 日志显示 `thinking-display-updates-2026-08-18` 已被转发
+
+---
+
 ## 2026-11-16
 
 ### Claude Code ≥ 2.1.316 不再全部 400:放行逐轮 effort 的 beta

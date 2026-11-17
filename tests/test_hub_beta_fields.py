@@ -187,7 +187,21 @@ def test_allowlist_holds_only_verified_betas():
         "per-turn-control-2026-07-01",
         "mid-conversation-output-config-2026-07-01",
         "task-budgets-2026-03-13",
+        "thinking-display-updates-2026-08-18",
     })
+
+
+def test_sdk_mode_claude_code_keeps_its_display_updates_beta():
+    """The header Claude Code 2.1.325 sends in SDK / stream-json mode, captured
+    from the real client. Its body carries thinking.display="updates", which
+    upstream rejects unless this beta rides along."""
+    forwarded = aa.forwardable_betas(
+        "claude-code-20250219,interleaved-thinking-2025-05-14,"
+        "context-management-2025-06-27,per-turn-control-2026-07-01,"
+        "mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,"
+        "advanced-tool-use-2025-11-20,effort-2025-11-24,"
+        "thinking-display-updates-2026-08-18")
+    assert "thinking-display-updates-2026-08-18" in forwarded
 
 
 def test_current_claude_code_keeps_its_per_turn_beta():
